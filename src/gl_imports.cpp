@@ -33,6 +33,13 @@ static GLuint _redirect_tex = 0;
 static uint32_t _redirect_w = 0, _redirect_h = 0;
 // Cart VAO — isolates cart's VAO 0 usage from host (RetroArch uses VAO 0 for overlays)
 static GLuint _cart_vao = 0;
+// The VAO the cart most recently bound (already mapped: cart's 0 -> _cart_vao).
+// Element-array binding is VAO state, so a host-side VAO switch between frames
+// must put THIS back, not _cart_vao: an engine that binds its own VAO once at
+// init (wasmcart-lua's render2d_gl) then draws with glDrawElements(..., 0)
+// otherwise draws through _cart_vao, which has no element buffer -- Mesa then
+// reads 0 as a client pointer and segfaults in memcpy (Batocera/Pi5).
+static GLuint _cart_bound_vao = 0;
 static GLuint _last_draw_fbo = 0;
 static int _cart_blitted_to_redirect = 0;
 static uint32_t _cart_blit_w = 0, _cart_blit_h = 0; // actual render size from cart's blit
@@ -573,10 +580,17 @@ GL_REG(glVertexAttribDivisor, 2, 0, glVertexAttribDivisor(A_U32(0), A_U32(1)))
 // ─── VAOs ─────────────────────────────────────────────────────────────────
 
 GL_REG(glGenVertexArrays, 2, 0, glGenVertexArrays(A_I32(0), (GLuint*)wptr(A_U32(1))))
-GL_REG(glDeleteVertexArrays, 2, 0, glDeleteVertexArrays(A_I32(0), (const GLuint*)wptr(A_U32(1))))
+GL_REG(glDeleteVertexArrays, 2, 0, {
+    GLsizei n = A_I32(0);
+    const GLuint* arrays = (const GLuint*)wptr(A_U32(1));
+    // Deleting the bound VAO reverts the binding to 0 (GL semantics).
+    if (arrays) for (GLsizei i = 0; i < n; i++) if (arrays[i] == _cart_bound_vao) _cart_bound_vao = 0;
+    glDeleteVertexArrays(n, arrays);
+})
 GL_REG(glBindVertexArray, 1, 0, {
     GLuint vao = A_U32(0);
     if (vao == 0 && _cart_vao) vao = _cart_vao;
+    _cart_bound_vao = vao;
     glBindVertexArray(vao);
 })
 
@@ -1080,9 +1094,11 @@ extern "C" void wc_gl_rebind_redirect(void) {
     if (!_redirect_fbo) return;
     glBindFramebuffer(GL_FRAMEBUFFER, _redirect_fbo);
     glViewport(0, 0, _redirect_w, _redirect_h);
-    // Ensure cart VAO is bound — Core 3.3 requires non-zero VAO for draw calls.
-    // Carts that don't use VAOs (gl4es) would otherwise get GL_INVALID_OPERATION.
-    if (_cart_vao) glBindVertexArray(_cart_vao);
+    // Put back the VAO the cart last bound (its element buffer lives there).
+    // Carts that never bind a VAO (gl4es) get _cart_vao: Core 3.3 requires a
+    // non-zero VAO for draw calls, else GL_INVALID_OPERATION.
+    GLuint vao = _cart_bound_vao ? _cart_bound_vao : _cart_vao;
+    if (vao) glBindVertexArray(vao);
     _last_draw_fbo = _redirect_fbo;
     _cart_blitted_to_redirect = 0;
     _draw_call_count = 0;
