@@ -58,6 +58,10 @@ struct wc_host {
     wc_cart_info_t info;
     wc_manifest_t manifest;
 
+    // Cached "_filelist.txt" body; built on first request, freed on close.
+    char*    file_list;
+    uint32_t file_list_len;
+
     // GL state
     bool uses_gl;
     wc_gl_get_proc_fn gl_loader;

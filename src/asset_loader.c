@@ -120,6 +120,11 @@ int wc_archive_open_memory(wc_host_t* host, const uint8_t* data, size_t len) {
 }
 
 void wc_archive_close(wc_host_t* host) {
+    if (host->file_list) {
+        free(host->file_list);
+        host->file_list = NULL;
+        host->file_list_len = 0;
+    }
     if (host->archive) {
         mz_zip_reader_end((mz_zip_archive*)host->archive);
         free(host->archive);
@@ -134,17 +139,91 @@ void wc_archive_close(wc_host_t* host) {
 
 // ─── Asset loading ─────────────────────────────────────────────────────────
 
+/*
+ * Resolve a cart-relative asset path to a ZIP entry index.
+ *
+ * A cart says "roms/game.prg"; the archive may hold it bare, under the
+ * manifest's own asset root ("app/roms/game.prg"), or under the legacy
+ * "assets/" the packer uses when it generates a manifest itself. Try the
+ * declared root first so a cart that ships both spellings gets its own.
+ */
+static int locate_asset(mz_zip_archive* zip, const wc_manifest_t* man, const char* path) {
+    char buf[512];
+    if (man->assets[0]) {
+        snprintf(buf, sizeof(buf), "%s%s", man->assets, path);
+        int idx = mz_zip_reader_locate_file(zip, buf, NULL, 0);
+        if (idx >= 0) return idx;
+    }
+    int idx = mz_zip_reader_locate_file(zip, path, NULL, 0);
+    if (idx >= 0) return idx;
+    snprintf(buf, sizeof(buf), "assets/%s", path);
+    return mz_zip_reader_locate_file(zip, buf, NULL, 0);
+}
+
+/*
+ * The virtual "_filelist.txt": every asset path, newline separated, so a cart
+ * can enumerate what it shipped with. The ABI has no directory call, so this
+ * is how a ROM picker or a bezel picker finds its choices.
+ *
+ * Names are emitted ONCE and with the manifest's asset root stripped, i.e.
+ * exactly the spelling a cart passes back to wc_load_asset. The JS host does
+ * the same; a cart must not see a different list depending on which host ran
+ * it. manifest.json and the wasm entry are not assets and are left out.
+ *
+ * Built on demand and cached: most carts never ask.
+ */
+static const char* build_file_list(wc_host_t* host, uint32_t* out_len) {
+    if (host->file_list) { *out_len = host->file_list_len; return host->file_list; }
+    if (!host->archive) return NULL;
+    mz_zip_archive* zip = (mz_zip_archive*)host->archive;
+
+    const char* root = host->manifest.assets;
+    size_t rootlen = root[0] ? strlen(root) : 0;
+    const char* entry = host->manifest.entry[0] ? host->manifest.entry : "cart.wasm";
+
+    mz_uint n = mz_zip_reader_get_num_files(zip);
+    size_t cap = 4096, len = 0;
+    char* buf = malloc(cap);
+    if (!buf) return NULL;
+
+    for (mz_uint i = 0; i < n; i++) {
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(zip, i, &st)) continue;
+        if (mz_zip_reader_is_file_a_directory(zip, i)) continue;
+        const char* name = st.m_filename;
+        if (strcmp(name, "manifest.json") == 0 || strcmp(name, entry) == 0) continue;
+        if (rootlen && strncmp(name, root, rootlen) == 0) name += rootlen;
+        else if (strncmp(name, "assets/", 7) == 0) name += 7;
+        if (!name[0]) continue;
+
+        size_t nl = strlen(name);
+        if (len + nl + 2 > cap) {
+            while (len + nl + 2 > cap) cap *= 2;
+            char* grown = realloc(buf, cap);
+            if (!grown) { free(buf); return NULL; }
+            buf = grown;
+        }
+        if (len) buf[len++] = '\n';
+        memcpy(buf + len, name, nl);
+        len += nl;
+    }
+    buf[len] = 0;
+    host->file_list = buf;
+    host->file_list_len = (uint32_t)len;
+    *out_len = host->file_list_len;
+    return host->file_list;
+}
+
 int32_t wc_archive_asset_size(wc_host_t* host, const char* path) {
     if (!host->archive) return -1;
     mz_zip_archive* zip = (mz_zip_archive*)host->archive;
 
-    // Try with and without "assets/" prefix
-    int idx = mz_zip_reader_locate_file(zip, path, NULL, 0);
-    if (idx < 0) {
-        char prefixed[512];
-        snprintf(prefixed, sizeof(prefixed), "assets/%s", path);
-        idx = mz_zip_reader_locate_file(zip, prefixed, NULL, 0);
+    if (strcmp(path, "_filelist.txt") == 0) {
+        uint32_t flen = 0;
+        return build_file_list(host, &flen) ? (int32_t)flen : -1;
     }
+
+    int idx = locate_asset(zip, &host->manifest, path);
     if (idx < 0) return -1;
 
     mz_zip_archive_file_stat stat;
@@ -156,12 +235,16 @@ int32_t wc_archive_load_asset(wc_host_t* host, const char* path, uint8_t* dest, 
     if (!host->archive) return -1;
     mz_zip_archive* zip = (mz_zip_archive*)host->archive;
 
-    int idx = mz_zip_reader_locate_file(zip, path, NULL, 0);
-    if (idx < 0) {
-        char prefixed[512];
-        snprintf(prefixed, sizeof(prefixed), "assets/%s", path);
-        idx = mz_zip_reader_locate_file(zip, prefixed, NULL, 0);
+    if (strcmp(path, "_filelist.txt") == 0) {
+        uint32_t flen = 0;
+        const char* list = build_file_list(host, &flen);
+        if (!list) return -1;
+        if (flen > max_size) return -1;
+        memcpy(dest, list, flen);
+        return (int32_t)flen;
     }
+
+    int idx = locate_asset(zip, &host->manifest, path);
     if (idx < 0) {
         static int _miss = 0;
         if (_miss < 3) { wc_log( "wasmcart: asset not found: %s\n", path); _miss++; }
@@ -213,6 +296,22 @@ int wc_parse_manifest(wc_host_t* host, const char* json, size_t len) {
         strncpy(host->manifest.entry, item->valuestring, sizeof(host->manifest.entry) - 1);
     else
         strncpy(host->manifest.entry, "cart.wasm", sizeof(host->manifest.entry) - 1);
+
+    /*
+     * Asset root. The packer writes assets under whatever prefix the cart's
+     * manifest declares ("app/" for the emulator carts), so resolving against
+     * a hardcoded "assets/" finds nothing. Normalize to a single trailing
+     * slash so the lookups can concatenate blindly.
+     */
+    item = cJSON_GetObjectItem(root, "assets");
+    if (cJSON_IsString(item) && item->valuestring[0]) {
+        strncpy(host->manifest.assets, item->valuestring, sizeof(host->manifest.assets) - 2);
+        size_t n = strlen(host->manifest.assets);
+        if (n && host->manifest.assets[n - 1] != '/') {
+            host->manifest.assets[n] = '/';
+            host->manifest.assets[n + 1] = 0;
+        }
+    }
 
     item = cJSON_GetObjectItem(root, "players");
     host->manifest.players = cJSON_IsNumber(item) ? item->valueint : 1;

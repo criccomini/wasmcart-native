@@ -123,6 +123,14 @@ typedef struct {
     char     version[64];
     uint32_t abi;
     char     entry[256];
+    /*
+     * Asset root inside the archive, e.g. "app/". The JS host reads this;
+     * this one used to assume "assets/" unconditionally, so a cart whose
+     * manifest said otherwise could not find its own assets: the zip holds
+     * "app/roms/game.prg" while the cart asks for "roms/game.prg".
+     * Empty means assets sit at the archive root.
+     */
+    char     assets[256];
     uint32_t players;
     bool     pointer;
     bool     keyboard;
