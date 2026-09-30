@@ -872,8 +872,17 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
             auto existing = mod_obj->Get(ctx(), name_str).ToLocalChecked();
             if (!existing->IsUndefined()) continue;
 
-            // Auto-stub based on kind
+            // Auto-stub based on kind.
+            //
+            // A stubbed FUNCTION returns 0, and for a query like
+            // glGetActiveUniformBlockiv(GL_UNIFORM_BLOCK_DATA_SIZE) that zero
+            // reads as a real answer: the engine sizes a uniform block from it,
+            // uploads garbage, and every vertex collapses to a point with no GL
+            // error and no failed draw call. The screen just stays empty. So
+            // say which imports were stubbed - a silent stub is the difference
+            // between a five-minute fix and a multi-day hunt.
             if (strcmp(*kind, "function") == 0) {
+                wc_log("wasmcart: stubbed missing import %s.%s (returns 0)\n", *mod, *name);
                 mod_obj->Set(ctx(), name_str, make_fn(v8_noop_return_0)).Check();
             } else if (strcmp(*kind, "global") == 0) {
                 // Create a WebAssembly.Global with value 0

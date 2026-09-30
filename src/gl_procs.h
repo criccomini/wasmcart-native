@@ -51,6 +51,7 @@ extern PFNGLCLIENTWAITSYNCPROC p_glClientWaitSync;
 extern PFNGLCOLORMASKPROC p_glColorMask;
 extern PFNGLCOMPILESHADERPROC p_glCompileShader;
 extern PFNGLCOMPRESSEDTEXIMAGE2DPROC p_glCompressedTexImage2D;
+extern PFNGLCOMPRESSEDTEXSUBIMAGE2DPROC p_glCompressedTexSubImage2D;
 extern PFNGLCOMPRESSEDTEXIMAGE3DPROC p_glCompressedTexImage3D;
 extern PFNGLCOMPRESSEDTEXSUBIMAGE3DPROC p_glCompressedTexSubImage3D;
 extern PFNGLCOPYBUFFERSUBDATAPROC p_glCopyBufferSubData;
@@ -118,6 +119,8 @@ extern PFNGLGETSTRINGIPROC p_glGetStringi;
 extern PFNGLGETSYNCIVPROC p_glGetSynciv;
 extern PFNGLGETTEXLEVELPARAMETERIVPROC p_glGetTexLevelParameteriv;
 extern PFNGLGETUNIFORMBLOCKINDEXPROC p_glGetUniformBlockIndex;
+extern PFNGLGETACTIVEUNIFORMBLOCKIVPROC p_glGetActiveUniformBlockiv;
+extern PFNGLGETACTIVEUNIFORMSIVPROC p_glGetActiveUniformsiv;
 extern PFNGLGETUNIFORMLOCATIONPROC p_glGetUniformLocation;
 extern PFNGLHINTPROC p_glHint;
 extern PFNGLINVALIDATEFRAMEBUFFERPROC p_glInvalidateFramebuffer;
@@ -223,6 +226,7 @@ extern PFNGLVIEWPORTPROC p_glViewport;
 #define glColorMask p_glColorMask
 #define glCompileShader p_glCompileShader
 #define glCompressedTexImage2D p_glCompressedTexImage2D
+#define glCompressedTexSubImage2D p_glCompressedTexSubImage2D
 #define glCompressedTexImage3D p_glCompressedTexImage3D
 #define glCompressedTexSubImage3D p_glCompressedTexSubImage3D
 #define glCopyBufferSubData p_glCopyBufferSubData
@@ -290,6 +294,8 @@ extern PFNGLVIEWPORTPROC p_glViewport;
 #define glGetSynciv p_glGetSynciv
 #define glGetTexLevelParameteriv p_glGetTexLevelParameteriv
 #define glGetUniformBlockIndex p_glGetUniformBlockIndex
+#define glGetActiveUniformBlockiv p_glGetActiveUniformBlockiv
+#define glGetActiveUniformsiv p_glGetActiveUniformsiv
 #define glGetUniformLocation p_glGetUniformLocation
 #define glHint p_glHint
 #define glInvalidateFramebuffer p_glInvalidateFramebuffer

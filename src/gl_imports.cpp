@@ -423,6 +423,7 @@ GL_REG(glTexImage2D, 9, 0, {
 })
 GL_REG(glTexSubImage2D, 9, 0, glTexSubImage2D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_U32(6), A_U32(7), wptr(A_U32(8))))
 GL_REG(glCompressedTexImage2D, 8, 0, glCompressedTexImage2D(A_U32(0), A_I32(1), A_U32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), wptr(A_U32(7))))
+GL_REG(glCompressedTexSubImage2D, 9, 0, glCompressedTexSubImage2D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_U32(6), A_I32(7), wptr(A_U32(8))))
 GL_REG(glCopyTexSubImage2D, 8, 0, glCopyTexSubImage2D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), A_I32(7)))
 GL_REG(glTexImage3D, 10, 0, glTexImage3D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), A_U32(7), A_U32(8), wptr(A_U32(9))))
 GL_REG(glTexStorage2D, 5, 0, glTexStorage2D(A_U32(0), A_I32(1), A_U32(2), A_I32(3), A_I32(4)))
@@ -682,6 +683,15 @@ GL_REG(glGetInteger64v, 2, 0, glGetInteger64v(A_U32(0), (GLint64*)wptr(A_U32(1))
 GL_REG(glBindBufferBase, 3, 0, glBindBufferBase(A_U32(0), A_U32(1), A_U32(2)))
 GL_REG(glBindBufferRange, 5, 0, glBindBufferRange(A_U32(0), A_U32(1), A_U32(2), A_I32(3), A_I32(4)))
 GL_REG(glGetUniformBlockIndex, 2, 1, R_I32(glGetUniformBlockIndex(A_U32(0), (const char*)wptr(A_U32(1)))))
+// Uniform-BLOCK introspection. An engine that cannot query
+// GL_UNIFORM_BLOCK_DATA_SIZE sizes its UBO from whatever the missing import
+// returned, uploads a block of that size, and the shader samples an
+// essentially unwritten buffer: every vertex multiplied by a zero
+// view-projection matrix collapses to a point. No GL error is raised and every
+// draw call succeeds, so the screen simply stays empty. Kept Defold carts from
+// ever drawing geometry on the JS host until the same pair was added there.
+GL_REG(glGetActiveUniformBlockiv, 4, 0, glGetActiveUniformBlockiv(A_U32(0), A_U32(1), A_U32(2), (GLint*)wptr(A_U32(3))))
+GL_REG(glGetActiveUniformsiv, 5, 0, glGetActiveUniformsiv(A_U32(0), A_I32(1), (const GLuint*)wptr(A_U32(2)), A_U32(3), (GLint*)wptr(A_U32(4))))
 GL_REG(glUniformBlockBinding, 3, 0, glUniformBlockBinding(A_U32(0), A_U32(1), A_U32(2)))
 GL_REG(glUniform1ui, 2, 0, glUniform1ui(A_I32(0), A_U32(1)))
 GL_REG(glUniform1uiv, 3, 0, glUniform1uiv(A_I32(0), A_I32(1), (const GLuint*)wptr(A_U32(2))))
@@ -946,6 +956,7 @@ static const gl_import_entry_t gl_table[] = {
     GL_E(glGenerateMipmap, "i>"), GL_E(glIsTexture, "i>i"),
     GL_E(glTexImage2D, "iiiiiiiii>"), GL_E(glTexSubImage2D, "iiiiiiiii>"),
     GL_E(glCompressedTexImage2D, "iiiiiiii>"), GL_E(glCopyTexSubImage2D, "iiiiiiii>"),
+    GL_E(glCompressedTexSubImage2D, "iiiiiiiii>"),
     GL_E(glTexImage3D, "iiiiiiiiii>"), GL_E(glTexStorage2D, "iiiii>"), GL_E(glTexStorage3D, "iiiiii>"),
     // Shaders
     GL_E(glCreateShader, "i>i"), GL_E(glDeleteShader, "i>"),
@@ -988,6 +999,7 @@ static const gl_import_entry_t gl_table[] = {
     GL_E(glGetStringi, "ii>i"), GL_E(glGetInteger64v, "ii>"),
     GL_E(glBindBufferBase, "iii>"), GL_E(glBindBufferRange, "iiiii>"),
     GL_E(glGetUniformBlockIndex, "ii>i"), GL_E(glUniformBlockBinding, "iii>"),
+    GL_E(glGetActiveUniformBlockiv, "iiii>"), GL_E(glGetActiveUniformsiv, "iiiii>"),
     GL_E(glUniform1ui, "ii>"), GL_E(glUniform1uiv, "iii>"),
     GL_E(glVertexAttribI4ui, "iiiii>"),
     GL_E(glCopyBufferSubData, "iiiii>"),

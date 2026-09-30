@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <signal.h>
 
 #define MAX_CONTROLLERS 4
 
@@ -128,6 +129,65 @@ static void poll_keyboard_as_pad(wc_pad_t* pad) {
 
 // ─── Main ──────────────────────────────────────────────────────────────────
 
+// Set from a signal handler, so it must be sig_atomic_t and volatile: the
+// main loop polls it instead of the process dying where it stands. Without
+// this, Ctrl+C (and any SIGTERM, including the one `timeout` sends) kills the
+// player before the save is written, which loses exactly the progress the
+// player was asked to keep.
+static volatile sig_atomic_t g_should_quit = 0;
+static void on_quit_signal(int sig) { (void)sig; g_should_quit = 1; }
+
+// ─── Save data ──────────────────────────────────────────────────────────
+//
+// A cart's save block is a region of its own linear memory that the host is
+// responsible for writing out at exit and restoring at load. Without this the
+// cart's save API appears to work for the length of one run and loses
+// everything on the next, which reads as "saving is broken" rather than as a
+// missing host step.
+//
+// Path convention matches the JS players (src/save.js): a local cart saves
+// alongside itself with ".sav" appended, so a cart moved between players finds
+// the same file.
+static void sav_path_for(const char* cart_path, char* out, size_t out_size) {
+    snprintf(out, out_size, "%s.sav", cart_path);
+}
+
+// Returns a malloc'd buffer the caller frees, or NULL when there is no save
+// yet (the ordinary first run, not an error).
+static uint8_t* load_sav(const char* sav_path, uint32_t* out_size) {
+    *out_size = 0;
+    FILE* f = fopen(sav_path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long n = ftell(f);
+    if (n <= 0) { fclose(f); return NULL; }
+    rewind(f);
+    uint8_t* buf = (uint8_t*)malloc((size_t)n);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    if (got != (size_t)n) { free(buf); return NULL; }
+    *out_size = (uint32_t)n;
+    return buf;
+}
+
+// Must run BEFORE wc_host_destroy(): the pointer returned points INTO the
+// cart's linear memory, which is gone afterwards.
+static void persist_sav(wc_host_t* host, const char* sav_path) {
+    uint32_t size = 0;
+    const uint8_t* data = wc_host_get_save_data(host, &size);
+    if (!data || size == 0) return;  // cart declares no save block
+    FILE* f = fopen(sav_path, "wb");
+    if (!f) {
+        fprintf(stderr, "wasmcart: could not write save to %s\n", sav_path);
+        return;
+    }
+    if (fwrite(data, 1, size, f) != size) {
+        fprintf(stderr, "wasmcart: short write saving to %s\n", sav_path);
+    }
+    fclose(f);
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         print_usage(argv[0]);
@@ -177,17 +237,25 @@ int main(int argc, char* argv[]) {
     }
 
     // 3. Load cart
+    char sav_path[4096];
+    sav_path_for(cart_path, sav_path, sizeof(sav_path));
+    uint32_t sav_size = 0;
+    uint8_t* sav_data = load_sav(sav_path, &sav_size);
+
     wc_host_options_t opts = {
         .preferred_width = pref_width,
         .preferred_height = pref_height,
         .host_fps = 60,
         .audio_sample_rate = 48000,
+        .save_data = sav_data,
+        .save_data_size = sav_size,
     };
 
     int rc = wc_host_load_file(host, cart_path, &opts);
     if (rc != 0) {
         fprintf(stderr, "wasmcart: failed to load %s\n", cart_path);
         wc_host_destroy(host);
+        free(sav_data);
         return 1;
     }
 
@@ -212,6 +280,7 @@ int main(int argc, char* argv[]) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) < 0) {
         fprintf(stderr, "wasmcart: SDL_Init failed: %s\n", SDL_GetError());
         wc_host_destroy(host);
+        free(sav_data);
         return 1;
     }
 
@@ -241,6 +310,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "wasmcart: SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_Quit();
         wc_host_destroy(host);
+        free(sav_data);
         return 1;
     }
 
@@ -405,6 +475,8 @@ int main(int argc, char* argv[]) {
     extern void wc_host_enter_v8(void);
     extern void wc_host_exit_v8(void);
     wc_host_enter_v8();
+    signal(SIGINT, on_quit_signal);
+    signal(SIGTERM, on_quit_signal);
     bool running = true;
     uint32_t frame_count = 0;
     uint64_t start_ticks = SDL_GetTicks64();
@@ -507,6 +579,11 @@ int main(int argc, char* argv[]) {
             break;
         }
 
+        if (g_should_quit) {
+            running = false;
+            break;
+        }
+
         // Present
         if (egl_is_initialized()) {
             // GL carts: blit redirect FBO to screen, then swap
@@ -566,7 +643,9 @@ int main(int argc, char* argv[]) {
     if (renderer) SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     egl_destroy();
+    persist_sav(host, sav_path);  // before destroy: reads the cart's memory
     wc_host_destroy(host);
+    free(sav_data);
     SDL_Quit();
 
     return 0;
