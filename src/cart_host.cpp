@@ -225,8 +225,17 @@ static void write_host_info(wc_host_t* host, const wc_host_options_t* opts) {
     if (ptr == 0) return;
     refresh_memory(host);
     uint8_t* mem = host->memory;
-    wc_write_u32(mem, ptr + WC_HOST_INFO_PREFERRED_WIDTH, opts ? opts->preferred_width : 0);
-    wc_write_u32(mem, ptr + WC_HOST_INFO_PREFERRED_HEIGHT, opts ? opts->preferred_height : 0);
+    // A manifest width/height is the cart author stating the size the cart
+    // wants, so pass it as the host's preference when the caller has no
+    // opinion of its own. Without this a runtime that sizes itself from
+    // preferred_width (Defold and Godot both do) ignores the declaration and
+    // falls back to its own default: a 1280x720 cart rendered at 960x540 with
+    // its picture cropped. An explicit caller preference still wins, because
+    // that is the host asking rather than the cart declaring.
+    uint32_t pref_w = opts && opts->preferred_width  ? opts->preferred_width  : host->manifest.width;
+    uint32_t pref_h = opts && opts->preferred_height ? opts->preferred_height : host->manifest.height;
+    wc_write_u32(mem, ptr + WC_HOST_INFO_PREFERRED_WIDTH, pref_w);
+    wc_write_u32(mem, ptr + WC_HOST_INFO_PREFERRED_HEIGHT, pref_h);
     wc_write_u32(mem, ptr + WC_HOST_INFO_HOST_FPS, opts ? opts->host_fps : 60);
     wc_write_u32(mem, ptr + WC_HOST_INFO_AUDIO_SAMPLE_RATE, opts ? opts->audio_sample_rate : 48000);
     wc_write_u32(mem, ptr + WC_HOST_INFO_FLAGS, 0);

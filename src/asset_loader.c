@@ -313,6 +313,11 @@ int wc_parse_manifest(wc_host_t* host, const char* json, size_t len) {
         }
     }
 
+    item = cJSON_GetObjectItem(root, "width");
+    host->manifest.width = cJSON_IsNumber(item) && item->valueint > 0 ? (uint32_t)item->valueint : 0;
+    item = cJSON_GetObjectItem(root, "height");
+    host->manifest.height = cJSON_IsNumber(item) && item->valueint > 0 ? (uint32_t)item->valueint : 0;
+
     item = cJSON_GetObjectItem(root, "players");
     host->manifest.players = cJSON_IsNumber(item) ? item->valueint : 1;
 

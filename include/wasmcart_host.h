@@ -131,6 +131,16 @@ typedef struct {
      * Empty means assets sit at the archive root.
      */
     char     assets[256];
+    /*
+     * The size the cart AUTHOR declared. Passed to the cart as the host's
+     * preferred_width/height when the user gave no --res, matching the JS
+     * host: a runtime that sizes itself from preferred_width (Defold and Godot
+     * both do) otherwise ignores the declaration and falls back to its own
+     * default, so a 1280x720 cart opened in a 960x540 window with its picture
+     * cropped. 0 means the manifest did not say.
+     */
+    uint32_t width;
+    uint32_t height;
     uint32_t players;
     bool     pointer;
     bool     keyboard;
