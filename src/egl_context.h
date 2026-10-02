@@ -6,10 +6,27 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Create an EGL context with a pbuffer surface (headless, for GL carts).
-// Must be called BEFORE SDL window creation.
-// Returns 0 on success.
+// Create an EGL context with a pbuffer surface (headless, for GL carts) on
+// the default display: X11, macOS, Windows. Must be called BEFORE SDL window
+// creation. Returns 0 on success.
 int egl_create_context(uint32_t width, uint32_t height);
+
+#ifdef WC_HAVE_WAYLAND_EGL
+// Native Wayland: the same, but on SDL's wl_display (a struct wl_display*),
+// with a width x height wl_egl_window on boot_wl_surface standing in for the
+// pbuffer, which Mesa's Wayland platform does not have. boot_wl_surface is
+// the wl_surface of a HIDDEN SDL window that must outlive the boot surface.
+int egl_create_wayland_context(void* wl_display, void* boot_wl_surface,
+                               uint32_t width, uint32_t height);
+
+// Replace the boot surface with a wl_egl_window of width x height PIXELS on
+// the player window's wl_surface. On failure the boot surface stays current.
+int egl_create_wayland_window_surface(void* wl_surface, int width, int height);
+#endif
+
+// Follow a new window size in PIXELS. Only Wayland needs this; X11, Cocoa
+// and Win32 surfaces follow their window by themselves.
+void egl_resize_window_surface(int width, int height);
 
 // Create a window surface from an SDL window's native handle.
 // Call after SDL_CreateWindow.
@@ -32,7 +49,7 @@ void egl_swap_buffers(void);
 // applied lazily once ANGLE's first present has created its layer.
 void egl_set_swap_interval(int interval);
 
-// Destroy EGL context and surfaces.
+// Destroy EGL context and surfaces. Safe to call more than once.
 void egl_destroy(void);
 
 // Get a GL function pointer by name (for wc_host_set_gl_loader).
