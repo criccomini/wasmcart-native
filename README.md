@@ -247,8 +247,8 @@ statics.
 
 Async work (connections, messages, timers) advances once per frame from
 `wc_host_run_frame()`. An embedder driving async work outside a frame loop --
-waiting for a connection before starting the cart, say -- can call
-`wc_host_pump()` directly.
+waiting for a connection before starting the cart, or while it is suspended,
+when `wc_host_run_frame()` does nothing -- can call `wc_host_pump()` directly.
 
 > Embedding note: node's event loop needs three things pumped together, and
 > missing any one breaks a different part of node in ways that look unrelated.
@@ -292,9 +292,13 @@ python3 test/gl_no_context_test.py build/wasmcart-run   # with no display, a GL 
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 sh test/wgpu_test.sh          # WebGPU carts (needs a build with WebGPU support)
+./lifecycle_test ../wasmcart/test/fixtures/lifecycle.wasc 5500 5504 5508 5512 5516 5520 \
+    ../wasmcart/test/fixtures/hello.wasc   # suspend/resume/focus order, no render while suspended
+
+cc -Iinclude -Isrc -o clock_test test/clock_test.c && ./clock_test   # no V8 or SDL needed
 ```
 
-`text_test` takes the cart's debug-field offsets as arguments because they move
+`text_test` and `lifecycle_test` take the cart's debug-field offsets as arguments because they move
 whenever the fixture is recompiled -- linking `malloc` alone shifted them 16
 bytes. Read them with wasmcart's `readDebugState()`.
 
@@ -335,6 +339,13 @@ host on some GL carts (~860 vs ~716 FPS for Skia Ganesh). Both use V8 for WASM a
 ### Wayland vs X11
 
 SDL2 may choose X11 (via XWayland) on Wayland sessions. The `egl_create_window_surface` code does a runtime check on `wm_info.subsystem` (not compile-time `#ifdef`). Both backends work, but compositor behavior may differ for vsync.
+
+Lifecycle differs too. The player suspends a cart when its window is minimized
+or hidden and resumes it on restore (the cart's `wc_on_suspend`/`wc_on_resume`
+fire, the save is written, `wc_render` stops). xdg-shell has no minimized
+state, so through SDL2's native Wayland backend a minimize is invisible: the
+cart only hears `wc_on_focus_lost`, and keeps rendering at whatever rate the
+compositor allows.
 
 ### Platform-Specific
 

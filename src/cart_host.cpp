@@ -169,7 +169,7 @@ static v8::Local<v8::Value> wgpu_call(wc_host_t* host, const char* method, int a
 static v8::Local<v8::Value> wgpu_wait(wc_host_t* host, v8::Local<v8::Value> job, std::string* err, int timeout_ms);
 static void pump_node(wc_host_t* host);
 
-// ─── Lifecycle ─────────────────────────────────────────────────────────
+// ─── Create / destroy ──────────────────────────────────────────────────
 
 extern "C" wc_host_t* wc_host_create(void) {
     wc_host_t* host = (wc_host_t*)calloc(1, sizeof(wc_host_t));
@@ -181,6 +181,7 @@ extern "C" wc_host_t* wc_host_create(void) {
     }
 
     host->v8_state = new v8_host_state();
+    host->focused = true;
     return host;
 }
 
@@ -2376,6 +2377,75 @@ extern "C" int wc_test_eval_flag(const char* code, const char* flag, int iters) 
     return 0;
 }
 
+// ─── Lifecycle (SPEC: Lifecycle) ───────────────────────────────────────
+
+// Call one optional lifecycle export. Looked up by name each time, like
+// wc_on_text: these fire a handful of times per session, not per frame. A
+// throw is logged and the cart keeps running, matching CartHost and the
+// other host-to-cart callbacks here; a cart that cannot pause politely is
+// still correct, because the host simply stops calling wc_render.
+static void call_lifecycle(wc_host_t* host, const char* name) {
+    if (host->trapped || host->init_deferred || !host->v8_state) return;
+
+    v8::Locker locker(g_isolate);
+    v8::Isolate::Scope isolate_scope(g_isolate);
+    v8::HandleScope handle_scope(g_isolate);
+    v8::Context::Scope context_scope(ctx());
+
+    auto state = (v8_host_state*)host->v8_state;
+    if (state->exports_obj.IsEmpty()) return;
+    auto exports = state->exports_obj.Get(g_isolate);
+    v8::Local<v8::Value> val;
+    if (!exports->Get(ctx(), v8str(name)).ToLocal(&val) || !val->IsFunction()) return;
+
+    _current_host = host;
+    v8::TryCatch tc(g_isolate);
+    v8::MaybeLocal<v8::Value> unused = val.As<v8::Function>()->Call(ctx(), ctx()->Global(), 0, nullptr);
+    (void)unused;
+    if (tc.HasCaught()) {
+        v8::String::Utf8Value err(g_isolate, tc.Exception());
+        wc_log("wasmcart: cart's %s() threw: %s\n", name, *err);
+    }
+    // The callback may have grown memory or written its save block.
+    if (!state->memory_obj.IsEmpty()) refresh_memory(host);
+}
+
+extern "C" bool wc_host_blur(wc_host_t* host) {
+    if (!host || !host->focused) return false;
+    host->focused = false;
+    call_lifecycle(host, "wc_on_focus_lost");
+    return true;
+}
+
+extern "C" bool wc_host_focus(wc_host_t* host) {
+    // Refused while suspended so focus_gained can never precede resume. (The
+    // JS CartHost allows it; a window system that reports focus before the
+    // restore would otherwise break the spec's ordering guarantee.)
+    if (!host || host->focused || host->suspended) return false;
+    host->focused = true;
+    call_lifecycle(host, "wc_on_focus_gained");
+    return true;
+}
+
+extern "C" bool wc_host_suspend(wc_host_t* host) {
+    if (!host || host->suspended) return false;
+    host->suspended = true;
+    wc_host_blur(host);  // focus_lost before suspend, per the spec
+    call_lifecycle(host, "wc_on_suspend");
+    return true;
+}
+
+extern "C" bool wc_host_resume(wc_host_t* host) {
+    if (!host || !host->suspended) return false;
+    host->suspended = false;
+    call_lifecycle(host, "wc_on_resume");
+    wc_host_focus(host);  // resume before focus_gained, per the spec
+    return true;
+}
+
+extern "C" bool wc_host_is_suspended(wc_host_t* host) { return host && host->suspended; }
+extern "C" bool wc_host_is_focused(wc_host_t* host) { return host && host->focused; }
+
 extern "C" void wc_host_pump(wc_host_t* host) {
     if (!host) return;
     v8::HandleScope hs(g_isolate);
@@ -2393,7 +2463,8 @@ static void deliver_wheel(wc_host_t* host) {
 }
 
 extern "C" void wc_host_run_frame(wc_host_t* host) {
-    if (!host->fn_wc_render || host->trapped) return;
+    // The spec's one MUST for suspension: no wc_render while suspended.
+    if (!host->fn_wc_render || host->trapped || host->suspended) return;
 
     // Locker + Isolate::Scope held persistently. Only HandleScope + Context::Scope per frame.
     v8::HandleScope handle_scope(g_isolate);

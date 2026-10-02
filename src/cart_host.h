@@ -84,6 +84,10 @@ struct wc_host {
     bool init_deferred;  // _initialize/wc_init not yet called
     wc_host_options_t deferred_opts;  // saved for finish_init
 
+    // Lifecycle (SPEC: Lifecycle). Starts running and focused.
+    bool suspended;
+    bool focused;
+
     // .wasc archive (kept open for wc_load_asset)
     void* archive;  // mz_zip_archive*
 
