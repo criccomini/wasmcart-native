@@ -18,6 +18,10 @@
 #include <stdbool.h>
 #include <signal.h>
 
+#if defined(SDL_VIDEO_DRIVER_WAYLAND) && defined(WC_HAVE_WAYLAND_EGL)
+#define WC_WAYLAND_EGL 1
+#endif
+
 #define MAX_CONTROLLERS 4
 
 static SDL_GameController* controllers[MAX_CONTROLLERS] = {0};
@@ -202,6 +206,59 @@ static void persist_sav(wc_host_t* host, const char* sav_path) {
     fclose(f);
 }
 
+// ─── Native Wayland ───────────────────────────────────────────────────────
+//
+// GL carts run their init inside wc_host_load_file, so a context has to be
+// current before the cart loads, and on Wayland it has to be on SDL's own
+// wl_display: Wayland objects can't cross connections, and the window will be
+// SDL's. SDL2 only hands its wl_display out through a window, so when SDL
+// picks Wayland a hidden 16x16 window comes first. Its wl_display carries the
+// EGL display and its wl_surface the boot surface that stands in for the
+// pbuffer. With any other video driver SDL video is shut down again and the
+// pbuffer path below runs exactly as before.
+#ifdef WC_WAYLAND_EGL
+static SDL_Window* boot_window = NULL;
+
+static void* wayland_boot_window(void** wl_surface) {
+    *wl_surface = NULL;
+    if (!getenv("WAYLAND_DISPLAY") && !getenv("WAYLAND_SOCKET")) return NULL;
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) return NULL;
+    void* display = NULL;
+    const char* driver = SDL_GetCurrentVideoDriver();
+    if (driver && strcmp(driver, "wayland") == 0) {
+        boot_window = SDL_CreateWindow("", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+            16, 16, SDL_WINDOW_HIDDEN);
+        SDL_SysWMinfo wm;
+        SDL_VERSION(&wm.version);
+        if (boot_window && SDL_GetWindowWMInfo(boot_window, &wm) &&
+            wm.subsystem == SDL_SYSWM_WAYLAND) {
+            display = wm.info.wl.display;
+            *wl_surface = wm.info.wl.surface;
+        } else if (boot_window) {
+            SDL_DestroyWindow(boot_window);
+            boot_window = NULL;
+        }
+    }
+    if (!display) SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    return display;
+}
+
+// After egl_destroy() or the switch to the real window: the boot surface's
+// wl_egl_window sits on this window's wl_surface.
+static void drop_boot_window(void) {
+    if (boot_window) SDL_DestroyWindow(boot_window);
+    boot_window = NULL;
+}
+#endif
+
+static void window_pixel_size(SDL_Window* window, int* w, int* h) {
+#if SDL_VERSION_ATLEAST(2, 26, 0)
+    SDL_GetWindowSizeInPixels(window, w, h);
+#else
+    SDL_GetWindowSize(window, w, h);  // the same without SDL_WINDOW_ALLOW_HIGHDPI
+#endif
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         print_usage(argv[0]);
@@ -244,8 +301,24 @@ int main(int argc, char* argv[]) {
     }
 
     // 2. Create EGL context (BEFORE SDL window)
-    //    Always available — the cart decides whether to use GL or framebuffer
-    egl_create_context(16, 16);
+    //    Always available — the cart decides whether to use GL or framebuffer.
+    //    On native Wayland it goes on SDL's wl_display (see above).
+#ifdef WC_WAYLAND_EGL
+    void* boot_wl_surface = NULL;
+    void* sdl_wl_display = wayland_boot_window(&boot_wl_surface);
+    if (sdl_wl_display) {
+        egl_create_wayland_context(sdl_wl_display, boot_wl_surface, 16, 16);
+        if (!egl_is_initialized()) {
+            fprintf(stderr, "wasmcart: no EGL on SDL's Wayland display; "
+                            "GL carts need SDL_VIDEODRIVER=x11\n");
+            egl_destroy();
+            drop_boot_window();
+        }
+    } else
+#endif
+    {
+        egl_create_context(16, 16);
+    }
     if (egl_is_initialized()) {
         wc_host_set_gl_loader(host, (wc_gl_get_proc_fn)egl_get_proc_address);
     }
@@ -268,6 +341,11 @@ int main(int argc, char* argv[]) {
     int rc = wc_host_load_file(host, cart_path, &opts);
     if (rc != 0) {
         fprintf(stderr, "wasmcart: failed to load %s\n", cart_path);
+        egl_destroy();
+#ifdef WC_WAYLAND_EGL
+        drop_boot_window();
+        SDL_Quit();
+#endif
         wc_host_destroy(host);
         free(sav_data);
         return 1;
@@ -303,6 +381,11 @@ int main(int argc, char* argv[]) {
     // 5. Init SDL
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) < 0) {
         fprintf(stderr, "wasmcart: SDL_Init failed: %s\n", SDL_GetError());
+        egl_destroy();
+#ifdef WC_WAYLAND_EGL
+        drop_boot_window();
+        SDL_Quit();
+#endif
         wc_host_destroy(host);
         free(sav_data);
         return 1;
@@ -322,7 +405,8 @@ int main(int argc, char* argv[]) {
     uint32_t win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
     if (fullscreen) win_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     // Don't use SDL_WINDOW_OPENGL — EGL provides our GL context, not SDL
-    // SDL_WINDOW_OPENGL would make SDL create a competing GLX context
+    // SDL_WINDOW_OPENGL would make SDL create a competing GLX context, and on
+    // Wayland would make SDL wrap the window in an EGLSurface of its own.
 
     char title[300];
     snprintf(title, sizeof(title), "wasmcart - %s", manifest->name);
@@ -332,6 +416,10 @@ int main(int argc, char* argv[]) {
         win_w, win_h, win_flags);
     if (!window) {
         fprintf(stderr, "wasmcart: SDL_CreateWindow failed: %s\n", SDL_GetError());
+        egl_destroy();
+#ifdef WC_WAYLAND_EGL
+        drop_boot_window();
+#endif
         SDL_Quit();
         wc_host_destroy(host);
         free(sav_data);
@@ -345,6 +433,9 @@ int main(int argc, char* argv[]) {
     // GL carts: keep EGL for direct GL rendering
     if (!is_gl) {
         egl_destroy();
+#ifdef WC_WAYLAND_EGL
+        drop_boot_window();
+#endif
         uint32_t render_flags = SDL_RENDERER_ACCELERATED;
         if (!uncapped) render_flags |= SDL_RENDERER_PRESENTVSYNC;
         renderer = SDL_CreateRenderer(window, -1, render_flags);
@@ -366,9 +457,27 @@ int main(int argc, char* argv[]) {
         if (SDL_GetWindowWMInfo(window, &wm_info)) {
             // Runtime check — SDL2 may use X11 or Wayland regardless of compile flags
             if (wm_info.subsystem == SDL_SYSWM_WAYLAND) {
-#ifdef SDL_VIDEO_DRIVER_WAYLAND
+#ifdef WC_WAYLAND_EGL
+                // SDL only makes a wl_egl_window for an SDL_WINDOW_OPENGL
+                // window (and then owns it), so wrap its wl_surface ourselves.
+                int pw, ph;
+                window_pixel_size(window, &pw, &ph);
+                if (egl_create_wayland_window_surface(wm_info.info.wl.surface, pw, ph) != 0) {
+                    fprintf(stderr, "wasmcart: could not create a Wayland EGL window surface for %s\n",
+                        manifest->name);
+                    egl_destroy();
+                    drop_boot_window();
+                    SDL_DestroyWindow(window);
+                    SDL_Quit();
+                    wc_host_destroy(host);
+                    free(sav_data);
+                    return 1;
+                }
                 fprintf(stderr, "wasmcart: using Wayland EGL window surface\n");
-                egl_create_window_surface((void*)wm_info.info.wl.egl_window);
+                drop_boot_window();
+#elif defined(SDL_VIDEO_DRIVER_WAYLAND)
+                fprintf(stderr, "wasmcart: built without wayland-egl; "
+                                "GL carts need SDL_VIDEODRIVER=x11 on Wayland\n");
 #endif
             } else if (wm_info.subsystem == SDL_SYSWM_X11) {
 #ifdef SDL_VIDEO_DRIVER_X11
@@ -618,6 +727,13 @@ int main(int argc, char* argv[]) {
             // The letterbox rect and viewport are in surface PIXELS. On Retina
             // the surface is backing-scale times the window's point size, so
             // SDL_GetWindowSize would put the picture in a corner quarter.
+            // A Wayland surface also has to be told the window's new size
+            // (F11, a late fullscreen configure, a compositor resize).
+            {
+                int pw, ph;
+                window_pixel_size(window, &pw, &ph);
+                egl_resize_window_surface(pw, ph);
+            }
             int cur_w, cur_h;
             if (!egl_get_drawable_size(&cur_w, &cur_h))
                 SDL_GetWindowSize(window, &cur_w, &cur_h);
@@ -672,8 +788,14 @@ int main(int argc, char* argv[]) {
     if (audio_dev) SDL_CloseAudioDevice(audio_dev);
     if (fb_tex) SDL_DestroyTexture(fb_tex);
     if (renderer) SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
+    // EGL before the window: on Wayland our surface sits on SDL's wl_surface
+    // and the display on SDL's wl_display, and ANGLE likewise wants its
+    // surface released while the native window still exists.
     egl_destroy();
+    SDL_DestroyWindow(window);
+#ifdef WC_WAYLAND_EGL
+    drop_boot_window();
+#endif
     persist_sav(host, sav_path);  // before destroy: reads the cart's memory
     wc_host_destroy(host);
     free(sav_data);

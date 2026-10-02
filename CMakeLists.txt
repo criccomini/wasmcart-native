@@ -166,6 +166,21 @@ if(EGL_LIB)
     target_link_libraries(wasmcart-run PRIVATE ${EGL_LIB})
 endif()
 
+# GL carts on native Wayland: EGL has to share SDL's wl_display, and the
+# player owns a wl_egl_window on SDL's wl_surface (SDL only makes one for an
+# SDL_WINDOW_OPENGL window). Without these the Wayland path compiles out and
+# GL carts need X11/Xwayland (SDL_VIDEODRIVER=x11).
+if(UNIX AND NOT APPLE)
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(WAYLAND_EGL QUIET IMPORTED_TARGET wayland-client wayland-egl)
+    endif()
+    if(WAYLAND_EGL_FOUND)
+        target_compile_definitions(wasmcart-run PRIVATE WC_HAVE_WAYLAND_EGL)
+        target_link_libraries(wasmcart-run PRIVATE PkgConfig::WAYLAND_EGL)
+    endif()
+endif()
+
 # ─── Status ─────────────────────────────────────────────────────────────
 
 message(STATUS "")
@@ -174,4 +189,5 @@ message(STATUS "  libnode: ${LIBNODE_DIR}")
 message(STATUS "  SDL2:    ${SDL2_STATIC}")
 message(STATUS "  EGL:     ${EGL_LIB}")
 message(STATUS "  GLESv2:  ${GLESV2_LIB}")
+message(STATUS "  Wayland: ${WAYLAND_EGL_FOUND}")
 message(STATUS "")
