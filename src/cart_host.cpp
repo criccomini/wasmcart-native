@@ -1645,6 +1645,25 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
         }
     }
 
+    // A GL cart needs GL entry points before any of its code runs: every
+    // _cb_gl* shim jumps through them with no null check, so a cart that
+    // touches GL in a start function (instantiation runs it), _initialize or
+    // wc_init would jump to 0. Without a GL context that is a load error, as
+    // the spec requires, not a crash. Which carts run on GL is known from the
+    // import scan before instantiation (2b; libretro's HW render setup needs
+    // it before init too); a cart that runs on WebGPU gets traps for its GL
+    // imports and isn't one. Building the imports (3) resolved GL through the
+    // loader, so a loader that gives nothing back has no context behind it
+    // (the standalone player's EGL failed to initialize). A deferred init gets
+    // its loader later and is checked in wc_host_finish_init instead.
+    if (host->cart_imports_gl && !host->uses_wgpu) host->uses_gl = true;
+    if (host->uses_gl && !(opts && opts->defer_init) &&
+        !(host->gl_loader && host->gl_loader("glGetString"))) {
+        wc_log( "wasmcart: %s is a GL cart but no GL context is available\n",
+            host->manifest.name);
+        return -1;
+    }
+
     // 5. Instantiate: new WebAssembly.Instance(module, imports)
     v8::Local<v8::Value> instance_args[] = { wasm_module, imports };
     auto instance_result = wasm_instance_ctor->NewInstance(ctx(), 2, instance_args);
@@ -1713,29 +1732,6 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
     host->fn_wc_get_info = &state->fn_wc_get_info;
     host->fn_wc_init = fn_init.IsEmpty() ? nullptr : &state->fn_wc_init;
     host->fn_wc_render = &state->fn_wc_render;
-
-    // Pre-scan: detect GL usage from imports (needed before init for libretro HW render setup)
-    // Check if any import is from "gl" module
-    {
-        auto wasm_module_ns = wasm_ns->Get(ctx(), v8str("Module")).ToLocalChecked().As<v8::Function>();
-        auto imports_fn = wasm_module_ns->Get(ctx(), v8str("imports")).ToLocalChecked().As<v8::Function>();
-        v8::Local<v8::Value> imp_args[] = { wasm_module };
-        auto imp_arr = imports_fn->Call(ctx(), wasm_ns, 1, imp_args).ToLocalChecked().As<v8::Array>();
-        for (uint32_t i = 0; i < imp_arr->Length(); i++) {
-            auto entry = imp_arr->Get(ctx(), i).ToLocalChecked().As<v8::Object>();
-            v8::String::Utf8Value mod(g_isolate, entry->Get(ctx(), v8str("module")).ToLocalChecked());
-            v8::String::Utf8Value name(g_isolate, entry->Get(ctx(), v8str("name")).ToLocalChecked());
-            v8::String::Utf8Value kind(g_isolate, entry->Get(ctx(), v8str("kind")).ToLocalChecked());
-            // Pre-scan for GL imports (needed before wc_get_info for deferred init)
-            // This is a fallback — gpu_api field in wc_info_t is authoritative after init
-            if (strcmp(*mod, "gl") == 0 ||
-                (strcmp(*mod, "env") == 0 && strcmp(*kind, "function") == 0 &&
-                 (*name)[0] == 'g' && (*name)[1] == 'l' && (*name)[2] >= 'A' && (*name)[2] <= 'Z')) {
-                host->uses_gl = true;
-                break;
-            }
-        }
-    }
 
     // 6-10. Init sequence (_initialize, wc_get_info, wc_init)
     // Can be deferred for GL carts that need the GL context first (libretro)
@@ -1833,6 +1829,14 @@ extern "C" int wc_host_finish_init(wc_host_t* host) {
     _current_host = host;
     auto state = (v8_host_state*)host->v8_state;
     v8::TryCatch try_catch(g_isolate);
+
+    // Same rule as the non-deferred path in wc_host_load_file: running a GL
+    // cart's init with no loader would jump through null GL pointers.
+    if (host->uses_gl && !host->gl_loader) {
+        wc_log( "wasmcart: %s is a GL cart but no GL context is available\n",
+            host->manifest.name);
+        return -1;
+    }
 
     // Call _initialize
     if (!state->fn_initialize.IsEmpty()) {
