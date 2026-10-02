@@ -25,6 +25,12 @@ extern "C" {
 #define WC_MAX_POINTERS    10
 #define WC_KEYS_STATE_SIZE 32
 
+// Largest delta_ms an embedder should hand a cart (SPEC: Frame timing). A
+// stall longer than this reaches the cart as one 250ms step, and time_ms is
+// kept consistent with the deltas actually delivered. A fixed step chosen by a
+// harness is not clamped.
+#define WC_MAX_DELTA_MS    250.0
+
 // Button bitmask
 #define WC_BUTTON_A      (1 << 0)
 #define WC_BUTTON_B      (1 << 1)
@@ -211,7 +217,7 @@ typedef struct {
 
 typedef struct wc_host wc_host_t;
 
-// Lifecycle
+// Create / destroy
 wc_host_t* wc_host_create(void);
 void       wc_host_destroy(wc_host_t* host);
 
@@ -293,6 +299,9 @@ void wc_host_set_pointer(wc_host_t* host, int index, int16_t x, int16_t y, uint8
 #define WC_WHEEL_DELTA 120
 
 void wc_host_add_wheel(wc_host_t* host, int32_t dx, int32_t dy);
+
+// Written verbatim. Clamping delta_ms to WC_MAX_DELTA_MS is the caller's job,
+// because a harness passing a fixed step must get exactly the step it asked for.
 void wc_host_set_time(wc_host_t* host, double time_ms, double delta_ms, uint32_t frame);
 
 // ─── Peer connections (ABI v3) ─────────────────────────────────────────────
@@ -346,11 +355,41 @@ void wc_host_remove_peer(wc_host_t* host, int32_t peer_id);
 
 // Advance node's event loop without running a frame. wc_host_run_frame() does
 // this for you; call it directly only when driving async work outside the
-// frame loop (waiting on a connection before the cart starts, say).
+// frame loop (waiting on a connection before the cart starts, say) or while
+// the cart is suspended.
 void wc_host_pump(wc_host_t* host);
 
-// Run one frame — calls wc_render() on the cart
+// Run one frame — calls wc_render() on the cart. Does nothing while suspended.
 void wc_host_run_frame(wc_host_t* host);
+
+// ─── Lifecycle (SPEC: Lifecycle) ───────────────────────────────────────────
+//
+// Suspension is host-owned: while suspended, wc_host_run_frame() never calls
+// wc_render(). Suspend and focus are separate, as in the spec: a minimized
+// window suspends, an unfocused one keeps rendering. Each call delivers the
+// matching optional cart export (wc_on_suspend, wc_on_resume,
+// wc_on_focus_lost, wc_on_focus_gained) and returns true only if the state
+// actually changed, so calling them on every event is safe. Names, ordering
+// and return values match the JS CartHost, except that wc_host_focus is
+// refused while suspended (below).
+//
+//   suspend  -> wc_on_focus_lost (if focused), then wc_on_suspend
+//   resume   -> wc_on_resume, then wc_on_focus_gained
+//
+// After resuming into a window that does not have focus, call wc_host_blur().
+// wc_host_focus() is refused while suspended, so focus_gained can never
+// arrive before resume. Rebase your clock before resuming so the cart sees no
+// phantom time. wc_host_run_frame no longer pumps node while suspended, so
+// call wc_host_pump yourself if the cart's connections should stay alive.
+// A cart whose callback throws is logged, not trapped. Callbacks
+// are skipped before a deferred init completes and after a trap, but the state
+// still changes. Call from the thread that runs frames.
+bool wc_host_suspend(wc_host_t* host);
+bool wc_host_resume(wc_host_t* host);
+bool wc_host_blur(wc_host_t* host);
+bool wc_host_focus(wc_host_t* host);
+bool wc_host_is_suspended(wc_host_t* host);
+bool wc_host_is_focused(wc_host_t* host);
 
 // V8 locking — hold locker persistently for hosts that call from the same thread
 void wc_host_enter_v8(void);
