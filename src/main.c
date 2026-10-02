@@ -381,8 +381,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Set up FBO redirect at the preferred (actual rendering) resolution
-    {
+    // Set up FBO redirect at the preferred (actual rendering) resolution.
+    // Only with a live context, which by now means a GL cart: a 2D cart has
+    // already traded EGL for the SDL renderer, and when EGL failed to
+    // initialize no GL loader was ever set, so this would call through null
+    // GL pointers.
+    if (egl_is_initialized()) {
         extern void wc_gl_setup_redirect(uint32_t width, uint32_t height);
         uint32_t redir_w = pref_width ? pref_width : cart_w;
         uint32_t redir_h = pref_height ? pref_height : cart_h;
