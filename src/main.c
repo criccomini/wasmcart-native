@@ -7,6 +7,7 @@
 
 #include "../include/wasmcart_host.h"
 #include "egl_context.h"
+#include "frame_clock.h"
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
@@ -125,6 +126,13 @@ static void poll_keyboard_as_pad(wc_pad_t* pad) {
     if (kb[SDL_SCANCODE_BACKSPACE] || kb[SDL_SCANCODE_RSHIFT]) pad->buttons |= WC_BUTTON_SELECT;
 
     if (pad->buttons) pad->connected = 1;
+}
+
+static void queue_silence(SDL_AudioDeviceID dev, uint32_t bytes) {
+    uint8_t* silence = calloc(1, bytes);
+    if (!silence) return;
+    SDL_QueueAudio(dev, silence, bytes);
+    free(silence);
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────
@@ -438,6 +446,7 @@ int main(int argc, char* argv[]) {
 
     // 5. Open audio device
     SDL_AudioDeviceID audio_dev = 0;
+    uint32_t audio_seed_bytes = 0;  // ~50ms of silence, re-queued on resume
     uint32_t audio_rate = info->audio_sample_rate ? info->audio_sample_rate : 48000;
     bool audio_f32 = (info->flags & WC_FLAG_AUDIO_F32) != 0;
 
@@ -454,10 +463,8 @@ int main(int argc, char* argv[]) {
         if (audio_dev) {
             // Pre-seed with ~50ms of silence to prevent initial underruns
             uint32_t seed_frames = have.freq / 20; // 50ms
-            uint32_t seed_bytes = seed_frames * have.channels * (audio_f32 ? 4 : 2);
-            uint8_t* silence = calloc(1, seed_bytes);
-            SDL_QueueAudio(audio_dev, silence, seed_bytes);
-            free(silence);
+            audio_seed_bytes = seed_frames * have.channels * (audio_f32 ? 4 : 2);
+            queue_silence(audio_dev, audio_seed_bytes);
             SDL_PauseAudioDevice(audio_dev, 0);
             fprintf(stderr, "wasmcart: audio %uHz %s stereo\n",
                 have.freq, audio_f32 ? "F32" : "S16");
@@ -482,7 +489,9 @@ int main(int argc, char* argv[]) {
     uint64_t start_ticks = SDL_GetTicks64();
     uint32_t fps_counter = 0;
     uint64_t fps_last = start_ticks;
-    uint64_t last_frame_ticks = start_ticks;
+    wc_frame_clock_t frame_clock;
+    wc_frame_clock_start(&frame_clock, (double)start_ticks);
+    bool window_focused = true;  // as the cart assumes at start (SPEC: Lifecycle)
 
     while (running) {
         uint64_t now = SDL_GetTicks64();
@@ -520,6 +529,12 @@ int main(int argc, char* argv[]) {
                 case SDL_CONTROLLERDEVICEREMOVED:
                     close_controller(event.cdevice.which);
                     break;
+                case SDL_WINDOWEVENT:
+                    if (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
+                        window_focused = true;
+                    else if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+                        window_focused = false;
+                    break;
                 case SDL_KEYDOWN:
                     if (event.key.keysym.sym == SDLK_ESCAPE) running = false;
                     if (event.key.keysym.sym == SDLK_F11) {
@@ -529,6 +544,56 @@ int main(int argc, char* argv[]) {
                     }
                     break;
             }
+        }
+
+        // Lifecycle (SPEC: Lifecycle). A minimized or hidden window suspends
+        // the cart; losing focus only tells it so, and it keeps rendering.
+        // Suspension is read from the window flags after the drain rather
+        // than from individual events, because backends disagree about which
+        // events a minimize and restore send (SDL2 on macOS restores with
+        // SHOWN, sdl2-compat with RESTORED) while all of them keep the flags
+        // right. Focus is tracked from focus events instead of polled, since
+        // a seat with only gamepads never gives a window keyboard focus.
+        {
+            bool hidden = (SDL_GetWindowFlags(window) &
+                           (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) != 0;
+            if (hidden) {
+                if (wc_host_suspend(host)) {
+                    fprintf(stderr, "wasmcart: suspended at frame %u\n", frame_count);
+                    // A hidden app can be killed without ever reaching a
+                    // graceful quit, so suspend is a persistence point.
+                    persist_sav(host, sav_path);
+                    if (audio_dev) {
+                        SDL_PauseAudioDevice(audio_dev, 1);
+                        SDL_ClearQueuedAudio(audio_dev);
+                    }
+                }
+            } else if (wc_host_is_suspended(host)) {
+                // Rebase first: the suspend is a gap we know about, so the
+                // cart sees none of it, not even one clamped frame.
+                wc_frame_clock_rebase(&frame_clock, (double)now);
+                wc_host_resume(host);
+                fprintf(stderr, "wasmcart: resumed at frame %u\n", frame_count);
+                if (audio_dev) {
+                    queue_silence(audio_dev, audio_seed_bytes);
+                    SDL_PauseAudioDevice(audio_dev, 0);
+                }
+                fps_counter = 0;
+                fps_last = now;
+            }
+            if (!wc_host_is_suspended(host)) {
+                if (window_focused) wc_host_focus(host);
+                else wc_host_blur(host);
+            }
+        }
+        if (wc_host_is_suspended(host)) {
+            if (!running || g_should_quit) break;
+            // No render, present or audio while suspended. Keep node's event
+            // loop turning for the cart's connections, and sleep until the
+            // next window event instead of spinning.
+            wc_host_pump(host);
+            SDL_WaitEventTimeout(NULL, 100);
+            continue;
         }
 
         // Don't set viewport before wc_render — the cart manages its own GL state
@@ -547,11 +612,9 @@ int main(int argc, char* argv[]) {
         }
         wc_host_set_pads(host, pads);
 
-        // Time
-        double time_ms = (double)(now - start_ticks);
-        double delta_ms = (double)(now - last_frame_ticks);
-        if (delta_ms <= 0.0) delta_ms = 0.001;  // avoid zero delta
-        last_frame_ticks = now;
+        // Time: delta clamped to WC_MAX_DELTA_MS, time_ms kept consistent
+        double time_ms, delta_ms;
+        wc_frame_clock_tick(&frame_clock, (double)now, &time_ms, &delta_ms);
         wc_host_set_time(host, time_ms, delta_ms, frame_count);
 
         // Run frame
