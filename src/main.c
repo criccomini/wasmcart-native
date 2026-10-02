@@ -588,8 +588,12 @@ int main(int argc, char* argv[]) {
         if (egl_is_initialized()) {
             // GL carts: blit redirect FBO to screen, then swap
             extern void wc_gl_blit_to_screen(uint32_t cart_w, uint32_t cart_h, uint32_t win_w, uint32_t win_h);
+            // The letterbox rect and viewport are in surface PIXELS. On Retina
+            // the surface is backing-scale times the window's point size, so
+            // SDL_GetWindowSize would put the picture in a corner quarter.
             int cur_w, cur_h;
-            SDL_GetWindowSize(window, &cur_w, &cur_h);
+            if (!egl_get_drawable_size(&cur_w, &cur_h))
+                SDL_GetWindowSize(window, &cur_w, &cur_h);
             uint32_t rw = pref_width ? pref_width : cart_w;
             uint32_t rh = pref_height ? pref_height : cart_h;
             wc_gl_blit_to_screen(rw, rh, (uint32_t)cur_w, (uint32_t)cur_h);

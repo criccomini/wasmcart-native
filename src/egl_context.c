@@ -22,6 +22,7 @@ static EGLContext egl_context = EGL_NO_CONTEXT;
 static EGLSurface egl_surface = EGL_NO_SURFACE;
 static EGLConfig egl_config;
 static bool initialized = false;
+static bool window_surface = false;
 
 #ifdef __APPLE__
 /* The original SDL handle and its resolved CALayer, plus deferred vsync:
@@ -153,7 +154,19 @@ int egl_create_window_surface(void* native_window) {
     }
 
     eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context);
+    window_surface = true;
     return 0;
+}
+
+bool egl_get_drawable_size(int* w, int* h) {
+    if (!initialized || !window_surface) return false;
+    EGLint sw = 0, sh = 0;
+    if (!eglQuerySurface(egl_display, egl_surface, EGL_WIDTH, &sw) ||
+        !eglQuerySurface(egl_display, egl_surface, EGL_HEIGHT, &sh) ||
+        sw <= 0 || sh <= 0) return false;
+    *w = sw;
+    *h = sh;
+    return true;
 }
 
 void egl_make_current(void) {
@@ -206,6 +219,7 @@ void egl_destroy(void) {
     if (egl_context != EGL_NO_CONTEXT) eglDestroyContext(egl_display, egl_context);
     if (egl_display != EGL_NO_DISPLAY) eglTerminate(egl_display);
     initialized = false;
+    window_surface = false;
 }
 
 void* egl_get_proc_address(const char* name) {

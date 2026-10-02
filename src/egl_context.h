@@ -15,6 +15,12 @@ int egl_create_context(uint32_t width, uint32_t height);
 // Call after SDL_CreateWindow.
 int egl_create_window_surface(void* native_window);
 
+// Size of the window surface in PIXELS. On a HiDPI display (macOS Retina,
+// where the layer's contentsScale is the backing scale) this is larger than
+// SDL_GetWindowSize, which reports points. False if there is no window
+// surface yet.
+bool egl_get_drawable_size(int* w, int* h);
+
 // Make the EGL context current (call after SDL init to re-assert).
 void egl_make_current(void);
 
