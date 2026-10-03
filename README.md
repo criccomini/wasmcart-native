@@ -299,6 +299,7 @@ cc -Iinclude -o pad_layout_test test/pad_layout_test.c && ./pad_layout_test   # 
 sh test/controller_db_platform_test.sh build/wasmcart-run test/snake.wasc   # this platform's mappings only
 python3 test/pad_hotplug_test.py build/wasmcart-run test/snake.wasc   # one slot per pad (Linux, uinput)
 cc -Isrc -o save_file_test test/save_file_test.c && ./save_file_test   # a save is replaced whole or not at all
+cc -Isrc -o save_writer_test test/save_writer_test.c $(pkg-config --cflags --libs sdl2) && ./save_writer_test
 python3 test/save_test.py build/wasmcart-run ../wasmcart/test/fixtures   # --save, --save-every, kills
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
