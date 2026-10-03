@@ -291,8 +291,11 @@ static void lock_save_if_moved(wc_host_t* host) {
         host->save_locked = true;
         return;
     }
-    if (host->save_loaded && (host->info.save_ptr != host->save_ptr_loaded ||
-                              host->info.save_size != host->save_size_loaded)) {
+    // Also when the region was empty before wc_init and the cart only set it
+    // up there: the save was never loaded, and the first write would
+    // replace it with the cart's fresh state.
+    if (host->save_provided && (host->info.save_ptr != host->save_ptr_loaded ||
+                                host->info.save_size != host->save_size_loaded)) {
         wc_log("wasmcart: save region moved during wc_init (%u bytes at %u, then %u at %u): "
                "not saving, so the save on disk survives\n",
                host->save_size_loaded, host->save_ptr_loaded,
@@ -1804,6 +1807,7 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
         if (check_save_region(host) != 0) return -1;
         host->save_ptr_loaded = host->info.save_ptr;
         host->save_size_loaded = host->info.save_size;
+        host->save_provided = opts && opts->save_data && opts->save_data_size > 0;
         if (opts && opts->save_data && host->info.save_ptr && opts->save_data_size > 0) {
             // A save of the wrong size is damaged or belongs to something
             // else. Loading part of it (or a cut-off prefix) would hand the
