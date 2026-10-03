@@ -4,6 +4,7 @@
 // V8 FunctionCallback wrappers instead of wasmtime callbacks.
 
 #include "v8.h"
+#include <vector>
 extern "C" {
 #include "cart_host.h"
 #include <GLES3/gl3.h>
@@ -65,21 +66,61 @@ static const char* _filtered_extensions[] = {
 };
 static const int _num_filtered_extensions = 7;
 
+// ─── Cart pointers ────────────────────────────────────────────────────────
+// Every pointer argument is an offset into the cart's memory that the cart
+// chose, and GL follows whatever host address it is handed. So each one is
+// checked first for the bytes the call will really touch (NEED, which traps
+// the cart if they aren't all in its memory) and only then converted.
+//
+// A 0 pointer stays NULL where GL gives NULL a meaning (no data for
+// glBuffer(Sub)Data and the texture uploads, an optional length out-param,
+// no array for glVertexAttribPointer); everywhere else it is cart address 0,
+// as it is for the cart's own loads and stores. Handing the driver NULL for
+// a pointer it must follow crashes the host.
+
+// Trap and return from the GL_REG callback unless [p, p + len) is cart memory.
+#define NEED(p, len) do { if (!wc_cart_range_ok(_host, _import, (p), (len))) return; } while (0)
+// The same for a NUL-terminated string.
+#define NEED_STR(p) do { if (!wc_cart_str_ok(_host, _import, (p))) return; } while (0)
+
+// Host address of a cart pointer that has passed NEED.
+static inline void* wmem(uint32_t p) {
+    return _host->memory + p;
+}
+// The same, except that 0 stays NULL.
+static inline void* wptr(uint32_t p) {
+    return p ? (_host->memory + p) : NULL;
+}
+
+// Bytes for n items of `each` bytes. GL's counts are signed, and a negative
+// one is an error that touches nothing.
+static inline uint64_t _nbytes(int32_t n, uint64_t each) {
+    return n > 0 ? (uint64_t)n * each : 0;
+}
+
+// Which buffer GL has bound at `binding`. With one bound, a pointer argument
+// for that target is an offset into that buffer, not a cart pointer at all.
+// With none, it is a client pointer, i.e. cart memory. Asked of GL rather
+// than tracked from glBindBuffer: deleting a buffer unbinds it, and the
+// element array binding changes with every glBindVertexArray.
+static GLuint _boundBuffer(GLenum binding) {
+    GLint b = 0;
+    glGetIntegerv(binding, &b);
+    return (GLuint)b;
+}
+
 // ─── Client-side vertex array support ────────────────────────────────────
 // gl4es uses client-side arrays (no VBO bound). We must track the WASM pointers
 // and upload to temp VBOs before draw calls, just like the Node.js host does.
 
 #define MAX_VERTEX_ATTRIBS 16
 
-static GLuint _boundArrayBuffer = 0;
-static GLuint _boundElementBuffer = 0;
-
 typedef struct {
     int active;         // has client-side pointer stored
     int size;           // components per vertex (1-4)
     GLenum type;        // GL_FLOAT, GL_SHORT, etc.
     GLboolean normalized;
-    int stride;
+    int stride;         // >= 0
     uint32_t wasmPtr;   // WASM memory offset
 } client_attrib_t;
 
@@ -98,59 +139,290 @@ static int _bytesForGLType(GLenum type) {
     }
 }
 
-static void _uploadClientAttribs(int firstVertex, int vertexCount) {
-    if (_numClientAttribs == 0) return;
+// Bytes one vertex of an attribute takes up: size components of type, except
+// the packed types, which hold all four in one 32-bit word.
+static uint64_t _attribBytes(const client_attrib_t* a) {
+    if (a->type == GL_INT_2_10_10_10_REV || a->type == GL_UNSIGNED_INT_2_10_10_10_REV) return 4;
+    return (uint64_t)a->size * _bytesForGLType(a->type);
+}
+
+// Where vertices [first, first + count) of a client array lie in cart memory.
+// Exact: the last vertex ends at its own last byte, not a whole stride later,
+// so an array that ends where the cart's memory ends still fits. With `fit`,
+// count is only a guess (see glDrawElements) and is cut short at the end of
+// memory instead; just the first vertex has to be in it.
+static void _clientRange(const client_attrib_t* a, uint64_t first, uint64_t count, bool fit,
+                         uint64_t* start, uint64_t* len) {
+    uint64_t elem = _attribBytes(a);
+    uint64_t stride = a->stride ? (uint64_t)a->stride : elem;
+    *start = a->wasmPtr + first * stride;
+    if (fit && *start + elem <= _host->memory_size) {
+        uint64_t room = (_host->memory_size - *start - elem) / stride + 1;
+        if (count > room) count = room;
+    }
+    *len = (count - 1) * stride + elem;
+}
+
+// Upload vertices [first, first + count) of every client array to its temp
+// VBO. Every array is checked before any is uploaded. Returns false if one
+// is outside cart memory, in which case the cart has been trapped.
+static bool _uploadClientAttribs(const char* import, uint64_t first, uint64_t count, bool fit) {
+    if (_numClientAttribs == 0 || count == 0) return true;
+    uint64_t start, len;
+    for (int i = 0; i < MAX_VERTEX_ATTRIBS; i++) {
+        if (!_clientAttribs[i].active) continue;
+        _clientRange(&_clientAttribs[i], first, count, fit, &start, &len);
+        if (!wc_cart_range_ok(_host, import, start, len)) return false;
+    }
+    GLuint prev = _boundBuffer(GL_ARRAY_BUFFER_BINDING);
     for (int i = 0; i < MAX_VERTEX_ATTRIBS; i++) {
         client_attrib_t* a = &_clientAttribs[i];
         if (!a->active) continue;
-        int elemBytes = a->size * _bytesForGLType(a->type);
-        int effectiveStride = a->stride ? a->stride : elemBytes;
-        uint32_t startByte = a->wasmPtr + firstVertex * effectiveStride;
-        int totalBytes = vertexCount * effectiveStride;
+        _clientRange(a, first, count, fit, &start, &len);
         if (!_tempVBOs[i]) glGenBuffers(1, &_tempVBOs[i]);
         glBindBuffer(GL_ARRAY_BUFFER, _tempVBOs[i]);
-        glBufferData(GL_ARRAY_BUFFER, totalBytes, _host->memory + startByte, GL_STREAM_DRAW);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)len, _host->memory + start, GL_STREAM_DRAW);
         glVertexAttribPointer(i, a->size, a->type, a->normalized, a->stride, 0);
     }
     // Restore user's binding
-    glBindBuffer(GL_ARRAY_BUFFER, _boundArrayBuffer);
+    glBindBuffer(GL_ARRAY_BUFFER, prev);
+    return true;
 }
 
-static void _uploadClientIndices(uint32_t wasmPtr, int count, GLenum type) {
-    int elemSize = _bytesForGLType(type);
-    int totalBytes = count * elemSize;
+// glVertexAttrib(I)Pointer with no array buffer bound: ptr is a client array
+// in cart memory. It is kept here and uploaded at draw time; GL itself is
+// never given it, since with no buffer bound GL would take it as a host
+// address.
+static void _setClientAttrib(uint32_t idx, GLint size, GLenum type, GLboolean normalized,
+                             GLsizei stride, uint32_t ptr) {
+    if (idx >= MAX_VERTEX_ATTRIBS) {
+        // Past what's tracked here, so there's nothing to upload it from.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            wc_log("wasmcart: client-side array on attribute %u ignored; only the "
+                   "first %d can have one\n", idx, MAX_VERTEX_ATTRIBS);
+        }
+        return;
+    }
+    if (size < 1 || size > 4 || stride < 0) {
+        // GL's INVALID_VALUE. Let GL raise it; it changes no state.
+        glVertexAttribPointer(idx, size, type, normalized, stride, NULL);
+        return;
+    }
+    if (!_clientAttribs[idx].active) _numClientAttribs++;
+    _clientAttribs[idx].active = 1;
+    _clientAttribs[idx].size = size;
+    _clientAttribs[idx].type = type;
+    _clientAttribs[idx].normalized = normalized;
+    _clientAttribs[idx].stride = stride;
+    _clientAttribs[idx].wasmPtr = ptr;
+}
+
+static void _clearClientAttrib(uint32_t idx) {
+    if (idx < MAX_VERTEX_ATTRIBS && _clientAttribs[idx].active) {
+        _clientAttribs[idx].active = 0;
+        _numClientAttribs--;
+    }
+}
+
+static bool _isIndexType(GLenum type) {
+    return type == GL_UNSIGNED_BYTE || type == GL_UNSIGNED_SHORT || type == GL_UNSIGNED_INT;
+}
+
+// Copy client-side indices (already checked to be in cart memory) into
+// _tempEBO and leave it bound; draw with offset 0, then rebind 0.
+static void _uploadClientIndices(uint32_t wasmPtr, uint64_t bytes) {
     if (!_tempEBO) glGenBuffers(1, &_tempEBO);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, _tempEBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, totalBytes, _host->memory + wasmPtr, GL_STREAM_DRAW);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)bytes, _host->memory + wasmPtr, GL_STREAM_DRAW);
 }
 
 // Forward declare — defined in cart_host.cpp
 extern "C" void wc_refresh_memory(wc_host_t* host);
 
-// Helper: WASM pointer to native pointer
-static inline void* wptr(uint32_t p) {
-    return p ? (_host->memory + p) : NULL;
-}
-
 // ─── V8 FunctionCallback wrapper macro ─────────────────────────────────────
 // Each GL function becomes a v8::FunctionCallback that unpacks args and
-// calls the real GL function. Same GL bodies as wasmtime version.
+// calls the real GL function. Same GL bodies as wasmtime version. The body is
+// variadic so a comma in it can't split it into extra macro arguments.
 
-#define GL_REG(name, nparams, nresults, body) \
+#define GL_REG(name, nparams, nresults, ...) \
     static void _cb_##name(const v8::FunctionCallbackInfo<v8::Value>& _args) { \
         v8::Local<v8::Context> _ctx = ctx(); \
         (void)_ctx; \
+        const char* _import = #name; \
+        (void)_import; \
         wc_refresh_memory(_host); \
-        body; \
+        __VA_ARGS__; \
     }
 
 #define A_I32(n) (_args[n]->Int32Value(_ctx).FromJust())
 #define A_U32(n) (_args[n]->Uint32Value(_ctx).FromJust())
 #define A_F32(n) ((float)_args[n]->NumberValue(_ctx).FromJust())
 #define A_F64(n) (_args[n]->NumberValue(_ctx).FromJust())
-#define A_I64(n) ((int64_t)_args[n]->IntegerValue(_ctx).FromJust())
+// i64 arrives from wasm as a BigInt, which IntegerValue() can't convert.
+#define A_I64(n) (_args[n]->IsBigInt() ? _args[n].As<v8::BigInt>()->Int64Value() \
+                                       : (int64_t)_args[n]->IntegerValue(_ctx).FromJust())
 #define R_I32(v) _args.GetReturnValue().Set((int32_t)(v))
 #define R_F32(v) _args.GetReturnValue().Set((double)(v))
+
+// ─── glGet* ───────────────────────────────────────────────────────────────
+// Most glGet* calls write a pname-dependent number of values. The driver
+// writes into a scratch buffer with room to spare, and only the values the
+// pname really has are copied out to the cart, so a pname not listed here (a
+// desktop-only or extension one) can't make the driver write past the cart's
+// buffer. The cart's current values go into the scratch first, so a call GL
+// rejects leaves them as they were.
+template <typename T, typename F>
+static bool _getInto(const char* import, uint32_t p, uint64_t n, F get) {
+    if (!wc_cart_range_ok(_host, import, p, n * sizeof(T))) return false;
+    T stack[80];
+    std::vector<T> heap;
+    T* buf = stack;
+    if (n + 64 > 80) {
+        heap.resize(n + 64);
+        buf = heap.data();
+    }
+    memcpy(buf, _host->memory + p, n * sizeof(T));
+    get(buf);
+    memcpy(_host->memory + p, buf, n * sizeof(T));
+    return true;
+}
+
+// How many values glGet{Integer,Float,Boolean,Integer64}v writes for pname:
+// one, except for these (ES 3.2's state tables, plus the two desktop GL
+// ranges a libretro desktop context answers).
+static uint64_t _getCount(GLenum pname) {
+    GLint n = 0;
+    switch (pname) {
+    case GL_VIEWPORT: case GL_SCISSOR_BOX: case GL_COLOR_WRITEMASK:
+    case GL_COLOR_CLEAR_VALUE: case GL_BLEND_COLOR:
+        return 4;
+    case GL_DEPTH_RANGE: case GL_ALIASED_LINE_WIDTH_RANGE:
+    case GL_ALIASED_POINT_SIZE_RANGE: case GL_MAX_VIEWPORT_DIMS:
+    case 0x0B12: /* GL_POINT_SIZE_RANGE */ case 0x0B22: /* GL_LINE_WIDTH_RANGE */
+        return 2;
+    case GL_PRIMITIVE_BOUNDING_BOX:
+        return 8;
+    case GL_COMPRESSED_TEXTURE_FORMATS:
+        glGetIntegerv(GL_NUM_COMPRESSED_TEXTURE_FORMATS, &n);
+        return n > 0 ? (uint64_t)n : 0;
+    case GL_PROGRAM_BINARY_FORMATS:
+        glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &n);
+        return n > 0 ? (uint64_t)n : 0;
+    case GL_SHADER_BINARY_FORMATS:
+        glGetIntegerv(GL_NUM_SHADER_BINARY_FORMATS, &n);
+        return n > 0 ? (uint64_t)n : 0;
+    default:
+        return 1;
+    }
+}
+
+// ─── Pixel data ───────────────────────────────────────────────────────────
+
+// Sizes computed from cart-chosen dimensions can pass 64 bits. Saturate
+// rather than wrap: a wrapped size could look small enough to fit.
+static uint64_t _mulSat(uint64_t a, uint64_t b) {
+    return (a && b > UINT64_MAX / a) ? UINT64_MAX : a * b;
+}
+static uint64_t _addSat(uint64_t a, uint64_t b) {
+    return a + b < a ? UINT64_MAX : a + b;
+}
+
+// Bytes per pixel of client pixel data in format/type, or 0 for a pair this
+// doesn't know.
+static uint64_t _pixelBytes(GLenum format, GLenum type) {
+    switch (type) {
+    case GL_UNSIGNED_SHORT_5_6_5: case GL_UNSIGNED_SHORT_4_4_4_4:
+    case GL_UNSIGNED_SHORT_5_5_5_1:
+        return 2;
+    case GL_UNSIGNED_INT_2_10_10_10_REV: case GL_UNSIGNED_INT_10F_11F_11F_REV:
+    case GL_UNSIGNED_INT_5_9_9_9_REV: case GL_UNSIGNED_INT_24_8:
+        return 4;
+    case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
+        return 8;
+    }
+    uint64_t comps;
+    switch (format) {
+    case GL_RED: case GL_RED_INTEGER: case GL_ALPHA: case GL_LUMINANCE:
+    case GL_DEPTH_COMPONENT: case GL_STENCIL_INDEX:
+        comps = 1; break;
+    case GL_RG: case GL_RG_INTEGER: case GL_LUMINANCE_ALPHA:
+        comps = 2; break;
+    case GL_RGB: case GL_RGB_INTEGER:
+        comps = 3; break;
+    case GL_RGBA: case GL_RGBA_INTEGER: case GL_BGRA_EXT:
+        comps = 4; break;
+    default:
+        return 0;
+    }
+    switch (type) {
+    case GL_UNSIGNED_BYTE: case GL_BYTE:
+        return comps;
+    case GL_UNSIGNED_SHORT: case GL_SHORT: case GL_HALF_FLOAT: case GL_HALF_FLOAT_OES:
+        return comps * 2;
+    case GL_UNSIGNED_INT: case GL_INT: case GL_FLOAT:
+        return comps * 4;
+    }
+    return 0;
+}
+
+// Bytes GL reads (unpack) or writes (pack) for a w x h x d image in client
+// memory, by ES 3.0's pixel store rules: each row starts ALIGNMENT-aligned,
+// rows are ROW_LENGTH pixels apart, SKIP_PIXELS/ROWS/IMAGES move the start,
+// and the last row isn't padded. That's also the size WebGL2 requires of the
+// array it's given. The store state is read back from GL, since that is what
+// the driver will use.
+static uint64_t _imageBytes(bool pack, bool three_d, GLsizei w, GLsizei h, GLsizei d,
+                            GLenum format, GLenum type) {
+    if (w <= 0 || h <= 0 || d <= 0) return 0;
+    uint64_t bpp = _pixelBytes(format, type);
+    if (!bpp) bpp = 16;  // a pair we don't know: assume ES's widest pixel (RGBA32F)
+    GLint align = 4, row_len = 0, skip_rows = 0, skip_px = 0, img_h = 0, skip_img = 0;
+    glGetIntegerv(pack ? GL_PACK_ALIGNMENT : GL_UNPACK_ALIGNMENT, &align);
+    glGetIntegerv(pack ? GL_PACK_ROW_LENGTH : GL_UNPACK_ROW_LENGTH, &row_len);
+    glGetIntegerv(pack ? GL_PACK_SKIP_ROWS : GL_UNPACK_SKIP_ROWS, &skip_rows);
+    glGetIntegerv(pack ? GL_PACK_SKIP_PIXELS : GL_UNPACK_SKIP_PIXELS, &skip_px);
+    if (three_d) {  // there's no pack equivalent
+        glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT, &img_h);
+        glGetIntegerv(GL_UNPACK_SKIP_IMAGES, &skip_img);
+    }
+    uint64_t a = align > 0 ? (uint64_t)align : 1;
+    uint64_t row_px = row_len > 0 ? (uint64_t)row_len : (uint64_t)w;
+    uint64_t stride = (row_px * bpp + a - 1) / a * a;   // < 2^36, can't overflow
+    uint64_t img_stride = _mulSat(img_h > 0 ? (uint64_t)img_h : (uint64_t)h, stride);
+    uint64_t bytes = _mulSat((uint64_t)(skip_px > 0 ? skip_px : 0), bpp);
+    bytes = _addSat(bytes, _mulSat((uint64_t)(skip_rows > 0 ? skip_rows : 0), stride));
+    bytes = _addSat(bytes, _mulSat((uint64_t)(skip_img > 0 ? skip_img : 0), img_stride));
+    bytes = _addSat(bytes, _mulSat((uint64_t)d - 1, img_stride));
+    bytes = _addSat(bytes, _mulSat((uint64_t)h - 1, stride));
+    return _addSat(bytes, (uint64_t)w * bpp);
+}
+
+// The pixels argument of glTex(Sub)Image*. With a buffer on
+// GL_PIXEL_UNPACK_BUFFER it is an offset into that buffer and is passed on
+// as one; otherwise it is cart memory, the image's size of it. NULL stays
+// NULL: no data, for glTexImage*. Returns false if the cart was trapped.
+static bool _unpackPixels(const char* import, uint32_t p, bool three_d, GLsizei w, GLsizei h,
+                          GLsizei d, GLenum format, GLenum type, const void** out) {
+    if (_boundBuffer(GL_PIXEL_UNPACK_BUFFER_BINDING)) {
+        *out = (const void*)(uintptr_t)p;
+        return true;
+    }
+    *out = wptr(p);
+    return !p || wc_cart_range_ok(_host, import, p, _imageBytes(false, three_d, w, h, d, format, type));
+}
+
+// The data argument of glCompressedTex(Sub)Image*: the same, but its size is
+// imageSize, which the cart states and GL checks against the dimensions.
+static bool _unpackCompressed(const char* import, uint32_t p, GLsizei imageSize, const void** out) {
+    if (_boundBuffer(GL_PIXEL_UNPACK_BUFFER_BINDING)) {
+        *out = (const void*)(uintptr_t)p;
+        return true;
+    }
+    *out = wptr(p);
+    return !p || wc_cart_range_ok(_host, import, p, _nbytes(imageSize, 1));
+}
 
 // ─── State ─────────────────────────────────────────────────────────────────
 
@@ -165,18 +437,30 @@ GL_REG(glIsEnabled, 1, 1, R_I32(glIsEnabled(A_U32(0))))
 
 GL_REG(glGetIntegerv, 2, 0, {
     GLenum pname = A_U32(0);
-    GLint* out = (GLint*)wptr(A_U32(1));
-    glGetIntegerv(pname, out);
-    // Ensure correct values for draw buffer caps — Core 3.3 returns correct values
-    // but gl4es may query these before the context is fully configured
-    if ((pname == 0x8CDF || pname == 0x8824) && *out < 4) {
-        *out = 8; // GL_MAX_COLOR_ATTACHMENTS / GL_MAX_DRAW_BUFFERS
-    }
+    _getInto<GLint>(_import, A_U32(1), _getCount(pname), [&](GLint* out) {
+        glGetIntegerv(pname, out);
+        // Ensure correct values for draw buffer caps — Core 3.3 returns correct values
+        // but gl4es may query these before the context is fully configured
+        if ((pname == 0x8CDF || pname == 0x8824) && *out < 4) {
+            *out = 8; // GL_MAX_COLOR_ATTACHMENTS / GL_MAX_DRAW_BUFFERS
+        }
+    });
 })
-GL_REG(glGetFloatv, 2, 0, glGetFloatv(A_U32(0), (GLfloat*)wptr(A_U32(1))))
-GL_REG(glGetBooleanv, 2, 0, glGetBooleanv(A_U32(0), (GLboolean*)wptr(A_U32(1))))
-GL_REG(glGetInternalformativ, 5, 0,
-    glGetInternalformativ(A_U32(0), A_U32(1), A_U32(2), A_I32(3), (GLint*)wptr(A_U32(4))))
+GL_REG(glGetFloatv, 2, 0, {
+    GLenum pname = A_U32(0);
+    _getInto<GLfloat>(_import, A_U32(1), _getCount(pname), [&](GLfloat* out) { glGetFloatv(pname, out); });
+})
+GL_REG(glGetBooleanv, 2, 0, {
+    GLenum pname = A_U32(0);
+    _getInto<GLboolean>(_import, A_U32(1), _getCount(pname), [&](GLboolean* out) { glGetBooleanv(pname, out); });
+})
+// GL writes at most bufSize values.
+GL_REG(glGetInternalformativ, 5, 0, {
+    GLsizei bufSize = A_I32(3);
+    uint32_t p = A_U32(4);
+    NEED(p, _nbytes(bufSize, 4));
+    glGetInternalformativ(A_U32(0), A_U32(1), A_U32(2), bufSize, (GLint*)wmem(p));
+})
 
 // glGetString: allocate buffer via cart's malloc (cache per GL_xxx name)
 static uint32_t _glstring_cache[8] = {0};
@@ -199,7 +483,7 @@ static uint32_t _gl_alloc_string(wc_host_t* host, const char* s) {
     uint32_t ptr = result.ToLocalChecked()->Uint32Value(ctx()).FromJust();
     // Refresh memory (malloc may grow) — caller must be in V8 scopes
     wc_refresh_memory(host);
-    if (ptr && ptr + len + 1 <= host->memory_size) {
+    if (ptr && (uint64_t)ptr + len + 1 <= host->memory_size) {
         memcpy(host->memory + ptr, s, len);
         host->memory[ptr + len] = 0;
         return ptr;
@@ -352,20 +636,21 @@ GL_REG(glLineWidth, 1, 0, glLineWidth(A_F32(0)))
 
 // ─── Buffers ──────────────────────────────────────────────────────────────
 
-GL_REG(glGenBuffers, 2, 0, glGenBuffers(A_I32(0), (GLuint*)wptr(A_U32(1))))
-GL_REG(glDeleteBuffers, 2, 0, glDeleteBuffers(A_I32(0), (const GLuint*)wptr(A_U32(1))))
-GL_REG(glBindBuffer, 2, 0, {
-    GLenum target = A_U32(0);
-    GLuint buf = A_U32(1);
-    if (target == GL_ARRAY_BUFFER) _boundArrayBuffer = buf;
-    else if (target == GL_ELEMENT_ARRAY_BUFFER) _boundElementBuffer = buf;
-    glBindBuffer(target, buf);
+// glGen*/glDelete*(n, names) all read or write n GLuints at names.
+GL_REG(glGenBuffers, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glGenBuffers(A_I32(0), (GLuint*)wmem(A_U32(1))); })
+GL_REG(glDeleteBuffers, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glDeleteBuffers(A_I32(0), (const GLuint*)wmem(A_U32(1))); })
+GL_REG(glBindBuffer, 2, 0, glBindBuffer(A_U32(0), A_U32(1)))
+GL_REG(glBufferData, 4, 0, {
+    uint32_t size = A_U32(1);
+    uint32_t data = A_U32(2);
+    if (data) NEED(data, size);
+    glBufferData(A_U32(0), size, wptr(data), A_U32(3));
 })
-GL_REG(glBufferData, 4, 0, glBufferData(A_U32(0), A_U32(1), wptr(A_U32(2)), A_U32(3)))
 GL_REG(glBufferSubData, 4, 0, {
     GLenum target = A_U32(0);
     GLintptr offset = A_U32(1);
     GLsizeiptr size = A_U32(2);
+    if (A_U32(3)) NEED(A_U32(3), A_U32(2));
     const void* data = wptr(A_U32(3));
     // Buffer orphaning: if updating from offset 0, orphan first to avoid
     // GPU sync stalls on mobile (Mali, Adreno). Driver allocates a new
@@ -379,8 +664,8 @@ GL_REG(glIsBuffer, 1, 1, R_I32(glIsBuffer(A_U32(0))))
 
 // ─── Textures ─────────────────────────────────────────────────────────────
 
-GL_REG(glGenTextures, 2, 0, glGenTextures(A_I32(0), (GLuint*)wptr(A_U32(1))))
-GL_REG(glDeleteTextures, 2, 0, glDeleteTextures(A_I32(0), (const GLuint*)wptr(A_U32(1))))
+GL_REG(glGenTextures, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glGenTextures(A_I32(0), (GLuint*)wmem(A_U32(1))); })
+GL_REG(glDeleteTextures, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glDeleteTextures(A_I32(0), (const GLuint*)wmem(A_U32(1))); })
 GL_REG(glBindTexture, 2, 0, glBindTexture(A_U32(0), A_U32(1)))
 GL_REG(glActiveTexture, 1, 0, glActiveTexture(A_U32(0)))
 GL_REG(glTexParameteri, 3, 0, glTexParameteri(A_U32(0), A_U32(1), A_I32(2)))
@@ -419,13 +704,31 @@ GL_REG(glTexImage2D, 9, 0, {
     GLenum type = A_U32(7);
     GLenum ifmt = _fixInternalFormat(A_I32(2), type);
     GLenum fmt = _fixFormat(A_U32(6));
-    glTexImage2D(A_U32(0), A_I32(1), ifmt, A_I32(3), A_I32(4), A_I32(5), fmt, type, wptr(A_U32(8)));
+    const void* pixels;
+    if (!_unpackPixels(_import, A_U32(8), false, A_I32(3), A_I32(4), 1, fmt, type, &pixels)) return;
+    glTexImage2D(A_U32(0), A_I32(1), ifmt, A_I32(3), A_I32(4), A_I32(5), fmt, type, pixels);
 })
-GL_REG(glTexSubImage2D, 9, 0, glTexSubImage2D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_U32(6), A_U32(7), wptr(A_U32(8))))
-GL_REG(glCompressedTexImage2D, 8, 0, glCompressedTexImage2D(A_U32(0), A_I32(1), A_U32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), wptr(A_U32(7))))
-GL_REG(glCompressedTexSubImage2D, 9, 0, glCompressedTexSubImage2D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_U32(6), A_I32(7), wptr(A_U32(8))))
+GL_REG(glTexSubImage2D, 9, 0, {
+    const void* pixels;
+    if (!_unpackPixels(_import, A_U32(8), false, A_I32(4), A_I32(5), 1, A_U32(6), A_U32(7), &pixels)) return;
+    glTexSubImage2D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_U32(6), A_U32(7), pixels);
+})
+GL_REG(glCompressedTexImage2D, 8, 0, {
+    const void* data;
+    if (!_unpackCompressed(_import, A_U32(7), A_I32(6), &data)) return;
+    glCompressedTexImage2D(A_U32(0), A_I32(1), A_U32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), data);
+})
+GL_REG(glCompressedTexSubImage2D, 9, 0, {
+    const void* data;
+    if (!_unpackCompressed(_import, A_U32(8), A_I32(7), &data)) return;
+    glCompressedTexSubImage2D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_U32(6), A_I32(7), data);
+})
 GL_REG(glCopyTexSubImage2D, 8, 0, glCopyTexSubImage2D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), A_I32(7)))
-GL_REG(glTexImage3D, 10, 0, glTexImage3D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), A_U32(7), A_U32(8), wptr(A_U32(9))))
+GL_REG(glTexImage3D, 10, 0, {
+    const void* pixels;
+    if (!_unpackPixels(_import, A_U32(9), true, A_I32(3), A_I32(4), A_I32(5), A_U32(7), A_U32(8), &pixels)) return;
+    glTexImage3D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), A_U32(7), A_U32(8), pixels);
+})
 GL_REG(glTexStorage2D, 5, 0, glTexStorage2D(A_U32(0), A_I32(1), A_U32(2), A_I32(3), A_I32(4)))
 GL_REG(glTexStorage3D, 6, 0, glTexStorage3D(A_U32(0), A_I32(1), A_U32(2), A_I32(3), A_I32(4), A_I32(5)))
 
@@ -456,25 +759,39 @@ GL_REG(glIsShader, 1, 1, R_I32(glIsShader(A_U32(0))))
 // Without the patcher, gl4es correctly detects GLES-only and outputs #version 100.
 
 GL_REG(glShaderSource, 4, 0, {
-    wc_refresh_memory(_host);
     uint32_t shader = A_U32(0);
     int32_t count = A_I32(1);
     uint32_t strings_ptr = A_U32(2);
     uint32_t lengths_ptr = A_U32(3);
-    uint32_t* wasm_ptrs = (uint32_t*)wptr(strings_ptr);
-    int32_t* wasm_lens = lengths_ptr ? (int32_t*)wptr(lengths_ptr) : NULL;
     const char* sources[16];
     int lens[16];
     int n = count > 16 ? 16 : count;
+    NEED(strings_ptr, _nbytes(n, 4));
+    if (lengths_ptr) NEED(lengths_ptr, _nbytes(n, 4));
     for (int i = 0; i < n; i++) {
-        sources[i] = (const char*)wptr(wasm_ptrs[i]);
-        lens[i] = wasm_lens ? wasm_lens[i] : -1;
+        uint32_t src;
+        int32_t len = -1;
+        memcpy(&src, wmem(strings_ptr + 4 * i), 4);
+        if (lengths_ptr) memcpy(&len, wmem(lengths_ptr + 4 * i), 4);
+        // A negative length, like no lengths array, means NUL-terminated.
+        if (len >= 0) NEED(src, (uint32_t)len);
+        else NEED_STR(src);
+        sources[i] = (const char*)wmem(src);
+        lens[i] = len;
     }
-    glShaderSource(shader, n, sources, wasm_lens ? lens : NULL);
+    glShaderSource(shader, n, sources, lengths_ptr ? lens : NULL);
 })
 
-GL_REG(glGetShaderiv, 3, 0, glGetShaderiv(A_U32(0), A_U32(1), (GLint*)wptr(A_U32(2))))
-GL_REG(glGetShaderInfoLog, 4, 0, glGetShaderInfoLog(A_U32(0), A_I32(1), A_U32(2) ? (GLsizei*)wptr(A_U32(2)) : NULL, (char*)wptr(A_U32(3))))
+GL_REG(glGetShaderiv, 3, 0, {
+    _getInto<GLint>(_import, A_U32(2), 1, [&](GLint* out) { glGetShaderiv(A_U32(0), A_U32(1), out); });
+})
+// The info logs write at most bufSize bytes to infoLog; length is optional.
+GL_REG(glGetShaderInfoLog, 4, 0, {
+    GLsizei bufSize = A_I32(1);
+    if (A_U32(2)) NEED(A_U32(2), 4);
+    NEED(A_U32(3), _nbytes(bufSize, 1));
+    glGetShaderInfoLog(A_U32(0), bufSize, (GLsizei*)wptr(A_U32(2)), (char*)wmem(A_U32(3)));
+})
 
 // ─── Programs ─────────────────────────────────────────────────────────────
 
@@ -496,14 +813,39 @@ GL_REG(glLinkProgram, 1, 0, {
 GL_REG(glUseProgram, 1, 0, glUseProgram(A_U32(0)))
 GL_REG(glIsProgram, 1, 1, R_I32(glIsProgram(A_U32(0))))
 GL_REG(glValidateProgram, 1, 0, glValidateProgram(A_U32(0)))
-GL_REG(glGetProgramiv, 3, 0, glGetProgramiv(A_U32(0), A_U32(1), (GLint*)wptr(A_U32(2))))
-GL_REG(glGetProgramInfoLog, 4, 0, glGetProgramInfoLog(A_U32(0), A_I32(1), A_U32(2) ? (GLsizei*)wptr(A_U32(2)) : NULL, (char*)wptr(A_U32(3))))
-GL_REG(glBindAttribLocation, 3, 0, glBindAttribLocation(A_U32(0), A_U32(1), (const char*)wptr(A_U32(2))))
-GL_REG(glGetAttribLocation, 2, 1, R_I32(glGetAttribLocation(A_U32(0), (const char*)wptr(A_U32(1)))))
-GL_REG(glGetUniformLocation, 2, 1, R_I32(glGetUniformLocation(A_U32(0), (const char*)wptr(A_U32(1)))))
+GL_REG(glGetProgramiv, 3, 0, {
+    GLenum pname = A_U32(1);
+    uint64_t n = pname == GL_COMPUTE_WORK_GROUP_SIZE ? 3 : 1;
+    _getInto<GLint>(_import, A_U32(2), n, [&](GLint* out) { glGetProgramiv(A_U32(0), pname, out); });
+})
+GL_REG(glGetProgramInfoLog, 4, 0, {
+    GLsizei bufSize = A_I32(1);
+    if (A_U32(2)) NEED(A_U32(2), 4);
+    NEED(A_U32(3), _nbytes(bufSize, 1));
+    glGetProgramInfoLog(A_U32(0), bufSize, (GLsizei*)wptr(A_U32(2)), (char*)wmem(A_U32(3)));
+})
+GL_REG(glBindAttribLocation, 3, 0, { NEED_STR(A_U32(2)); glBindAttribLocation(A_U32(0), A_U32(1), (const char*)wmem(A_U32(2))); })
+GL_REG(glGetAttribLocation, 2, 1, { NEED_STR(A_U32(1)); R_I32(glGetAttribLocation(A_U32(0), (const char*)wmem(A_U32(1)))); })
+GL_REG(glGetUniformLocation, 2, 1, { NEED_STR(A_U32(1)); R_I32(glGetUniformLocation(A_U32(0), (const char*)wmem(A_U32(1)))); })
 
-GL_REG(glGetActiveAttrib, 7, 0, glGetActiveAttrib(A_U32(0), A_U32(1), A_I32(2), A_U32(3) ? (GLsizei*)wptr(A_U32(3)) : NULL, (GLint*)wptr(A_U32(4)), (GLenum*)wptr(A_U32(5)), (char*)wptr(A_U32(6))))
-GL_REG(glGetActiveUniform, 7, 0, glGetActiveUniform(A_U32(0), A_U32(1), A_I32(2), A_U32(3) ? (GLsizei*)wptr(A_U32(3)) : NULL, (GLint*)wptr(A_U32(4)), (GLenum*)wptr(A_U32(5)), (char*)wptr(A_U32(6))))
+// length is optional; size and type are one value each; name gets at most
+// bufSize bytes.
+GL_REG(glGetActiveAttrib, 7, 0, {
+    GLsizei bufSize = A_I32(2);
+    if (A_U32(3)) NEED(A_U32(3), 4);
+    NEED(A_U32(4), 4);
+    NEED(A_U32(5), 4);
+    NEED(A_U32(6), _nbytes(bufSize, 1));
+    glGetActiveAttrib(A_U32(0), A_U32(1), bufSize, (GLsizei*)wptr(A_U32(3)), (GLint*)wmem(A_U32(4)), (GLenum*)wmem(A_U32(5)), (char*)wmem(A_U32(6)));
+})
+GL_REG(glGetActiveUniform, 7, 0, {
+    GLsizei bufSize = A_I32(2);
+    if (A_U32(3)) NEED(A_U32(3), 4);
+    NEED(A_U32(4), 4);
+    NEED(A_U32(5), 4);
+    NEED(A_U32(6), _nbytes(bufSize, 1));
+    glGetActiveUniform(A_U32(0), A_U32(1), bufSize, (GLsizei*)wptr(A_U32(3)), (GLint*)wmem(A_U32(4)), (GLenum*)wmem(A_U32(5)), (char*)wmem(A_U32(6)));
+})
 
 // ─── Uniforms ─────────────────────────────────────────────────────────────
 
@@ -516,63 +858,48 @@ GL_REG(glUniform2f, 3, 0, glUniform2f(A_I32(0), A_F32(1), A_F32(2)))
 GL_REG(glUniform3f, 4, 0, glUniform3f(A_I32(0), A_F32(1), A_F32(2), A_F32(3)))
 GL_REG(glUniform4f, 5, 0, glUniform4f(A_I32(0), A_F32(1), A_F32(2), A_F32(3), A_F32(4)))
 
-GL_REG(glUniform1iv, 3, 0, glUniform1iv(A_I32(0), A_I32(1), (const GLint*)wptr(A_U32(2))))
-GL_REG(glUniform2iv, 3, 0, glUniform2iv(A_I32(0), A_I32(1), (const GLint*)wptr(A_U32(2))))
-GL_REG(glUniform3iv, 3, 0, glUniform3iv(A_I32(0), A_I32(1), (const GLint*)wptr(A_U32(2))))
-GL_REG(glUniform4iv, 3, 0, glUniform4iv(A_I32(0), A_I32(1), (const GLint*)wptr(A_U32(2))))
-GL_REG(glUniform1fv, 3, 0, glUniform1fv(A_I32(0), A_I32(1), (const GLfloat*)wptr(A_U32(2))))
-GL_REG(glUniform2fv, 3, 0, glUniform2fv(A_I32(0), A_I32(1), (const GLfloat*)wptr(A_U32(2))))
-GL_REG(glUniform3fv, 3, 0, glUniform3fv(A_I32(0), A_I32(1), (const GLfloat*)wptr(A_U32(2))))
-GL_REG(glUniform4fv, 3, 0, glUniform4fv(A_I32(0), A_I32(1), (const GLfloat*)wptr(A_U32(2))))
+// glUniform*v(location, count, value) read count elements of N values each.
+#define UNIFORM_V(T, N) NEED(A_U32(2), _nbytes(A_I32(1), (N) * sizeof(T))); const T* _v = (const T*)wmem(A_U32(2))
+GL_REG(glUniform1iv, 3, 0, { UNIFORM_V(GLint, 1); glUniform1iv(A_I32(0), A_I32(1), _v); })
+GL_REG(glUniform2iv, 3, 0, { UNIFORM_V(GLint, 2); glUniform2iv(A_I32(0), A_I32(1), _v); })
+GL_REG(glUniform3iv, 3, 0, { UNIFORM_V(GLint, 3); glUniform3iv(A_I32(0), A_I32(1), _v); })
+GL_REG(glUniform4iv, 3, 0, { UNIFORM_V(GLint, 4); glUniform4iv(A_I32(0), A_I32(1), _v); })
+GL_REG(glUniform1fv, 3, 0, { UNIFORM_V(GLfloat, 1); glUniform1fv(A_I32(0), A_I32(1), _v); })
+GL_REG(glUniform2fv, 3, 0, { UNIFORM_V(GLfloat, 2); glUniform2fv(A_I32(0), A_I32(1), _v); })
+GL_REG(glUniform3fv, 3, 0, { UNIFORM_V(GLfloat, 3); glUniform3fv(A_I32(0), A_I32(1), _v); })
+GL_REG(glUniform4fv, 3, 0, { UNIFORM_V(GLfloat, 4); glUniform4fv(A_I32(0), A_I32(1), _v); })
 
-GL_REG(glUniformMatrix2fv, 4, 0, glUniformMatrix2fv(A_I32(0), A_I32(1), A_U32(2)!=0, (const GLfloat*)wptr(A_U32(3))))
-GL_REG(glUniformMatrix3fv, 4, 0, glUniformMatrix3fv(A_I32(0), A_I32(1), A_U32(2)!=0, (const GLfloat*)wptr(A_U32(3))))
-GL_REG(glUniformMatrix4fv, 4, 0, glUniformMatrix4fv(A_I32(0), A_I32(1), A_U32(2)!=0, (const GLfloat*)wptr(A_U32(3))))
+// glUniformMatrix*v(location, count, transpose, value): count NxN matrices.
+#define UNIFORM_M(N) NEED(A_U32(3), _nbytes(A_I32(1), (N) * (N) * sizeof(GLfloat))); const GLfloat* _v = (const GLfloat*)wmem(A_U32(3))
+GL_REG(glUniformMatrix2fv, 4, 0, { UNIFORM_M(2); glUniformMatrix2fv(A_I32(0), A_I32(1), A_U32(2)!=0, _v); })
+GL_REG(glUniformMatrix3fv, 4, 0, { UNIFORM_M(3); glUniformMatrix3fv(A_I32(0), A_I32(1), A_U32(2)!=0, _v); })
+GL_REG(glUniformMatrix4fv, 4, 0, { UNIFORM_M(4); glUniformMatrix4fv(A_I32(0), A_I32(1), A_U32(2)!=0, _v); })
 
 // ─── Vertex attributes ───────────────────────────────────────────────────
 
 GL_REG(glEnableVertexAttribArray, 1, 0, glEnableVertexAttribArray(A_U32(0)))
 GL_REG(glDisableVertexAttribArray, 1, 0, {
     uint32_t idx = A_U32(0);
-    if (idx < MAX_VERTEX_ATTRIBS && _clientAttribs[idx].active) {
-        _clientAttribs[idx].active = 0;
-        _numClientAttribs--;
-    }
+    _clearClientAttrib(idx);
     glDisableVertexAttribArray(idx);
 })
+// A pointer of 0 with no buffer bound is passed on as NULL, i.e. no array:
+// the state every attribute starts in.
 GL_REG(glVertexAttribPointer, 6, 0, {
     uint32_t idx = A_U32(0);
-    if (_boundArrayBuffer == 0 && A_U32(5) != 0 && idx < MAX_VERTEX_ATTRIBS) {
-        if (!_clientAttribs[idx].active) _numClientAttribs++;
-        _clientAttribs[idx].active = 1;
-        _clientAttribs[idx].size = A_I32(1);
-        _clientAttribs[idx].type = A_U32(2);
-        _clientAttribs[idx].normalized = A_U32(3) != 0;
-        _clientAttribs[idx].stride = A_I32(4);
-        _clientAttribs[idx].wasmPtr = A_U32(5);
+    if (A_U32(5) != 0 && _boundBuffer(GL_ARRAY_BUFFER_BINDING) == 0) {
+        _setClientAttrib(idx, A_I32(1), A_U32(2), A_U32(3) != 0, A_I32(4), A_U32(5));
     } else {
-        if (idx < MAX_VERTEX_ATTRIBS && _clientAttribs[idx].active) {
-            _clientAttribs[idx].active = 0;
-            _numClientAttribs--;
-        }
+        _clearClientAttrib(idx);
         glVertexAttribPointer(idx, A_I32(1), A_U32(2), A_U32(3)!=0, A_I32(4), (const void*)(uintptr_t)A_U32(5));
     }
 })
 GL_REG(glVertexAttribIPointer, 5, 0, {
     uint32_t idx = A_U32(0);
-    if (_boundArrayBuffer == 0 && A_U32(4) != 0 && idx < MAX_VERTEX_ATTRIBS) {
-        if (!_clientAttribs[idx].active) _numClientAttribs++;
-        _clientAttribs[idx].active = 1;
-        _clientAttribs[idx].size = A_I32(1);
-        _clientAttribs[idx].type = A_U32(2);
-        _clientAttribs[idx].normalized = GL_FALSE;
-        _clientAttribs[idx].stride = A_I32(3);
-        _clientAttribs[idx].wasmPtr = A_U32(4);
+    if (A_U32(4) != 0 && _boundBuffer(GL_ARRAY_BUFFER_BINDING) == 0) {
+        _setClientAttrib(idx, A_I32(1), A_U32(2), GL_FALSE, A_I32(3), A_U32(4));
     } else {
-        if (idx < MAX_VERTEX_ATTRIBS && _clientAttribs[idx].active) {
-            _clientAttribs[idx].active = 0;
-            _numClientAttribs--;
-        }
+        _clearClientAttrib(idx);
         glVertexAttribIPointer(idx, A_I32(1), A_U32(2), A_I32(3), (const void*)(uintptr_t)A_U32(4));
     }
 })
@@ -580,10 +907,11 @@ GL_REG(glVertexAttribDivisor, 2, 0, glVertexAttribDivisor(A_U32(0), A_U32(1)))
 
 // ─── VAOs ─────────────────────────────────────────────────────────────────
 
-GL_REG(glGenVertexArrays, 2, 0, glGenVertexArrays(A_I32(0), (GLuint*)wptr(A_U32(1))))
+GL_REG(glGenVertexArrays, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glGenVertexArrays(A_I32(0), (GLuint*)wmem(A_U32(1))); })
 GL_REG(glDeleteVertexArrays, 2, 0, {
     GLsizei n = A_I32(0);
-    const GLuint* arrays = (const GLuint*)wptr(A_U32(1));
+    NEED(A_U32(1), _nbytes(n, 4));
+    const GLuint* arrays = (const GLuint*)wmem(A_U32(1));
     // Deleting the bound VAO reverts the binding to 0 (GL semantics).
     if (arrays) for (GLsizei i = 0; i < n; i++) if (arrays[i] == _cart_bound_vao) _cart_bound_vao = 0;
     glDeleteVertexArrays(n, arrays);
@@ -601,8 +929,9 @@ GL_REG(glDrawArrays, 3, 0, {
     GLenum mode = A_U32(0);
     int first = A_I32(1);
     int count = A_I32(2);
-    if (_numClientAttribs > 0) {
-        _uploadClientAttribs(first, count);
+    // A negative first or count is GL's INVALID_VALUE and reads nothing.
+    if (_numClientAttribs > 0 && first >= 0 && count > 0) {
+        if (!_uploadClientAttribs(_import, first, count, false)) return;
         glDrawArrays(mode, 0, count);
     } else {
         glDrawArrays(mode, first, count);
@@ -626,29 +955,47 @@ GL_REG(glDrawElements, 4, 0, {
     int count = A_I32(1);
     GLenum type = A_U32(2);
     uint32_t offsetPtr = A_U32(3);
-    int hasClientIndices = (_boundElementBuffer == 0 && offsetPtr != 0);
+    // With no element buffer bound the indices are client-side, in cart
+    // memory (offset 0 included: that's cart address 0, not a NULL for the
+    // driver to follow). They go through _tempEBO, so GL only ever gets an
+    // offset.
+    bool hasClientIndices = _boundBuffer(GL_ELEMENT_ARRAY_BUFFER_BINDING) == 0;
+    if (count <= 0 || !_isIndexType(type)) {
+        // Nothing drawn, or GL's INVALID_VALUE/INVALID_ENUM: no index is read.
+        glDrawElements(mode, count, type, hasClientIndices ? NULL : (const void*)(uintptr_t)offsetPtr);
+        return;
+    }
     if (_numClientAttribs > 0 || hasClientIndices) {
-        int maxVertex = 0;
+        uint64_t maxVertex = 0;
+        uint64_t indexBytes = (uint64_t)count * _bytesForGLType(type);
         if (hasClientIndices) {
-            // Scan indices to find max vertex
-            uint8_t* mem = _host->memory + offsetPtr;
-            if (type == GL_UNSIGNED_SHORT) {
-                uint16_t* idx = (uint16_t*)mem;
-                for (int i = 0; i < count; i++) if (idx[i] > maxVertex) maxVertex = idx[i];
-            } else if (type == GL_UNSIGNED_INT) {
-                uint32_t* idx = (uint32_t*)mem;
-                for (int i = 0; i < count; i++) if ((int)idx[i] > maxVertex) maxVertex = (int)idx[i];
-            } else {
-                for (int i = 0; i < count; i++) if (mem[i] > maxVertex) maxVertex = mem[i];
+            NEED(offsetPtr, indexBytes);
+            // Scan indices to find max vertex: that's how far GL reads into
+            // each client array. The restart index isn't a vertex.
+            const uint8_t* mem = _host->memory + offsetPtr;
+            bool restart = glIsEnabled(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+            for (int i = 0; i < count; i++) {
+                uint32_t v;
+                if (type == GL_UNSIGNED_SHORT) { uint16_t v16; memcpy(&v16, mem + 2 * i, 2); v = v16; }
+                else if (type == GL_UNSIGNED_INT) memcpy(&v, mem + 4 * i, 4);
+                else v = mem[i];
+                if (restart && v == (type == GL_UNSIGNED_INT ? 0xFFFFFFFFu :
+                                     type == GL_UNSIGNED_SHORT ? 0xFFFFu : 0xFFu)) continue;
+                if (v > maxVertex) maxVertex = v;
             }
         } else {
-            maxVertex = count * 2;
+            // The indices are in a buffer, which can't be read without mapping
+            // it, so how many vertices they reach is a guess. The client arrays
+            // are uploaded only as far as cart memory goes, which bounds what
+            // the host reads; an index past what was uploaded reads past the
+            // temp VBO on the GPU, as it did before.
+            maxVertex = (uint64_t)count * 2;
         }
-        if (_numClientAttribs > 0) _uploadClientAttribs(0, maxVertex + 1);
+        if (!_uploadClientAttribs(_import, 0, maxVertex + 1, !hasClientIndices)) return;
         if (hasClientIndices) {
-            _uploadClientIndices(offsetPtr, count, type);
+            _uploadClientIndices(offsetPtr, indexBytes);
             glDrawElements(mode, count, type, 0);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, _boundElementBuffer);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         } else {
             glDrawElements(mode, count, type, (const void*)(uintptr_t)offsetPtr);
         }
@@ -657,8 +1004,29 @@ GL_REG(glDrawElements, 4, 0, {
     }
 })
 GL_REG(glDrawArraysInstanced, 4, 0, glDrawArraysInstanced(A_U32(0), A_I32(1), A_I32(2), A_I32(3)))
-GL_REG(glDrawElementsInstanced, 5, 0, glDrawElementsInstanced(A_U32(0), A_I32(1), A_U32(2), (const void*)(uintptr_t)A_U32(3), A_I32(4)))
-GL_REG(glDrawBuffers, 2, 0, glDrawBuffers(A_I32(0), (const GLenum*)wptr(A_U32(1))))
+GL_REG(glDrawElementsInstanced, 5, 0, {
+    GLenum mode = A_U32(0);
+    int count = A_I32(1);
+    GLenum type = A_U32(2);
+    uint32_t offsetPtr = A_U32(3);
+    GLsizei instances = A_I32(4);
+    if (_boundBuffer(GL_ELEMENT_ARRAY_BUFFER_BINDING) != 0) {
+        glDrawElementsInstanced(mode, count, type, (const void*)(uintptr_t)offsetPtr, instances);
+        return;
+    }
+    // Client-side indices, as for glDrawElements. (Client-side vertex arrays
+    // aren't uploaded for instanced draws.)
+    if (count <= 0 || !_isIndexType(type)) {
+        glDrawElementsInstanced(mode, count, type, NULL, instances);
+        return;
+    }
+    uint64_t indexBytes = (uint64_t)count * _bytesForGLType(type);
+    NEED(offsetPtr, indexBytes);
+    _uploadClientIndices(offsetPtr, indexBytes);
+    glDrawElementsInstanced(mode, count, type, 0, instances);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+})
+GL_REG(glDrawBuffers, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glDrawBuffers(A_I32(0), (const GLenum*)wmem(A_U32(1))); })
 GL_REG(glReadBuffer, 1, 0, glReadBuffer(A_U32(0)))
 
 // ─── Missing GLES3 functions needed by Godot ──────────────────────────────
@@ -679,10 +1047,13 @@ GL_REG(glGetStringi, 2, 1, {
         R_I32(ptr);
     }
 })
-GL_REG(glGetInteger64v, 2, 0, glGetInteger64v(A_U32(0), (GLint64*)wptr(A_U32(1))))
+GL_REG(glGetInteger64v, 2, 0, {
+    GLenum pname = A_U32(0);
+    _getInto<GLint64>(_import, A_U32(1), _getCount(pname), [&](GLint64* out) { glGetInteger64v(pname, out); });
+})
 GL_REG(glBindBufferBase, 3, 0, glBindBufferBase(A_U32(0), A_U32(1), A_U32(2)))
 GL_REG(glBindBufferRange, 5, 0, glBindBufferRange(A_U32(0), A_U32(1), A_U32(2), A_I32(3), A_I32(4)))
-GL_REG(glGetUniformBlockIndex, 2, 1, R_I32(glGetUniformBlockIndex(A_U32(0), (const char*)wptr(A_U32(1)))))
+GL_REG(glGetUniformBlockIndex, 2, 1, { NEED_STR(A_U32(1)); R_I32(glGetUniformBlockIndex(A_U32(0), (const char*)wmem(A_U32(1)))); })
 // Uniform-BLOCK introspection. An engine that cannot query
 // GL_UNIFORM_BLOCK_DATA_SIZE sizes its UBO from whatever the missing import
 // returned, uploads a block of that size, and the shader samples an
@@ -690,45 +1061,113 @@ GL_REG(glGetUniformBlockIndex, 2, 1, R_I32(glGetUniformBlockIndex(A_U32(0), (con
 // view-projection matrix collapses to a point. No GL error is raised and every
 // draw call succeeds, so the screen simply stays empty. Kept Defold carts from
 // ever drawing geometry on the JS host until the same pair was added there.
-GL_REG(glGetActiveUniformBlockiv, 4, 0, glGetActiveUniformBlockiv(A_U32(0), A_U32(1), A_U32(2), (GLint*)wptr(A_U32(3))))
-GL_REG(glGetActiveUniformsiv, 5, 0, glGetActiveUniformsiv(A_U32(0), A_I32(1), (const GLuint*)wptr(A_U32(2)), A_U32(3), (GLint*)wptr(A_U32(4))))
+GL_REG(glGetActiveUniformBlockiv, 4, 0, {
+    GLuint prog = A_U32(0), block = A_U32(1);
+    GLenum pname = A_U32(2);
+    // One value, except the index list, which has one per active uniform.
+    GLint n = 1;
+    if (pname == GL_UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES) {
+        n = 0;
+        glGetActiveUniformBlockiv(prog, block, GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS, &n);
+    }
+    _getInto<GLint>(_import, A_U32(3), _nbytes(n, 1), [&](GLint* out) {
+        glGetActiveUniformBlockiv(prog, block, pname, out);
+    });
+})
+// count indices in, count values out.
+GL_REG(glGetActiveUniformsiv, 5, 0, {
+    GLsizei count = A_I32(1);
+    NEED(A_U32(2), _nbytes(count, 4));
+    NEED(A_U32(4), _nbytes(count, 4));
+    glGetActiveUniformsiv(A_U32(0), count, (const GLuint*)wmem(A_U32(2)), A_U32(3), (GLint*)wmem(A_U32(4)));
+})
 GL_REG(glUniformBlockBinding, 3, 0, glUniformBlockBinding(A_U32(0), A_U32(1), A_U32(2)))
 GL_REG(glUniform1ui, 2, 0, glUniform1ui(A_I32(0), A_U32(1)))
-GL_REG(glUniform1uiv, 3, 0, glUniform1uiv(A_I32(0), A_I32(1), (const GLuint*)wptr(A_U32(2))))
+GL_REG(glUniform1uiv, 3, 0, { UNIFORM_V(GLuint, 1); glUniform1uiv(A_I32(0), A_I32(1), _v); })
 GL_REG(glVertexAttribI4ui, 5, 0, glVertexAttribI4ui(A_U32(0), A_U32(1), A_U32(2), A_U32(3), A_U32(4)))
 GL_REG(glCopyBufferSubData, 5, 0, glCopyBufferSubData(A_U32(0), A_U32(1), A_I32(2), A_I32(3), A_I32(4)))
 GL_REG(glFramebufferTextureLayer, 5, 0, glFramebufferTextureLayer(A_U32(0), A_U32(1), A_U32(2), A_I32(3), A_I32(4)))
-GL_REG(glTexSubImage3D, 11, 0, glTexSubImage3D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), A_I32(7), A_U32(8), A_U32(9), wptr(A_U32(10))))
-GL_REG(glCompressedTexImage3D, 9, 0, glCompressedTexImage3D(A_U32(0), A_I32(1), A_U32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), A_I32(7), wptr(A_U32(8))))
-GL_REG(glCompressedTexSubImage3D, 11, 0, glCompressedTexSubImage3D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), A_I32(7), A_U32(8), A_I32(9), wptr(A_U32(10))))
+GL_REG(glTexSubImage3D, 11, 0, {
+    const void* pixels;
+    if (!_unpackPixels(_import, A_U32(10), true, A_I32(5), A_I32(6), A_I32(7), A_U32(8), A_U32(9), &pixels)) return;
+    glTexSubImage3D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), A_I32(7), A_U32(8), A_U32(9), pixels);
+})
+GL_REG(glCompressedTexImage3D, 9, 0, {
+    const void* data;
+    if (!_unpackCompressed(_import, A_U32(8), A_I32(7), &data)) return;
+    glCompressedTexImage3D(A_U32(0), A_I32(1), A_U32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), A_I32(7), data);
+})
+GL_REG(glCompressedTexSubImage3D, 11, 0, {
+    const void* data;
+    if (!_unpackCompressed(_import, A_U32(10), A_I32(9), &data)) return;
+    glCompressedTexSubImage3D(A_U32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), A_I32(7), A_U32(8), A_I32(9), data);
+})
 GL_REG(glBeginTransformFeedback, 1, 0, glBeginTransformFeedback(A_U32(0)))
 GL_REG(glEndTransformFeedback, 0, 0, glEndTransformFeedback())
 GL_REG(glTransformFeedbackVaryings, 4, 0, {
     uint32_t prog = A_U32(0);
     int32_t count = A_I32(1);
     uint32_t strings_ptr = A_U32(2);
-    uint32_t* wasm_ptrs = (uint32_t*)wptr(strings_ptr);
     const char* names[16];
     int n = count > 16 ? 16 : count;
-    for (int i = 0; i < n; i++) names[i] = (const char*)wptr(wasm_ptrs[i]);
+    NEED(strings_ptr, _nbytes(n, 4));
+    for (int i = 0; i < n; i++) {
+        uint32_t name;
+        memcpy(&name, wmem(strings_ptr + 4 * i), 4);
+        NEED_STR(name);
+        names[i] = (const char*)wmem(name);
+    }
     glTransformFeedbackVaryings(prog, n, names, A_U32(3));
 })
-GL_REG(glGetSynciv, 5, 0, glGetSynciv((GLsync)(uintptr_t)A_U32(0), A_U32(1), A_I32(2), (GLsizei*)wptr(A_U32(3)), (GLint*)wptr(A_U32(4))))
-GL_REG(glGenQueries, 2, 0, glGenQueries(A_I32(0), (GLuint*)wptr(A_U32(1))))
-GL_REG(glDeleteQueries, 2, 0, glDeleteQueries(A_I32(0), (const GLuint*)wptr(A_U32(1))))
+// A GLsync is a driver pointer, too wide for wasm32 and not something to
+// take back from the cart: the driver would follow whatever value it passed.
+// The cart gets a handle into this table instead (index + 1; 0 is no sync).
+static std::vector<GLsync> _syncs;
 
+static uint32_t _syncPut(GLsync s) {
+    if (!s) return 0;
+    for (size_t i = 0; i < _syncs.size(); i++)
+        if (!_syncs[i]) { _syncs[i] = s; return (uint32_t)i + 1; }
+    _syncs.push_back(s);
+    return (uint32_t)_syncs.size();
+}
+
+static GLsync _syncGet(uint32_t h) {
+    return (h && h <= _syncs.size()) ? _syncs[h - 1] : NULL;
+}
+
+// values gets at most bufSize values; length is optional.
+GL_REG(glGetSynciv, 5, 0, {
+    GLsync sync = _syncGet(A_U32(0));
+    GLsizei bufSize = A_I32(2);
+    if (A_U32(3)) NEED(A_U32(3), 4);
+    NEED(A_U32(4), _nbytes(bufSize, 4));
+    if (!sync) return;  // GL's INVALID_VALUE
+    glGetSynciv(sync, A_U32(1), bufSize, (GLsizei*)wptr(A_U32(3)), (GLint*)wmem(A_U32(4)));
+})
+GL_REG(glGenQueries, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glGenQueries(A_I32(0), (GLuint*)wmem(A_U32(1))); })
+GL_REG(glDeleteQueries, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glDeleteQueries(A_I32(0), (const GLuint*)wmem(A_U32(1))); })
+
+// Four values for GL_COLOR, one for GL_DEPTH. GL reads them from a copy, so
+// a buffer value it doesn't expect can't make it read further.
 GL_REG(glClearBufferfv, 3, 0, {
-    glClearBufferfv(A_U32(0), A_I32(1), (const GLfloat*)wptr(A_U32(2)));
+    GLenum buffer = A_U32(0);
+    uint64_t n = buffer == GL_COLOR ? 4 : 1;
+    GLfloat value[4] = {0, 0, 0, 0};
+    NEED(A_U32(2), n * sizeof(GLfloat));
+    memcpy(value, wmem(A_U32(2)), n * sizeof(GLfloat));
+    glClearBufferfv(buffer, A_I32(1), value);
 })
 
 // ─── Framebuffers ─────────────────────────────────────────────────────────
 
 static int _cart_uses_fbos = 0;
 GL_REG(glGenFramebuffers, 2, 0, {
+    NEED(A_U32(1), _nbytes(A_I32(0), 4));
     _cart_uses_fbos = 1;
-    glGenFramebuffers(A_I32(0), (GLuint*)wptr(A_U32(1)));
+    glGenFramebuffers(A_I32(0), (GLuint*)wmem(A_U32(1)));
 })
-GL_REG(glDeleteFramebuffers, 2, 0, glDeleteFramebuffers(A_I32(0), (const GLuint*)wptr(A_U32(1))))
+GL_REG(glDeleteFramebuffers, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glDeleteFramebuffers(A_I32(0), (const GLuint*)wmem(A_U32(1))); })
 // FBO redirect: capture what the cart renders to FBO 0
 
 static GLuint _redirect_rbo = 0;
@@ -803,29 +1242,51 @@ GL_REG(glBlitFramebuffer, 10, 0, {
     }
     glBlitFramebuffer(A_I32(0), A_I32(1), A_I32(2), A_I32(3), A_I32(4), A_I32(5), A_I32(6), A_I32(7), A_U32(8), A_U32(9));
 })
-GL_REG(glReadPixels, 7, 0, glReadPixels(A_I32(0), A_I32(1), A_I32(2), A_I32(3), A_U32(4), A_U32(5), wptr(A_U32(6))))
+// With a buffer on GL_PIXEL_PACK_BUFFER, pixels is an offset into it.
+// Otherwise it is where in cart memory the pixels go (0 included).
+GL_REG(glReadPixels, 7, 0, {
+    GLsizei w = A_I32(2), h = A_I32(3);
+    GLenum format = A_U32(4), type = A_U32(5);
+    uint32_t p = A_U32(6);
+    void* pixels = (void*)(uintptr_t)p;
+    if (!_boundBuffer(GL_PIXEL_PACK_BUFFER_BINDING)) {
+        NEED(p, _imageBytes(true, false, w, h, 1, format, type));
+        pixels = wmem(p);
+    }
+    glReadPixels(A_I32(0), A_I32(1), w, h, format, type, pixels);
+})
 
 // ─── Renderbuffers ────────────────────────────────────────────────────────
 
-GL_REG(glGenRenderbuffers, 2, 0, glGenRenderbuffers(A_I32(0), (GLuint*)wptr(A_U32(1))))
-GL_REG(glDeleteRenderbuffers, 2, 0, glDeleteRenderbuffers(A_I32(0), (const GLuint*)wptr(A_U32(1))))
+GL_REG(glGenRenderbuffers, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glGenRenderbuffers(A_I32(0), (GLuint*)wmem(A_U32(1))); })
+GL_REG(glDeleteRenderbuffers, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glDeleteRenderbuffers(A_I32(0), (const GLuint*)wmem(A_U32(1))); })
 GL_REG(glBindRenderbuffer, 2, 0, glBindRenderbuffer(A_U32(0), A_U32(1)))
 GL_REG(glRenderbufferStorage, 4, 0, glRenderbufferStorage(A_U32(0), A_U32(1), A_I32(2), A_I32(3)))
 GL_REG(glRenderbufferStorageMultisample, 5, 0, glRenderbufferStorageMultisample(A_U32(0), A_I32(1), A_U32(2), A_I32(3), A_I32(4)))
 
 // ─── Samplers ─────────────────────────────────────────────────────────────
 
-GL_REG(glGenSamplers, 2, 0, glGenSamplers(A_I32(0), (GLuint*)wptr(A_U32(1))))
-GL_REG(glDeleteSamplers, 2, 0, glDeleteSamplers(A_I32(0), (const GLuint*)wptr(A_U32(1))))
+GL_REG(glGenSamplers, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glGenSamplers(A_I32(0), (GLuint*)wmem(A_U32(1))); })
+GL_REG(glDeleteSamplers, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glDeleteSamplers(A_I32(0), (const GLuint*)wmem(A_U32(1))); })
 GL_REG(glBindSampler, 2, 0, glBindSampler(A_U32(0), A_U32(1)))
 GL_REG(glSamplerParameteri, 3, 0, glSamplerParameteri(A_U32(0), A_U32(1), A_I32(2)))
 GL_REG(glSamplerParameterf, 3, 0, glSamplerParameterf(A_U32(0), A_U32(1), A_F32(2)))
 
 // ─── Sync ─────────────────────────────────────────────────────────────────
 
-GL_REG(glFenceSync, 2, 1, { GLsync s = glFenceSync(A_U32(0), A_U32(1)); R_I32((int32_t)(uintptr_t)s); })
-GL_REG(glDeleteSync, 1, 0, glDeleteSync((GLsync)(uintptr_t)A_U32(0)))
-GL_REG(glClientWaitSync, 3, 1, R_I32(glClientWaitSync((GLsync)(uintptr_t)A_U32(0), A_U32(1), (GLuint64)A_I64(2))))
+GL_REG(glFenceSync, 2, 1, { R_I32(_syncPut(glFenceSync(A_U32(0), A_U32(1)))); })
+GL_REG(glDeleteSync, 1, 0, {
+    uint32_t h = A_U32(0);
+    GLsync s = _syncGet(h);
+    if (!s) return;
+    glDeleteSync(s);
+    _syncs[h - 1] = NULL;
+})
+GL_REG(glClientWaitSync, 3, 1, {
+    GLsync s = _syncGet(A_U32(0));
+    if (!s) { R_I32(GL_WAIT_FAILED); return; }  // GL's answer for a bad sync
+    R_I32(glClientWaitSync(s, A_U32(1), (GLuint64)A_I64(2)));
+})
 
 // ─── Buffer mapping ───────────────────────────────────────────────────────
 
@@ -838,8 +1299,17 @@ GL_REG(glUnmapBuffer, 1, 1, R_I32(glUnmapBuffer(A_U32(0))))
 
 // ─── Extra attribs / params ───────────────────────────────────────────────
 
-GL_REG(glVertexAttrib4fv, 2, 0, glVertexAttrib4fv(A_U32(0), (const GLfloat*)wptr(A_U32(1))))
-GL_REG(glTexParameteriv, 3, 0, glTexParameteriv(A_U32(0), A_U32(1), (const GLint*)wptr(A_U32(2))))
+GL_REG(glVertexAttrib4fv, 2, 0, { NEED(A_U32(1), 16); glVertexAttrib4fv(A_U32(0), (const GLfloat*)wmem(A_U32(1))); })
+// One value, or four for a colour or a swizzle. GL reads them from a copy, so
+// a pname not listed here can't make it read past the cart's buffer.
+GL_REG(glTexParameteriv, 3, 0, {
+    GLenum pname = A_U32(1);
+    uint64_t n = (pname == GL_TEXTURE_BORDER_COLOR || pname == 0x8E46 /* GL_TEXTURE_SWIZZLE_RGBA */) ? 4 : 1;
+    GLint params[4] = {0, 0, 0, 0};
+    NEED(A_U32(2), n * sizeof(GLint));
+    memcpy(params, wmem(A_U32(2)), n * sizeof(GLint));
+    glTexParameteriv(A_U32(0), pname, params);
+})
 
 // ─── GLES 3.1+ functions needed by Skia Ganesh ──────────────────────────
 
@@ -847,16 +1317,32 @@ GL_REG(glMemoryBarrier, 1, 0, glMemoryBarrier(A_U32(0)))
 GL_REG(glTexBuffer, 3, 0, glTexBuffer(A_U32(0), A_U32(1), A_U32(2)))
 GL_REG(glTexBufferRange, 5, 0, glTexBufferRange(A_U32(0), A_U32(1), A_U32(2), A_I32(3), A_I32(4)))
 GL_REG(glPatchParameteri, 2, 0, glPatchParameteri(A_U32(0), A_I32(1)))
-GL_REG(glDrawArraysIndirect, 2, 0, glDrawArraysIndirect(A_U32(0), (const void*)(uintptr_t)A_U32(1)))
-GL_REG(glDrawElementsIndirect, 3, 0, glDrawElementsIndirect(A_U32(0), A_U32(1), (const void*)(uintptr_t)A_U32(2)))
-GL_REG(glGetMultisamplefv, 3, 0, glGetMultisamplefv(A_U32(0), A_U32(1), (GLfloat*)wptr(A_U32(2))))
-GL_REG(glGetTexLevelParameteriv, 4, 0, glGetTexLevelParameteriv(A_U32(0), A_I32(1), A_U32(2), (GLint*)wptr(A_U32(3))))
+// The indirect draws read their command from GL_DRAW_INDIRECT_BUFFER, and
+// glDrawElementsIndirect its indices from the element buffer. ES 3.1 requires
+// both and errors without them; a desktop compatibility context would instead
+// read client memory at the cart's value, i.e. at a host address. So without
+// them the draw is dropped, as ES would.
+GL_REG(glDrawArraysIndirect, 2, 0, {
+    if (!_boundBuffer(GL_DRAW_INDIRECT_BUFFER_BINDING)) return;
+    glDrawArraysIndirect(A_U32(0), (const void*)(uintptr_t)A_U32(1));
+})
+GL_REG(glDrawElementsIndirect, 3, 0, {
+    if (!_boundBuffer(GL_DRAW_INDIRECT_BUFFER_BINDING) ||
+        !_boundBuffer(GL_ELEMENT_ARRAY_BUFFER_BINDING)) return;
+    glDrawElementsIndirect(A_U32(0), A_U32(1), (const void*)(uintptr_t)A_U32(2));
+})
+GL_REG(glGetMultisamplefv, 3, 0, {
+    _getInto<GLfloat>(_import, A_U32(2), 2, [&](GLfloat* out) { glGetMultisamplefv(A_U32(0), A_U32(1), out); });
+})
+GL_REG(glGetTexLevelParameteriv, 4, 0, {
+    _getInto<GLint>(_import, A_U32(3), 1, [&](GLint* out) { glGetTexLevelParameteriv(A_U32(0), A_I32(1), A_U32(2), out); });
+})
 GL_REG(glBindFragDataLocation, 3, 0, { /* not in GLES — no-op */ })
 GL_REG(glBindFragDataLocationIndexed, 4, 0, { /* not in GLES — no-op */ })
 GL_REG(glBlendBarrier, 0, 0, glBlendBarrier())
 GL_REG(glBlendBarrierKHR, 0, 0, glBlendBarrier())
-GL_REG(glDiscardFramebufferEXT, 3, 0, glInvalidateFramebuffer(A_U32(0), A_I32(1), (const GLenum*)wptr(A_U32(2))))
-GL_REG(glInvalidateFramebuffer, 3, 0, glInvalidateFramebuffer(A_U32(0), A_I32(1), (const GLenum*)wptr(A_U32(2))))
+GL_REG(glDiscardFramebufferEXT, 3, 0, { NEED(A_U32(2), _nbytes(A_I32(1), 4)); glInvalidateFramebuffer(A_U32(0), A_I32(1), (const GLenum*)wmem(A_U32(2))); })
+GL_REG(glInvalidateFramebuffer, 3, 0, { NEED(A_U32(2), _nbytes(A_I32(1), 4)); glInvalidateFramebuffer(A_U32(0), A_I32(1), (const GLenum*)wmem(A_U32(2))); })
 
 // Skia debug/label functions — no-op stubs
 GL_REG(glDebugMessageCallback, 2, 0, { /* no-op */ })
@@ -877,10 +1363,10 @@ GL_REG(glWindowRectanglesEXT, 3, 0, { /* no-op — extension not available */ })
 
 // Timer queries
 GL_REG(glQueryCounterEXT, 2, 0, { /* no-op */ })
-GL_REG(glGetQueryObjecti64v, 3, 0, { int64_t zero = 0; memcpy(wptr(A_U32(2)), &zero, 8); })
-GL_REG(glGetQueryObjecti64vEXT, 3, 0, { int64_t zero = 0; memcpy(wptr(A_U32(2)), &zero, 8); })
-GL_REG(glGetQueryObjectui64v, 3, 0, { uint64_t zero = 0; memcpy(wptr(A_U32(2)), &zero, 8); })
-GL_REG(glGetQueryObjectui64vEXT, 3, 0, { uint64_t zero = 0; memcpy(wptr(A_U32(2)), &zero, 8); })
+GL_REG(glGetQueryObjecti64v, 3, 0, { int64_t zero = 0; NEED(A_U32(2), 8); memcpy(wmem(A_U32(2)), &zero, 8); })
+GL_REG(glGetQueryObjecti64vEXT, 3, 0, { int64_t zero = 0; NEED(A_U32(2), 8); memcpy(wmem(A_U32(2)), &zero, 8); })
+GL_REG(glGetQueryObjectui64v, 3, 0, { uint64_t zero = 0; NEED(A_U32(2), 8); memcpy(wmem(A_U32(2)), &zero, 8); })
+GL_REG(glGetQueryObjectui64vEXT, 3, 0, { uint64_t zero = 0; NEED(A_U32(2), 8); memcpy(wmem(A_U32(2)), &zero, 8); })
 
 // Multi-draw indirect
 GL_REG(glMultiDrawArraysIndirect, 4, 0, { /* no-op — fallback to individual draws */ })
