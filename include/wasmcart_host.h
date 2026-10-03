@@ -358,6 +358,18 @@ const uint8_t*  wc_host_get_framebuffer(wc_host_t* host, uint32_t* width, uint32
 const void*     wc_host_get_audio(wc_host_t* host, uint32_t* num_frames, bool* is_f32);
 uint8_t*        wc_host_get_save_data(wc_host_t* host, uint32_t* size);
 
+// The largest save region a host keeps. The cart picks save_size and the
+// host copies that much out of its memory on every save, so it needs a
+// ceiling; 4 MiB is 64 times what the biggest engine port seen so far uses.
+// A cart asking for more, or for a region outside its memory, fails to load.
+#define WC_MAX_SAVE_SIZE (4u * 1024 * 1024)
+
+// True when the save passed in wc_host_options_t wasn't loaded because its
+// size doesn't match the cart's save region (a damaged or foreign file).
+// The cart started fresh; the host should move the old file aside before it
+// saves over it.
+bool            wc_host_save_rejected(wc_host_t* host);
+
 // GL carts
 bool wc_host_uses_gl(wc_host_t* host);
 // Set a function that resolves GL function names to pointers.

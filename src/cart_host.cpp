@@ -206,6 +206,42 @@ static int check_abi_version(wc_host_t* host) {
     return 0;
 }
 
+// The save region is the cart's to choose, so check it before the host
+// copies a save into it or out of it: inside the cart's memory, and no
+// bigger than WC_MAX_SAVE_SIZE.
+static int check_save_region(wc_host_t* host) {
+    const wc_cart_info_t* info = &host->info;
+    if (!info->save_ptr || !info->save_size) return 0;
+    if (info->save_size > WC_MAX_SAVE_SIZE) {
+        wc_log("wasmcart: save region too large: %u bytes, this host keeps at most %u\n",
+               info->save_size, WC_MAX_SAVE_SIZE);
+        return -1;
+    }
+    if ((uint64_t)info->save_ptr + info->save_size > host->memory_size) {
+        wc_log("wasmcart: save region out of bounds: %u bytes at %u, memory is %u bytes\n",
+               info->save_size, info->save_ptr, host->memory_size);
+        return -1;
+    }
+    return 0;
+}
+
+// After wc_init: the region the host will save from must still be valid,
+// and must be the one the save was loaded into.
+static void lock_save_if_moved(wc_host_t* host) {
+    if (check_save_region(host) != 0) {
+        host->save_locked = true;
+        return;
+    }
+    if (host->save_loaded && (host->info.save_ptr != host->save_ptr_loaded ||
+                              host->info.save_size != host->save_size_loaded)) {
+        wc_log("wasmcart: save region moved during wc_init (%u bytes at %u, then %u at %u): "
+               "not saving, so the save on disk survives\n",
+               host->save_size_loaded, host->save_ptr_loaded,
+               host->info.save_size, host->info.save_ptr);
+        host->save_locked = true;
+    }
+}
+
 static void parse_cart_info(wc_host_t* host, uint32_t info_ptr) {
     uint8_t* mem = host->memory;
     wc_cart_info_t* info = &host->info;
@@ -1067,10 +1103,21 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
 
         write_host_info(host, opts);
 
+        if (check_save_region(host) != 0) return -1;
+        host->save_ptr_loaded = host->info.save_ptr;
+        host->save_size_loaded = host->info.save_size;
         if (opts && opts->save_data && host->info.save_ptr && opts->save_data_size > 0) {
-            uint32_t copy_size = opts->save_data_size < host->info.save_size ?
-                opts->save_data_size : host->info.save_size;
-            memcpy(host->memory + host->info.save_ptr, opts->save_data, copy_size);
+            // A save of the wrong size is damaged or belongs to something
+            // else. Loading part of it (or a cut-off prefix) would hand the
+            // cart a blob it can't trust, so start fresh and say so.
+            if (opts->save_data_size != host->info.save_size) {
+                wc_log("wasmcart: save is %u bytes but the cart's save region is %u: not loaded\n",
+                       opts->save_data_size, host->info.save_size);
+                host->save_rejected = true;
+            } else {
+                memcpy(host->memory + host->info.save_ptr, opts->save_data, host->info.save_size);
+                host->save_loaded = true;
+            }
         }
 
         seed_cart_rng(host, opts);
@@ -1097,6 +1144,7 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
                 parse_cart_info(host, result.ToLocalChecked()->Uint32Value(ctx()).FromJust());
             }
         }
+        lock_save_if_moved(host);
     } // end else (non-deferred init)
 
     // A deferred cart hasn't run yet, so its version isn't known here;
@@ -1166,6 +1214,9 @@ extern "C" int wc_host_finish_init(wc_host_t* host) {
     // where its ABI version is known. Refuse before wc_init, so an
     // incompatible cart never gets to touch the structs.
     if (check_abi_version(host) != 0) return -1;
+    if (check_save_region(host) != 0) return -1;
+    host->save_ptr_loaded = host->info.save_ptr;
+    host->save_size_loaded = host->info.save_size;
 
     // Write host info (preferred dimensions, etc.) before wc_init
     write_host_info(host, &host->deferred_opts);
@@ -1197,6 +1248,7 @@ extern "C" int wc_host_finish_init(wc_host_t* host) {
         }
     }
 
+    lock_save_if_moved(host);
     host->init_deferred = false;
 
     wc_log( "wasmcart: deferred init complete (%ux%u, %s)\n",
@@ -1838,12 +1890,17 @@ extern "C" const void* wc_host_get_audio(wc_host_t* host, uint32_t* num_frames, 
 }
 
 extern "C" uint8_t* wc_host_get_save_data(wc_host_t* host, uint32_t* size) {
-    if (!host->memory || !host->info.save_ptr || !host->info.save_size) {
-        *size = 0; return NULL;
-    }
+    *size = 0;
+    if (!host->memory || !host->info.save_ptr || !host->info.save_size || host->save_locked)
+        return NULL;
+    if (host->info.save_size > WC_MAX_SAVE_SIZE ||
+        (uint64_t)host->info.save_ptr + host->info.save_size > host->memory_size)
+        return NULL;
     *size = host->info.save_size;
     return host->memory + host->info.save_ptr;
 }
+
+extern "C" bool wc_host_save_rejected(wc_host_t* host) { return host && host->save_rejected; }
 
 // ─── GL / Info (unchanged) ──────────────────────────────────────────────
 
