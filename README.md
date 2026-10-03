@@ -238,6 +238,7 @@ cc -Isrc -o save_file_test test/save_file_test.c && ./save_file_test   # a save 
 python3 test/save_test.py build/wasmcart-run ../wasmcart/test/fixtures   # --save, --save-every, kills
 sh test/abi_gate_test.sh build/wasmcart-run ../wasmcart/test/fixtures/hello.wasc <v4 hello.wasc>   # wrong ABI refused
 python3 test/save_region_test.py build/wasmcart-run   # save region checked; a wrong-size save kept aside
+cc -Isrc -o peer_addr_test test/peer_addr_test.c && ./peer_addr_test   # the allowlist checks the host really reached
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 ./lifecycle_test ../wasmcart/test/fixtures/lifecycle.wasc 5484 5488 5492 5496 5500 5504 \
