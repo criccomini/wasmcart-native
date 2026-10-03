@@ -8,6 +8,7 @@
 #include "../include/wasmcart_host.h"
 #include "egl_context.h"
 #include "save_file.h"
+#include "save_writer.h"
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
@@ -177,14 +178,25 @@ static uint8_t* load_sav(const char* sav_path, uint32_t* out_size) {
 
 // Must run BEFORE wc_host_destroy(): the pointer returned points INTO the
 // cart's linear memory, which is gone afterwards.
-static uint8_t* g_last_saved = NULL;  // what's on disk, to skip identical writes
+static uint8_t* g_last_saved = NULL;  // the last save written or handed over
 static uint32_t g_last_saved_size = 0;
+static save_writer_t g_writer;           // writes periodic saves off the game's thread
+static bool g_save_retry = false;        // a write failed: send the next one regardless
 
-static void persist_sav(wc_host_t* host, const char* sav_path) {
+// Called after every save write, on whichever thread did it.
+static void save_done(bool ok) {
+    if (!ok) fprintf(stderr, "wasmcart: could not write a save\n");
+}
+
+// now: write it here and now, after anything the writer has in flight (the
+// final save on exit). Otherwise hand a snapshot to the writer thread.
+static void persist_sav(wc_host_t* host, const char* sav_path, bool now) {
     uint32_t size = 0;
     const uint8_t* data = wc_host_get_save_data(host, &size);
     if (!data || size == 0) return;  // cart declares no save block
-    if (g_last_saved && g_last_saved_size == size && memcmp(g_last_saved, data, size) == 0)
+    if (save_writer_take_failure(&g_writer)) g_save_retry = true;
+    if (!g_save_retry && g_last_saved && g_last_saved_size == size &&
+        memcmp(g_last_saved, data, size) == 0)
         return;  // nothing changed since the last write: spare the SD card
     // An all-zero region from a cart that never saved isn't a save: writing
     // it would create a .sav just by running the cart. With a save already
@@ -195,10 +207,13 @@ static void persist_sav(wc_host_t* host, const char* sav_path) {
         while (i < size && data[i] == 0) i++;
         if (i == size) return;
     }
-    if (save_file_write(sav_path, data, size) != 0) {
-        fprintf(stderr, "wasmcart: could not write save to %s\n", sav_path);
-        return;
+    if (now || !save_writer_post(&g_writer, data, size)) {
+        save_writer_flush(&g_writer);
+        bool ok = save_file_write(sav_path, data, size) == 0;
+        save_done(ok);
+        if (!ok) return;
     }
+    g_save_retry = false;
     uint8_t* copy = (uint8_t*)realloc(g_last_saved, size);
     if (copy) {
         memcpy(copy, data, size);
@@ -269,6 +284,8 @@ int main(int argc, char* argv[]) {
         sav_path_for(cart_path, sav_path, sizeof(sav_path));
     uint32_t sav_size = 0;
     uint8_t* sav_data = load_sav(sav_path, &sav_size);
+    if (!save_writer_start(&g_writer, sav_path, save_done))
+        fprintf(stderr, "wasmcart: no save writer thread; saves happen between frames\n");
     // The save as loaded is what's on disk: an exit without changes then
     // doesn't rewrite it.
     if (sav_data) {
@@ -685,7 +702,7 @@ int main(int argc, char* argv[]) {
         // of progress. Unchanged saves aren't rewritten.
         if (save_every_s && now - last_save_ticks >= (uint64_t)save_every_s * 1000) {
             last_save_ticks = now;
-            persist_sav(host, sav_path);
+            persist_sav(host, sav_path, false);
         }
 
         // Frame timing — vsync handles it if available, otherwise manual delay
@@ -705,7 +722,8 @@ int main(int argc, char* argv[]) {
     if (renderer) SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     egl_destroy();
-    persist_sav(host, sav_path);  // before destroy: reads the cart's memory
+    persist_sav(host, sav_path, true);  // before destroy: reads the cart's memory
+    save_writer_stop(&g_writer);
     wc_host_destroy(host);
     free(sav_data);
     SDL_Quit();
