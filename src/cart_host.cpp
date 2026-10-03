@@ -14,6 +14,7 @@ public:
 const SnapshotData* SnapshotBuilder::GetEmbeddedSnapshotData() { return nullptr; }
 }
 
+#include "peer_addr.h"
 #include "node.h"
 #include "v8.h"
 #include "v8-wasm.h"
@@ -545,21 +546,10 @@ static bool peer_addr_granted(wc_host_t* host, const char* addr) {
     if (!host->manifest.has_net) return false;
 
     /* Only ws:// and wss:// are implemented. A LAN or serial address would be
-     * gated by its own grant class, which does not exist yet. */
-    const char* rest;
-    if (strncmp(addr, "ws://", 5) == 0)       rest = addr + 5;
-    else if (strncmp(addr, "wss://", 6) == 0) rest = addr + 6;
-    else return false;
-
-    /* Hostname ends at ':', '/' or end of string. */
+     * gated by its own grant class, which does not exist yet. The hostname
+     * must be the one node's WebSocket will connect to: see peer_addr.h. */
     char hostname[256];
-    size_t n = 0;
-    while (rest[n] && rest[n] != ':' && rest[n] != '/' && n < sizeof(hostname) - 1) {
-        hostname[n] = rest[n];
-        n++;
-    }
-    hostname[n] = 0;
-    if (n == 0) return false;
+    if (!peer_addr_hostname(addr, hostname, sizeof(hostname))) return false;
 
     if (host->manifest.ws_domain_count == 0) return false;
     for (uint32_t i = 0; i < host->manifest.ws_domain_count; i++)
