@@ -225,6 +225,7 @@ node ../wasmcart/test/wsserver.mjs --port 8796 &   # from the wasmcart repo
 ./rumble_test ../wasmcart/test/fixtures/rumble.wasc
 ./text_test  test/textauto.wasc 5436 5440 5444 5456
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
+python3 test/info_bounds_test.py build/wasmcart-run   # wc_info_t regions outside memory are skipped, not crashed on
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 ```
