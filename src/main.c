@@ -96,6 +96,46 @@ static void close_controller(SDL_JoystickID id) {
     }
 }
 
+// ─── Rumble ────────────────────────────────────────────────────────────────
+//
+// The cart's wc_pad_rumble imports land here. The host library has already
+// clamped the magnitudes to 0..1 and capped the duration, so this only maps
+// them onto SDL's 0..65535 motors. Without a backend the imports are silent
+// no-ops and wc_pad_has_rumble reports 0 for every pad.
+
+static SDL_GameController* rumble_pad(uint32_t pad_id) {
+    return pad_id < MAX_CONTROLLERS ? controllers[pad_id] : NULL;
+}
+
+static int rumble_has(void* user, uint32_t pad_id) {
+    (void)user;
+    SDL_GameController* gc = rumble_pad(pad_id);
+    if (!gc) return 0;
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    return SDL_GameControllerHasRumble(gc) ? 1 : 0;
+#else
+    return 1;  // can't ask; SDL_GameControllerRumble fails quietly if not
+#endif
+}
+
+static void rumble_play(void* user, uint32_t pad_id, float low, float high,
+                        uint32_t duration_ms) {
+    (void)user;
+    SDL_GameController* gc = rumble_pad(pad_id);
+    if (gc) SDL_GameControllerRumble(gc, (Uint16)(low * 65535.0f + 0.5f),
+                                     (Uint16)(high * 65535.0f + 0.5f), duration_ms);
+}
+
+static void rumble_stop(void* user, uint32_t pad_id) {
+    (void)user;
+    SDL_GameController* gc = rumble_pad(pad_id);
+    if (gc) SDL_GameControllerRumble(gc, 0, 0, 0);
+}
+
+static void rumble_stop_all(void) {
+    for (uint32_t i = 0; i < MAX_CONTROLLERS; i++) rumble_stop(NULL, i);
+}
+
 // ─── Poll gamepads ─────────────────────────────────────────────────────────
 
 static void poll_pads(wc_pad_t pads[WC_MAX_PADS]) {
@@ -705,6 +745,10 @@ int main(int argc, char* argv[]) {
     if (!host) {
         fprintf(stderr, "wasmcart: failed to create host\n");
         return 1;
+    }
+    {
+        wc_rumble_backend_t rumble = { rumble_has, rumble_play, rumble_stop, NULL };
+        wc_host_set_rumble_backend(host, &rumble);
     }
 
     // 2. GL (BEFORE the SDL window): the EGL context is made when the host
@@ -1448,6 +1492,9 @@ int main(int argc, char* argv[]) {
     }
 
     // 8. Cleanup
+    // A long rumble would otherwise run out its duration after the window
+    // closes (SDL only stops it when the pad is closed, in SDL_Quit).
+    rumble_stop_all();
     wc_host_exit_v8();
     fprintf(stderr, "wasmcart: shutting down\n");
 
