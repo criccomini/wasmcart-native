@@ -232,6 +232,7 @@ sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 sh test/wayland_egl_guard_test.sh   # Wayland EGL stays on SDL's surface, torn down first
 sh test/kmsdrm_gl_guard_test.sh     # KMSDRM GL follows SDL's ordering rules
 cc -Iinclude -o pad_layout_test test/pad_layout_test.c && ./pad_layout_test   # wc_pad_t is the ABI's 16 bytes
+sh test/controller_db_platform_test.sh build/wasmcart-run test/snake.wasc   # this platform's mappings only
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 ./lifecycle_test ../wasmcart/test/fixtures/lifecycle.wasc 5484 5488 5492 5496 5500 5504 \
