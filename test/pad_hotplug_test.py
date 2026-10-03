@@ -50,6 +50,10 @@ class Runner:
         env = dict(os.environ)
         env.setdefault("SDL_VIDEODRIVER", "dummy")
         env.setdefault("SDL_AUDIODRIVER", "dummy")
+        # Without a udev daemon (a container) SDL still enumerates through
+        # libudev but never hears about new devices. Make it watch /dev/input.
+        if not os.path.exists("/run/udev/control"):
+            env.setdefault("SDL_JOYSTICK_DISABLE_UDEV", "1")
         self.proc = subprocess.Popen([binary, cart], env=env, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE, text=True)
         self.events = []  # (slot, "connected" | "disconnected")
