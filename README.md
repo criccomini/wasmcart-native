@@ -230,6 +230,7 @@ node ../wasmcart/test/wsserver.mjs --port 8796 &   # from the wasmcart repo
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 sh test/wayland_egl_guard_test.sh   # Wayland EGL stays on SDL's surface, torn down first
 python3 test/gl_no_context_test.py build/wasmcart-run   # with no display, a GL cart is refused at load, not crashed
+sh test/kmsdrm_gl_guard_test.sh     # KMSDRM GL follows SDL's ordering rules
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 ```
@@ -300,6 +301,38 @@ waits for the compositor's frame callback with no timeout, and compositors
 stop sending them to a covered or minimized window, which would freeze the
 loop, quit signals included. Like SDL's own Wayland GL path, the player swaps
 with interval 0 and waits for the callback itself, for at most 50ms.
+
+### Console (KMSDRM, no compositor)
+
+To run carts straight on the console, with no X11 or Wayland session, set
+`SDL_VIDEODRIVER=kmsdrm`. 2D carts work there without it; GL carts need it,
+because it is decided before the cart loads.
+
+On KMSDRM SDL owns the GL context (OpenGL ES 3.0, RGBA8, D24S8) and its
+`SDL_GL_GetProcAddress` is the cart's GL loader: SDL keeps its GBM surface to
+itself and does the page flips in its own swap, so the player can't present
+an EGL surface of its own there. The player creates one window, before the
+cart loads, at the console's current mode, and keeps it for the whole run,
+because on KMSDRM a window's size picks the video mode and creating or
+destroying windows moves SDL's context and resets the screen. So:
+
+- Set the resolution with the kernel's `video=` parameter. `--fullscreen`,
+  `--scale` and `--width`/`--height` don't change the mode; `--res` sets only
+  the GL render size.
+- F11 does nothing, and the cursor is hidden.
+- The user needs the `video`, `render` and `input` groups, and nothing else
+  (a compositor, Plymouth) may hold DRM master.
+- If SDL probes the wrong card, set `SDL_KMSDRM_DEVICE_INDEX`.
+
+If KMSDRM can't come up (no DRM access, a driver without OpenGL ES 3), the
+player says why. GL carts then can't run, and with `SDL_VIDEODRIVER=kmsdrm`
+set, SDL itself can't start either, so the player exits.
+
+Known issue: on a console with a keyboard attached, SDL installs crash
+handlers that restore the keyboard and re-raise the signal. A cart's
+out-of-bounds memory access, which V8 normally turns into a trap the player
+reports ("cart trapped"), then ends the process instead. This already applies
+to 2D carts on KMSDRM.
 
 ### Platform-Specific
 
