@@ -228,6 +228,7 @@ sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 cc -Isrc -o save_file_test test/save_file_test.c && ./save_file_test   # a save is replaced whole or not at all
 cc -Isrc -o save_writer_test test/save_writer_test.c $(pkg-config --cflags --libs sdl2) && ./save_writer_test
 python3 test/save_test.py build/wasmcart-run ../wasmcart/test/fixtures   # --save, --save-every, kills
+python3 test/save_region_test.py build/wasmcart-run   # save region checked; a wrong-size save kept aside
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 ```
