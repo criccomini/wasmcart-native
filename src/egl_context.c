@@ -23,7 +23,9 @@ typedef EGLDisplay (*PFNEGLGETPLATFORMDISPLAYEXTPROC_WC)(EGLenum, void*, const E
  * which would otherwise switch eglplatform.h's native types. */
 #include <wayland-client.h>
 #include <wayland-egl.h>
+#include <poll.h>
 #include <string.h>
+#include <time.h>
 #ifndef EGL_PLATFORM_WAYLAND_EXT
 #define EGL_PLATFORM_WAYLAND_EXT 0x31D8
 #endif
@@ -65,6 +67,69 @@ static struct wl_egl_window* wl_boot_win = NULL;
 static struct wl_egl_window* wl_win = NULL;
 static int wl_w = 0, wl_h = 0;
 static bool wl_opaque = false;
+
+/* Present pacing. Mesa honours eglSwapInterval(1) by blocking the next
+ * eglSwapBuffers on a frame callback, with no timeout, and compositors stop
+ * sending frame callbacks to a window that is covered or minimized: the main
+ * loop would stop dead, quit signals included. So, as SDL does for its own
+ * Wayland GL windows, the swap interval is 0 and we wait for the callback
+ * ourselves, on a private queue, for at most WL_FRAME_WAIT_MS. */
+#define WL_FRAME_WAIT_MS 50
+static struct wl_event_queue* wl_frame_queue = NULL;
+static struct wl_surface* wl_frame_surface = NULL;  // wrapper on wl_frame_queue
+static struct wl_callback* wl_frame_cb = NULL;
+static bool wl_frame_ready = false;
+static int wl_interval = 0;
+
+static void wl_frame_done(void* data, struct wl_callback* cb, uint32_t time);
+static const struct wl_callback_listener wl_frame_listener = { wl_frame_done };
+
+static void wl_request_frame(void) {
+    wl_frame_cb = wl_surface_frame(wl_frame_surface);
+    wl_callback_add_listener(wl_frame_cb, &wl_frame_listener, NULL);
+}
+
+static void wl_frame_done(void* data, struct wl_callback* cb, uint32_t time) {
+    (void)data;
+    (void)time;
+    wl_callback_destroy(cb);
+    wl_frame_ready = true;
+    // Ask for the next one now; Mesa's eglSwapBuffers commits it with the
+    // next frame.
+    wl_request_frame();
+}
+
+static uint64_t wl_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+// Wait for the compositor's go-ahead for the next frame, or the timeout.
+static void wl_wait_frame(void) {
+    uint64_t deadline = wl_now_ms() + WL_FRAME_WAIT_MS;
+    while (!wl_frame_ready) {
+        // A dead or errored connection never dispatches again, and
+        // prepare_read keeps failing while our event sits undispatched:
+        // without this the loop would spin forever. SDL reports the quit.
+        if (wl_display_get_error(wl_dpy)) break;
+        wl_display_flush(wl_dpy);
+        if (wl_display_prepare_read_queue(wl_dpy, wl_frame_queue) != 0) {
+            if (wl_display_dispatch_queue_pending(wl_dpy, wl_frame_queue) < 0) break;
+            continue;
+        }
+        uint64_t now = wl_now_ms();
+        struct pollfd pfd = { wl_display_get_fd(wl_dpy), POLLIN, 0 };
+        // Times out (or a signal arrives): present anyway.
+        if (now >= deadline || poll(&pfd, 1, (int)(deadline - now)) <= 0) {
+            wl_display_cancel_read(wl_dpy);
+            break;
+        }
+        if (wl_display_read_events(wl_dpy) < 0) break;
+        if (wl_display_dispatch_queue_pending(wl_dpy, wl_frame_queue) < 0) break;
+    }
+    wl_frame_ready = false;
+}
 
 static EGLSurface create_wl_surface(struct wl_egl_window* win) {
     /* Opaque even if the cart leaves alpha below 1 in the framebuffer;
@@ -252,6 +317,13 @@ int egl_create_wayland_window_surface(void* wl_surface, int width, int height) {
     wl_w = width;
     wl_h = height;
     window_surface = true;
+
+    // Frame callbacks on a queue of our own, so waiting for one never
+    // dispatches SDL's events.
+    wl_frame_queue = wl_display_create_queue(wl_dpy);
+    wl_frame_surface = (struct wl_surface*)wl_proxy_create_wrapper(wl_surface);
+    wl_proxy_set_queue((struct wl_proxy*)wl_frame_surface, wl_frame_queue);
+    wl_request_frame();
     return 0;
 }
 #endif
@@ -331,6 +403,14 @@ void egl_make_current(void) {
 
 void egl_swap_buffers(void) {
     if (initialized) {
+#ifdef WC_HAVE_WAYLAND_EGL
+        if (wl_frame_surface && wl_interval > 0) {
+            // Get the frame's GL work to the GPU before waiting, so it renders
+            // during the wait, as it does when Mesa throttles inside the swap.
+            glFlush();
+            wl_wait_frame();
+        }
+#endif
         eglSwapBuffers(egl_display, egl_surface);
 #ifdef __APPLE__
         if (mac_layer) {
@@ -348,6 +428,14 @@ void egl_swap_buffers(void) {
 
 void egl_set_swap_interval(int interval) {
     if (!initialized) return;
+#ifdef WC_HAVE_WAYLAND_EGL
+    if (wl_dpy) {
+        // Paced by wl_wait_frame instead; see WL_FRAME_WAIT_MS.
+        wl_interval = interval;
+        eglSwapInterval(egl_display, 0);
+        return;
+    }
+#endif
     eglSwapInterval(egl_display, interval);
 #ifdef __APPLE__
     /* ANGLE Metal ignores eglSwapInterval; displaySyncEnabled is the real
@@ -368,6 +456,17 @@ void egl_destroy(void) {
     mac_layer = NULL;
     mac_desired_sync = -1;
     mac_sync_applied = true;
+#endif
+#ifdef WC_HAVE_WAYLAND_EGL
+    // Proxies before the queue they are on.
+    if (wl_frame_cb) wl_callback_destroy(wl_frame_cb);
+    if (wl_frame_surface) wl_proxy_wrapper_destroy(wl_frame_surface);
+    if (wl_frame_queue) wl_event_queue_destroy(wl_frame_queue);
+    wl_frame_cb = NULL;
+    wl_frame_surface = NULL;
+    wl_frame_queue = NULL;
+    wl_frame_ready = false;
+    wl_interval = 0;
 #endif
     if (egl_display != EGL_NO_DISPLAY) {
         eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);

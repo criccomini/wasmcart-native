@@ -363,6 +363,12 @@ window, since SDL only makes one for an `SDL_WINDOW_OPENGL` window. This needs
 `libwayland-dev` at build time. X11 keeps `EGL_DEFAULT_DISPLAY`, since X window
 IDs work across connections.
 
+Presents on Wayland are paced by the player, not by `eglSwapInterval(1)`: Mesa
+waits for the compositor's frame callback with no timeout, and compositors
+stop sending them to a covered or minimized window, which would freeze the
+loop, quit signals included. Like SDL's own Wayland GL path, the player swaps
+with interval 0 and waits for the callback itself, for at most 50ms.
+
 Lifecycle differs too. The player suspends a cart when its window is minimized
 or hidden and resumes it on restore (the cart's `wc_on_suspend`/`wc_on_resume`
 fire, the save is written, `wc_render` stops). xdg-shell has no minimized
