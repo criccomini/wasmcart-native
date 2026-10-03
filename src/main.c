@@ -277,6 +277,16 @@ int main(int argc, char* argv[]) {
     const wc_manifest_t* manifest = wc_host_get_manifest(host);
     bool is_gl = wc_host_uses_gl(host);
 
+    // A GL cart cannot run without a GL context, and its first GL call through
+    // an unresolved proc is a NULL jump. Say why instead of segfaulting.
+    if (is_gl && !egl_is_initialized()) {
+        fprintf(stderr, "wasmcart: %s is a GL cart but EGL failed to initialize "
+            "(no usable display?); 2D carts still run without it\n", cart_path);
+        wc_host_destroy(host);
+        free(sav_data);
+        return 1;
+    }
+
     uint32_t cart_w = info->width;
     uint32_t cart_h = info->height;
     uint32_t win_w, win_h;
@@ -395,8 +405,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Set up FBO redirect at the preferred (actual rendering) resolution
-    {
+    // Set up FBO redirect at the preferred (actual rendering) resolution.
+    // Only with a live EGL context: the redirect is GL calls, and without one
+    // (eglInitialize failed, or a 2D cart that just ran egl_destroy) the GL
+    // procs may never have been resolved, so this jumped through NULL.
+    if (egl_is_initialized()) {
         extern void wc_gl_setup_redirect(uint32_t width, uint32_t height);
         uint32_t redir_w = pref_width ? pref_width : cart_w;
         uint32_t redir_h = pref_height ? pref_height : cart_h;
