@@ -38,6 +38,8 @@ static SDL_GameController* controllers[MAX_CONTROLLERS] = {0};
 // supervisor asks for sticky slots (see the supervisor hooks below).
 static pad_slots_t g_slots;
 static void hb_write_slot(int slot, bool connected, const char* key);
+static void hb_note(char kind, const char* what);
+static bool g_save_set_aside = false;
 
 // Letterboxing is NOT done here. GL carts are scaled by wc_gl_blit_to_screen
 // (gl_imports.cpp), which computes a centred destination rect from the cart's
@@ -424,6 +426,12 @@ static void dbg_poll_reply(wc_host_t* host, uint32_t* last_seq) {
 //   as "L <slot> <monotonic_us> <0|1> <key>". A cart that declares one
 //   player (or none) gets every pad's input on slot 0, so a pad that went to
 //   sleep can't lock everyone else out.
+// - Saves are reported too: "W 0 <monotonic_us>" once a save is on disk,
+//   "E 0 <monotonic_us> <reason>" when one couldn't be written
+//   (write_failed) or a save that couldn't be loaded was set aside
+//   (save_set_aside), and "I <abi> <save_size> <monotonic_us>" once the
+//   cart is loaded. The save file stays the source of truth: lines can be
+//   dropped.
 // - COUCHMIX_KEYBOARD_PAD=0 stops the keyboard driving pad 0. A TV's
 //   HDMI-CEC remote shows up as a keyboard.
 static volatile sig_atomic_t g_ext_suspend = 0;
@@ -464,6 +472,32 @@ static void hb_write(char kind, uint32_t frame) {
     }
 }
 
+static unsigned long long hb_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull;
+}
+
+static void hb_line(const char* line, int n) {
+    if (g_hb_fd < 0 || n <= 0) return;
+    if (write(g_hb_fd, line, (size_t)n) < 0 && errno != EAGAIN && errno != EINTR) {
+        close(g_hb_fd);
+        g_hb_fd = -1;
+    }
+}
+
+static void hb_note(char kind, const char* what) {
+    char line[128];
+    int n = what ? snprintf(line, sizeof(line), "%c 0 %llu %s\n", kind, hb_now_us(), what)
+                 : snprintf(line, sizeof(line), "%c 0 %llu\n", kind, hb_now_us());
+    hb_line(line, n);
+}
+
+static void hb_info(uint32_t abi, uint32_t save_size) {
+    char line[96];
+    hb_line(line, snprintf(line, sizeof(line), "I %u %u %llu\n", abi, save_size, hb_now_us()));
+}
+
 static void hb_write_slot(int slot, bool connected, const char* key) {
     if (g_hb_fd < 0) return;
     struct timespec ts;
@@ -488,6 +522,8 @@ static void hb_write(char kind, uint32_t frame) { (void)kind; (void)frame; }
 static void hb_write_slot(int slot, bool connected, const char* key) {
     (void)slot; (void)connected; (void)key;
 }
+static void hb_note(char kind, const char* what) { (void)kind; (void)what; }
+static void hb_info(uint32_t abi, uint32_t save_size) { (void)abi; (void)save_size; }
 static void supervisor_hooks_init(void) {}
 #endif
 
@@ -563,9 +599,11 @@ static uint32_t g_last_saved_size = 0;
 static save_writer_t g_writer;           // writes periodic saves off the game's thread
 static bool g_save_retry = false;        // a write failed: send the next one regardless
 
-// Called after every save write, on whichever thread did it.
+// Called after every save write, on whichever thread did it. The heartbeat
+// lines are single non-blocking writes, so the writer thread can send them.
 static void save_done(bool ok) {
     if (!ok) fprintf(stderr, "wasmcart: could not write a save\n");
+    hb_note(ok ? 'W' : 'E', ok ? NULL : "write_failed");
 }
 
 // now: write it here and now, after anything the writer has in flight (the
@@ -824,8 +862,10 @@ static void set_aside_sav(const char* sav_path) {
         snprintf(dest, sizeof(dest), "%s.invalid-%d", sav_path, n);
         FILE* f = fopen(dest, "rb");
         if (f) { fclose(f); continue; }
-        if (rename(sav_path, dest) == 0)
+        if (rename(sav_path, dest) == 0) {
             fprintf(stderr, "wasmcart: kept the save it couldn't load as %s\n", dest);
+            g_save_set_aside = true;
+        }
         return;
     }
 }
@@ -1323,6 +1363,12 @@ int main(int argc, char* argv[]) {
     // report the slots of the pads opened just below.
     pad_policy_init();
     supervisor_hooks_init();
+    {
+        uint32_t save_size = 0;
+        wc_host_get_save_data(host, &save_size);
+        hb_info(info->version, save_size);
+        if (g_save_set_aside) hb_note('E', "save_set_aside");
+    }
 
     // 6. Open any already-connected controllers
     for (int i = 0; i < SDL_NumJoysticks(); i++) {
