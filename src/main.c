@@ -36,6 +36,7 @@ static void print_usage(const char* argv0) {
     fprintf(stderr, "  --fullscreen    Start in fullscreen mode\n");
     fprintf(stderr, "  --fps           Show FPS counter\n");
     fprintf(stderr, "  --uncapped      Disable vsync and frame cap\n");
+    fprintf(stderr, "  --no-net        Refuse every network connection, whatever the manifest grants\n");
 }
 
 // ─── Controller management ─────────────────────────────────────────────────
@@ -199,6 +200,7 @@ int main(int argc, char* argv[]) {
     bool fullscreen = false;
     bool show_fps = false;
     bool uncapped = false;
+    bool no_net = false;
     uint32_t pref_width = 0;
     uint32_t pref_height = 0;
 
@@ -220,6 +222,8 @@ int main(int argc, char* argv[]) {
             show_fps = true;
         else if (strcmp(argv[i], "--uncapped") == 0)
             uncapped = true;
+        else if (strcmp(argv[i], "--no-net") == 0)
+            no_net = true;
     }
 
     // 1. Create host
@@ -249,7 +253,9 @@ int main(int argc, char* argv[]) {
         .audio_sample_rate = 48000,
         .save_data = sav_data,
         .save_data_size = sav_size,
+        .deny_net = no_net,
     };
+    if (no_net) fprintf(stderr, "wasmcart: networking off (--no-net)\n");
 
     int rc = wc_host_load_file(host, cart_path, &opts);
     if (rc != 0) {
