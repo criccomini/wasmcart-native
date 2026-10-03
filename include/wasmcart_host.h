@@ -56,7 +56,13 @@ extern "C" {
 
 // ─── Structs ───────────────────────────────────────────────────────────────
 
-// Matches the in-memory layout of wc_pad_t (16 bytes)
+// Matches the in-memory layout of wc_pad_t (16 bytes, ABI v3).
+//
+// wc_host_set_pads memcpy's four of these into cart memory with sizeof(), so
+// the size is the ABI. This used to say "16 bytes" while declaring a single
+// byte of padding, which compiles to 14: the copy moved 56 bytes where the
+// cart reads 64, and pads 1-3 landed at the wrong offsets. The assertion
+// keeps the comment honest.
 typedef struct {
     uint16_t buttons;
     int16_t  left_x;
@@ -66,8 +72,14 @@ typedef struct {
     uint8_t  left_trigger;
     uint8_t  right_trigger;
     uint8_t  connected;
-    uint8_t  _pad;
+    uint8_t  _pad[3];
 } wc_pad_t;
+
+#ifdef __cplusplus
+static_assert(sizeof(wc_pad_t) == 16, "wc_pad_t must be exactly 16 bytes (ABI v3)");
+#else
+_Static_assert(sizeof(wc_pad_t) == 16, "wc_pad_t must be exactly 16 bytes (ABI v3)");
+#endif
 
 // Parsed from wc_get_info() return
 typedef struct {
