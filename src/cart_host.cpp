@@ -598,6 +598,10 @@ static void v8_wc_peer_open(const v8::FunctionCallbackInfo<v8::Value>& args) {
     if (!wc_cart_range_ok(host, "wc_peer_open", ptr, len)) return;
     if (!read_cart_str(host, ptr, len, addr, sizeof addr)) return;
 
+    if (host->net_denied) {
+        wc_log("wasmcart: wc_peer_open refused; networking is off for this cart\n");
+        return;
+    }
     if (!peer_addr_granted(host, addr)) {
         wc_log("wasmcart: wc_peer_open refused; the cart must set "
                "WC_FLAG_NET_PEER and the manifest must grant that host\n");
@@ -966,6 +970,8 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
 
     _current_host = host;
     auto state = (v8_host_state*)host->v8_state;
+    // Before anything of the cart's runs: it may dial out from wc_init.
+    host->net_denied = opts && opts->deny_net;
 
     // 1. Open archive and read wasm bytes
     int rc = wc_archive_open(host, wasc_path);

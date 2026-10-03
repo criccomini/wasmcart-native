@@ -120,6 +120,7 @@ struct wc_host {
     // not have anticipated. A host-supplied peer needs no grant -- the host
     // already chose it.
     wc_peer_t* peers;
+    bool       net_denied;  // wc_host_options_t.deny_net: refuse every wc_peer_open
     uint32_t   peer_count;
     uint32_t   peer_cap;
     int32_t    peer_next_id;

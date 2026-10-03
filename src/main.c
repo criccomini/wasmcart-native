@@ -56,6 +56,7 @@ static void print_usage(const char* argv0) {
     fprintf(stderr, "  --uncapped      Disable vsync and frame cap\n");
     fprintf(stderr, "  --save <path>   Save file (default: the cart's path + .sav)\n");
     fprintf(stderr, "  --save-every <s>  Also write the save every s seconds if it changed\n");
+    fprintf(stderr, "  --no-net        Refuse every network connection, whatever the manifest grants\n");
 }
 
 // ─── Controller management ─────────────────────────────────────────────────
@@ -695,6 +696,7 @@ int main(int argc, char* argv[]) {
     bool uncapped = false;
     const char* save_override = NULL;
     uint32_t save_every_s = 0;
+    bool no_net = false;
     uint32_t pref_width = 0;
     uint32_t pref_height = 0;
 
@@ -720,6 +722,8 @@ int main(int argc, char* argv[]) {
             save_override = argv[++i];
         else if (strcmp(argv[i], "--save-every") == 0 && i + 1 < argc)
             save_every_s = (uint32_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--no-net") == 0)
+            no_net = true;
     }
 
     // 1. Create host
@@ -788,7 +792,9 @@ int main(int argc, char* argv[]) {
         .audio_sample_rate = 48000,
         .save_data = sav_data,
         .save_data_size = sav_size,
+        .deny_net = no_net,
     };
+    if (no_net) fprintf(stderr, "wasmcart: networking off (--no-net)\n");
 
     int rc = wc_host_load_file(host, cart_path, &opts);
     if (rc != 0) {

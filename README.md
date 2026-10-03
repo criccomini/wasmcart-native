@@ -177,6 +177,11 @@ destination the packager may not have anticipated. A peer the host established
 needs no cart-side grant; requiring an embedder to write a manifest key
 permitting its own action would be ceremony.
 
+The player can still say no. `deny_net` in `wc_host_options_t` (`--no-net` for
+the standalone player) makes `wc_peer_open()` refuse every address, whatever the
+manifest grants, with the same -1 an ungranted host gets, so the cart sees what
+it would see offline. Host-supplied peers aren't affected.
+
 Dial-out is handled entirely inside the host using node's own WebSocket -- the
 same implementation the Node host uses, so a cart that talks to a server in the
 browser talks to it here without change, and an embedder does nothing. For a
@@ -250,6 +255,7 @@ python3 test/info_bounds_test.py build/wasmcart-run   # wc_info_t regions outsid
 cc -Iinclude -Isrc -o clock_test test/clock_test.c && ./clock_test   # no V8 or SDL needed
 cc -Iinclude -Isrc -o audio_fade_test test/audio_fade_test.c -lm && ./audio_fade_test
 cc -Isrc -o pad_slots_test test/pad_slots_test.c && ./pad_slots_test   # sticky player slots
+python3 test/no_net_test.py build/wasmcart-run     # --no-net refuses a granted host
 ```
 
 `text_test` and `lifecycle_test` take the cart's debug-field offsets as arguments because they move
