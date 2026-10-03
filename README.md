@@ -298,6 +298,7 @@ sh test/kmsdrm_gl_guard_test.sh     # KMSDRM GL follows SDL's ordering rules
 cc -Iinclude -o pad_layout_test test/pad_layout_test.c && ./pad_layout_test   # wc_pad_t is the ABI's 20 bytes
 sh test/controller_db_platform_test.sh build/wasmcart-run test/snake.wasc   # this platform's mappings only
 python3 test/pad_hotplug_test.py build/wasmcart-run test/snake.wasc   # one slot per pad (Linux, uinput)
+cc -Isrc -o save_file_test test/save_file_test.c && ./save_file_test   # a save is replaced whole or not at all
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 sh test/wgpu_test.sh          # WebGPU carts (needs a build with WebGPU support)
