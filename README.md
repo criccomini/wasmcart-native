@@ -241,6 +241,7 @@ python3 test/pad_hotplug_test.py build/wasmcart-run test/snake.wasc   # one slot
 
 cc -Iinclude -Isrc -o clock_test test/clock_test.c && ./clock_test   # no V8 or SDL needed
 cc -Iinclude -Isrc -o audio_fade_test test/audio_fade_test.c -lm && ./audio_fade_test
+cc -Isrc -o pad_slots_test test/pad_slots_test.c && ./pad_slots_test   # sticky player slots
 ```
 
 `text_test` and `lifecycle_test` take the cart's debug-field offsets as arguments because they move

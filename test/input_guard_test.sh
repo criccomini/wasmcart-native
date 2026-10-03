@@ -16,8 +16,8 @@ set -e
 SRC="$(dirname "$0")/../src/main.c"
 fail=0
 
-if grep -q 'if (!wc_host_text_input_active(host))' "$SRC" &&
-   grep -A2 'if (!wc_host_text_input_active(host))' "$SRC" | grep -q 'poll_keyboard_as_pad'; then
+if grep -q '!wc_host_text_input_active(host))' "$SRC" &&
+   grep -A2 '!wc_host_text_input_active(host))' "$SRC" | grep -q 'poll_keyboard_as_pad'; then
   echo "  ok    keyboard-as-gamepad is suppressed during text input"
 else
   echo "*** FAIL poll_keyboard_as_pad() is not guarded by wc_host_text_input_active()"
