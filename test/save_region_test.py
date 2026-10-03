@@ -61,9 +61,10 @@ def name(s):
     return leb(len(s)) + s.encode()
 
 
-def cart(save_ptr, save_size, moved_ptr=None):
+def cart(save_ptr, save_size, moved_ptr=None, late_size=None):
     """A 2D cart, 8x8, one page of memory, whose save region is as given.
-    With moved_ptr, wc_init rewrites save_ptr in its wc_info_t."""
+    With moved_ptr, wc_init rewrites save_ptr in its wc_info_t, and with
+    late_size save_size too."""
     info = struct.pack("<12I", 3, 8, 8, 2048, 0, 0, 0, 0, save_ptr, save_size, 0, 0)
     info += struct.pack("<I", 0)  # flags
     types = vec([b"\x60\x00\x01\x7f", b"\x60\x00\x00"])  # () -> i32, () -> ()
@@ -79,6 +80,8 @@ def cart(save_ptr, save_size, moved_ptr=None):
     init = b""
     if moved_ptr is not None:
         init = b"\x41" + sleb(INFO + 32) + b"\x41" + sleb(moved_ptr) + b"\x36\x02\x00"
+    if late_size is not None:
+        init += b"\x41" + sleb(INFO + 36) + b"\x41" + sleb(late_size) + b"\x36\x02\x00"
     code = vec([body(b"\x41" + sleb(INFO)), body(b""), body(init)])
     data = vec([b"\x00\x41" + sleb(INFO) + b"\x0b" + leb(len(info)) + info])
     wasm = (b"\x00asm\x01\x00\x00\x00" + section(1, types) + section(3, funcs) +
@@ -143,6 +146,13 @@ def main():
         open(save, "wb").write(old)
         rc, err = run(binary, moved, save)
         expect("a region moved in wc_init leaves the save alone",
+               "save region moved during wc_init" in err and open(save, "rb").read() == old)
+
+        late = write_cart("late", cart(0, 0, moved_ptr=4096, late_size=64))
+        save = os.path.join(d, "late.sav")
+        open(save, "wb").write(old)
+        rc, err = run(binary, late, save)
+        expect("a region set up only in wc_init leaves the save alone",
                "save region moved during wc_init" in err and open(save, "rb").read() == old)
 
         # Wrong size: a 5-byte save for a 64-byte region. It isn't loaded, it's
