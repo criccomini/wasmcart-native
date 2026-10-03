@@ -149,6 +149,70 @@ static void queue_silence(SDL_AudioDeviceID dev, uint32_t bytes) {
 static volatile sig_atomic_t g_should_quit = 0;
 static void on_quit_signal(int sig) { (void)sig; g_should_quit = 1; }
 
+// ─── Couchmix supervisor hooks ──────────────────────────────────────────
+//
+// For a process supervisor (Couchmix) that owns the screen and the Home
+// button:
+//
+// - COUCHMIX_HEARTBEAT_FD names an inherited, write-only fd (a pipe). One
+//   line per event: "F <frame> <monotonic_us>" per presented frame,
+//   "S"/"R" on suspend/resume, "P" every 250ms while suspended. Writes are
+//   non-blocking and dropped on EAGAIN, so a slow supervisor never stalls the
+//   game. A supervisor that stops seeing them can call the cart hung.
+// - SIGUSR1 asks for a suspend and SIGUSR2 for a resume. They feed the same
+//   lifecycle path as a minimized window (callbacks, save, clock rebase),
+//   which is the only way to suspend on native Wayland, where SDL2 can't see
+//   a minimize.
+// - Buttons held at a resume are masked until released, so the press that
+//   chose "Resume" in the supervisor's menu never reaches the cart.
+static volatile sig_atomic_t g_ext_suspend = 0;
+#ifndef _WIN32
+#include <errno.h>
+#include <fcntl.h>
+#include <time.h>
+#include <unistd.h>
+static int g_hb_fd = -1;
+
+static void on_suspend_signal(int sig) { (void)sig; g_ext_suspend = 1; }
+static void on_resume_signal(int sig) { (void)sig; g_ext_suspend = 0; }
+
+static void hb_open(void) {
+    const char* s = getenv("COUCHMIX_HEARTBEAT_FD");
+    if (!s || !*s) return;
+    int fd = atoi(s);
+    if (fd < 0 || fcntl(fd, F_GETFD) < 0) {
+        fprintf(stderr, "wasmcart: COUCHMIX_HEARTBEAT_FD=%s is not open\n", s);
+        return;
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    signal(SIGPIPE, SIG_IGN);
+    g_hb_fd = fd;
+}
+
+static void hb_write(char kind, uint32_t frame) {
+    if (g_hb_fd < 0) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    char line[64];
+    int n = snprintf(line, sizeof(line), "%c %u %llu\n", kind, frame,
+        (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull);
+    if (write(g_hb_fd, line, (size_t)n) < 0 && errno != EAGAIN && errno != EINTR) {
+        close(g_hb_fd);
+        g_hb_fd = -1;  // the supervisor went away; keep playing
+    }
+}
+
+static void supervisor_hooks_init(void) {
+    signal(SIGUSR1, on_suspend_signal);
+    signal(SIGUSR2, on_resume_signal);
+    hb_open();
+}
+#else
+static void hb_write(char kind, uint32_t frame) { (void)kind; (void)frame; }
+static void supervisor_hooks_init(void) {}
+#endif
+
 // ─── Save data ──────────────────────────────────────────────────────────
 //
 // A cart's save block is a region of its own linear memory that the host is
@@ -779,6 +843,9 @@ int main(int argc, char* argv[]) {
     wc_host_enter_v8();
     signal(SIGINT, on_quit_signal);
     signal(SIGTERM, on_quit_signal);
+    supervisor_hooks_init();
+    uint64_t last_alive_ticks = 0;
+    uint32_t guard_mask[WC_MAX_PADS] = {0};
     bool running = true;
     uint32_t frame_count = 0;
     uint64_t start_ticks = SDL_GetTicks64();
@@ -853,9 +920,11 @@ int main(int argc, char* argv[]) {
         // a seat with only gamepads never gives a window keyboard focus.
         {
             bool hidden = (SDL_GetWindowFlags(window) &
-                           (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) != 0;
+                           (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) != 0 ||
+                          g_ext_suspend;
             if (hidden) {
                 if (wc_host_suspend(host)) {
+                    hb_write('S', frame_count);
                     fprintf(stderr, "wasmcart: suspended at frame %u\n", frame_count);
                     // A hidden app can be killed without ever reaching a
                     // graceful quit, so suspend is a persistence point.
@@ -870,6 +939,11 @@ int main(int argc, char* argv[]) {
                 // cart sees none of it, not even one clamped frame.
                 wc_frame_clock_rebase(&frame_clock, (double)now);
                 wc_host_resume(host);
+                hb_write('R', frame_count);
+                // Mask what is held right now until it is released.
+                wc_pad_t held[WC_MAX_PADS];
+                poll_pads(held);
+                for (int i = 0; i < WC_MAX_PADS; i++) guard_mask[i] = held[i].buttons;
                 fprintf(stderr, "wasmcart: resumed at frame %u\n", frame_count);
                 if (audio_dev) {
                     queue_silence(audio_dev, audio_seed_bytes);
@@ -889,7 +963,13 @@ int main(int argc, char* argv[]) {
             // loop turning for the cart's connections, and sleep until the
             // next window event instead of spinning.
             wc_host_pump(host);
-            SDL_WaitEventTimeout(NULL, 100);
+            if (now - last_alive_ticks >= 250) {
+                hb_write('P', frame_count);
+                last_alive_ticks = now;
+            }
+            // A resume signal doesn't wake SDL's wait, so poll faster while
+            // the supervisor holds the cart suspended.
+            SDL_WaitEventTimeout(NULL, g_ext_suspend ? 16 : 100);
             continue;
         }
 
@@ -906,6 +986,11 @@ int main(int argc, char* argv[]) {
         // picker.
         if (!wc_host_text_input_active(host)) {
             poll_keyboard_as_pad(&pads[0]);
+        }
+        for (int i = 0; i < WC_MAX_PADS; i++) {
+            if (!guard_mask[i]) continue;
+            guard_mask[i] &= pads[i].buttons;  // released buttons leave the mask
+            pads[i].buttons &= ~guard_mask[i];
         }
         wc_host_set_pads(host, pads);
 
@@ -996,6 +1081,8 @@ int main(int argc, char* argv[]) {
                 SDL_QueueAudio(audio_dev, audio, bytes);
             }
         }
+
+        hb_write('F', frame_count);
 
         // FPS counter
         frame_count++;
