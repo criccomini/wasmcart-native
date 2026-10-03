@@ -38,6 +38,7 @@ static void print_usage(const char* argv0) {
     fprintf(stderr, "  --fps           Show FPS counter\n");
     fprintf(stderr, "  --uncapped      Disable vsync and frame cap\n");
     fprintf(stderr, "  --save <path>   Save file (default: the cart's path + .sav)\n");
+    fprintf(stderr, "  --save-every <s>  Also write the save every s seconds if it changed\n");
 }
 
 // ─── Controller management ─────────────────────────────────────────────────
@@ -171,6 +172,15 @@ static void persist_sav(wc_host_t* host, const char* sav_path) {
     if (!data || size == 0) return;  // cart declares no save block
     if (g_last_saved && g_last_saved_size == size && memcmp(g_last_saved, data, size) == 0)
         return;  // nothing changed since the last write: spare the SD card
+    // An all-zero region from a cart that never saved isn't a save: writing
+    // it would create a .sav just by running the cart. With a save already
+    // on disk, zeros mean the player cleared it, and that must be written or
+    // the old save comes back next time (SPEC.md, "Saving is host-managed").
+    if (!g_last_saved) {
+        uint32_t i = 0;
+        while (i < size && data[i] == 0) i++;
+        if (i == size) return;
+    }
     if (save_file_write(sav_path, data, size) != 0) {
         fprintf(stderr, "wasmcart: could not write save to %s\n", sav_path);
         return;
@@ -195,6 +205,7 @@ int main(int argc, char* argv[]) {
     bool show_fps = false;
     bool uncapped = false;
     const char* save_override = NULL;
+    uint32_t save_every_s = 0;
     uint32_t pref_width = 0;
     uint32_t pref_height = 0;
 
@@ -218,6 +229,8 @@ int main(int argc, char* argv[]) {
             uncapped = true;
         else if (strcmp(argv[i], "--save") == 0 && i + 1 < argc)
             save_override = argv[++i];
+        else if (strcmp(argv[i], "--save-every") == 0 && i + 1 < argc)
+            save_every_s = (uint32_t)atoi(argv[++i]);
     }
 
     // 1. Create host
@@ -493,6 +506,7 @@ int main(int argc, char* argv[]) {
     uint32_t fps_counter = 0;
     uint64_t fps_last = start_ticks;
     uint64_t last_frame_ticks = start_ticks;
+    uint64_t last_save_ticks = start_ticks;
 
     while (running) {
         uint64_t now = SDL_GetTicks64();
@@ -638,6 +652,13 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "wasmcart: FPS: %.1f\n", fps_counter * 1000.0 / (now - fps_last));
             fps_counter = 0;
             fps_last = now;
+        }
+
+        // Periodic saves: a crash or power cut then costs at most this long
+        // of progress. Unchanged saves aren't rewritten.
+        if (save_every_s && now - last_save_ticks >= (uint64_t)save_every_s * 1000) {
+            last_save_ticks = now;
+            persist_sav(host, sav_path);
         }
 
         // Frame timing — vsync handles it if available, otherwise manual delay
