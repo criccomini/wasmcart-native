@@ -225,6 +225,7 @@ node ../wasmcart/test/wsserver.mjs --port 8796 &   # from the wasmcart repo
 ./rumble_test ../wasmcart/test/fixtures/rumble.wasc
 ./text_test  test/textauto.wasc 5436 5440 5444 5456
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
+sh test/abi_gate_test.sh build/wasmcart-run ../wasmcart/test/fixtures/hello.wasc <v4 hello.wasc>   # wrong ABI refused
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 ```
