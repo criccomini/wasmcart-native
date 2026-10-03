@@ -14,8 +14,10 @@ extern "C" {
 
 // ─── ABI Constants (matches abi.js) ────────────────────────────────────────
 
-#define WC_ABI_VERSION     3
-#define WC_MIN_ABI_VERSION 1
+#define WC_ABI_VERSION     4
+// v4 moved every field after wc_pad_t.buttons, so a v1-v3 cart cannot be read
+// with v4 offsets: it is refused at load rather than reinterpreted.
+#define WC_MIN_ABI_VERSION 4
 
 #define WC_MAX_PADS        4
 #define WC_PAD_SIZE        16
@@ -38,6 +40,21 @@ extern "C" {
 #define WC_BUTTON_RIGHT  (1 << 11)
 #define WC_BUTTON_L3     (1 << 12)
 #define WC_BUTTON_R3     (1 << 13)
+// ABI v4: the rest of SDL2's controller button set, which libretro mirrors.
+// Bits 0-13 above keep the meanings they have always had. A pad lacking one
+// of these never sets the bit, so a cart may read them unconditionally.
+#define WC_BUTTON_GUIDE    (1 << 14)  // centre/home/logo
+#define WC_BUTTON_MISC1    (1 << 15)  // share/capture/microphone, varies
+#define WC_BUTTON_PADDLE1  (1 << 16)  // upper right paddle (Elite/Pro)
+#define WC_BUTTON_PADDLE2  (1 << 17)  // upper left paddle
+#define WC_BUTTON_PADDLE3  (1 << 18)  // lower right paddle
+#define WC_BUTTON_PADDLE4  (1 << 19)  // lower left paddle
+#define WC_BUTTON_TOUCHPAD (1 << 20)  // touchpad click (DualShock)
+// Bits 21-31 reserved.
+
+// Full travel on a trigger. Matches SDL2 and libretro, so an embedder reading
+// either assigns the value through rather than scaling it.
+#define WC_TRIGGER_MAX     32767
 
 // Cart info flags
 #define WC_FLAG_AUDIO_F32 (1 << 0)
@@ -50,18 +67,35 @@ extern "C" {
 
 // ─── Structs ───────────────────────────────────────────────────────────────
 
-// Matches the in-memory layout of wc_pad_t (16 bytes)
+// Matches the in-memory layout of wc_pad_t (20 bytes, ABI v4).
+//
+// EVERY ANALOG AXIS IS int16: sticks -32768..32767, triggers 0..32767. That
+// is bit-for-bit what SDL_GameControllerGetAxis and libretro's
+// RETRO_DEVICE_ANALOG already report, so an embedder assigns the value
+// straight through with no scaling at all.
+//
+// The static assert below is load-bearing. This struct is memcpy'd into cart
+// memory with sizeof(), and the previous version declared itself as "16
+// bytes" in a comment while actually compiling to FOURTEEN -- so the copy
+// moved 56 bytes where the cart expected 64, and pads 1 through 3 were
+// silently misaligned. A comment cannot hold a layout; an assertion can.
 typedef struct {
-    uint16_t buttons;
+    uint32_t buttons;        // WC_BTN_* bitmask; bits 21-31 reserved
     int16_t  left_x;
     int16_t  left_y;
     int16_t  right_x;
     int16_t  right_y;
-    uint8_t  left_trigger;
-    uint8_t  right_trigger;
+    int16_t  left_trigger;   // 0..32767, never negative
+    int16_t  right_trigger;  // 0..32767, never negative
     uint8_t  connected;
-    uint8_t  _pad;
+    uint8_t  _pad[3];
 } wc_pad_t;
+
+#ifdef __cplusplus
+static_assert(sizeof(wc_pad_t) == 20, "wc_pad_t must be exactly 20 bytes (ABI v4)");
+#else
+_Static_assert(sizeof(wc_pad_t) == 20, "wc_pad_t must be exactly 20 bytes (ABI v4)");
+#endif
 
 // Parsed from wc_get_info() return
 typedef struct {

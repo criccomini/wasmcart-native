@@ -89,13 +89,27 @@ static void poll_pads(wc_pad_t pads[WC_MAX_PADS]) {
         if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) pads[i].buttons |= WC_BUTTON_RIGHT;
         if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSTICK))  pads[i].buttons |= WC_BUTTON_L3;
         if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) pads[i].buttons |= WC_BUTTON_R3;
+        /* ABI v4 buttons. SDL_GameControllerHasButton is checked because the
+         * paddles and touchpad only exist on some pads, and asking for an
+         * absent button is not meaningful. */
+        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_GUIDE))    pads[i].buttons |= WC_BUTTON_GUIDE;
+        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_MISC1))    pads[i].buttons |= WC_BUTTON_MISC1;
+        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_PADDLE1))  pads[i].buttons |= WC_BUTTON_PADDLE1;
+        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_PADDLE2))  pads[i].buttons |= WC_BUTTON_PADDLE2;
+        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_PADDLE3))  pads[i].buttons |= WC_BUTTON_PADDLE3;
+        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_PADDLE4))  pads[i].buttons |= WC_BUTTON_PADDLE4;
+        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_TOUCHPAD)) pads[i].buttons |= WC_BUTTON_TOUCHPAD;
 
+        /* Straight assignment, no scaling: SDL and the pad struct now use the
+         * same representation for every analog axis. The triggers used to need
+         * `>> 7` to fit a byte, which is the shift that was wrong by one in
+         * the libretro core. */
         pads[i].left_x  = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
         pads[i].left_y  = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);
         pads[i].right_x = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX);
         pads[i].right_y = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY);
-        pads[i].left_trigger  = (uint8_t)(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT) >> 7);
-        pads[i].right_trigger = (uint8_t)(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) >> 7);
+        pads[i].left_trigger  = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+        pads[i].right_trigger = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
     }
 }
 
