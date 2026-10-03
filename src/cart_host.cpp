@@ -206,6 +206,7 @@ static void parse_cart_info(wc_host_t* host, uint32_t info_ptr) {
     info->pointer_ptr      = wc_read_u32(mem, info_ptr + WC_INFO_POINTER_PTR);
     info->keys_ptr         = wc_read_u32(mem, info_ptr + WC_INFO_KEYS_PTR);
     info->gpu_api          = wc_read_u32(mem, info_ptr + WC_INFO_GPU_API);
+    info->wheel_ptr        = wc_read_u32(mem, info_ptr + WC_INFO_WHEEL_PTR);
 
     // Determine rendering mode: gpu_api is authoritative when set. For old
     // carts built before the field existed (gpu_api == 0), fall back to
@@ -1188,6 +1189,16 @@ extern "C" void wc_host_set_pointer(wc_host_t* host, int index, int16_t x, int16
     host->memory[offset + 7] = 0;
 }
 
+// Wheel (ABI v3.1). ACCUMULATES: an embedder calls this once per event and
+// the host hands the cart the frame's total, which is what makes a trackpad
+// flick one delta instead of a number that depends on how long the frame
+// took. Zeroed after each frame in run_frame, so the cart only ever reads.
+extern "C" void wc_host_add_wheel(wc_host_t* host, int32_t dx, int32_t dy) {
+    if (!host->memory || !host->info.wheel_ptr) return;
+    host->wheel_dx += dx;
+    host->wheel_dy += dy;
+}
+
 extern "C" void wc_host_set_time(wc_host_t* host, double time_ms, double delta_ms, uint32_t frame) {
     if (!host->memory || !host->info.time_ptr) return;
     uint32_t ptr = host->info.time_ptr;
@@ -1615,6 +1626,15 @@ extern "C" void wc_host_pump(wc_host_t* host) {
     pump_node(host);
 }
 
+// Write the frame's accumulated wheel delta where the cart reads it. Separate
+// from wc_host_add_wheel so events can arrive at any time and the cart still
+// sees a single coherent value for the frame.
+static void deliver_wheel(wc_host_t* host) {
+    if (!host->memory || !host->info.wheel_ptr) return;
+    wc_write_u32(host->memory, host->info.wheel_ptr + WC_WHEEL_DX, (uint32_t) host->wheel_dx);
+    wc_write_u32(host->memory, host->info.wheel_ptr + WC_WHEEL_DY, (uint32_t) host->wheel_dy);
+}
+
 extern "C" void wc_host_run_frame(wc_host_t* host) {
     if (!host->fn_wc_render || host->trapped) return;
 
@@ -1629,6 +1649,7 @@ extern "C" void wc_host_run_frame(wc_host_t* host) {
     drain_js_peer_events(host); // move socket events into the peer records
     deliver_peers(host);        // then into the cart, at a known point
     deliver_text(host);         // before render, like every other input
+    deliver_wheel(host);        // frame total in, zeroed again after render
 
     auto result = state->fn_wc_render.Get(g_isolate)->Call(
         ctx(), ctx()->Global(), 0, nullptr);
@@ -1641,6 +1662,15 @@ extern "C" void wc_host_run_frame(wc_host_t* host) {
     }
 
     refresh_memory(host);
+
+    // Clear AFTER the frame, not before: the cart has now read the total, and
+    // leaving it set would scroll forever off a single flick.
+    if (host->memory && host->info.wheel_ptr) {
+        wc_write_u32(host->memory, host->info.wheel_ptr + WC_WHEEL_DX, 0);
+        wc_write_u32(host->memory, host->info.wheel_ptr + WC_WHEEL_DY, 0);
+    }
+    host->wheel_dx = 0;
+    host->wheel_dy = 0;
 }
 
 // ─── Readback (unchanged — pure C, reads host->memory) ────────────────

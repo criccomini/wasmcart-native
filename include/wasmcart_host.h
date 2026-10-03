@@ -83,6 +83,8 @@ typedef struct {
     uint32_t pointer_ptr;
     uint32_t keys_ptr;
     uint32_t gpu_api;          // 0=2D, 1=WebGL2/GLES3, 2=WebGPU, 3=Vulkan
+    // v3.1
+    uint32_t wheel_ptr;        // wc_wheel_t, 0 = cart does not read the wheel
 } wc_cart_info_t;
 
 // GPU API values
@@ -240,6 +242,23 @@ int  wc_host_text_input_active(wc_host_t* host);
 void wc_host_set_pads(wc_host_t* host, const wc_pad_t pads[WC_MAX_PADS]);
 void wc_host_set_keyboard(wc_host_t* host, const uint8_t keys[WC_KEYS_STATE_SIZE]);
 void wc_host_set_pointer(wc_host_t* host, int index, int16_t x, int16_t y, uint8_t buttons, uint8_t active);
+
+// Scroll wheel (ABI v3.1). Units are 1/120 of a notch, right and UP positive:
+// one click of a detented wheel is 120, and a trackpad or free-spin wheel
+// reports whatever fraction it actually moved, so smooth scrolling survives
+// instead of being rounded to a click.
+//
+// ACCUMULATE, DO NOT ASSIGN. Call this once per event as they arrive; the host
+// sums them, hands the cart the frame's total, and zeroes it afterwards. That
+// is what makes a trackpad flick (dozens of events) one delta, and makes a
+// cart behave the same at 30fps as at 144. An embedder that never calls this
+// leaves the field zero forever, which is how a device with no wheel looks.
+// One click of a detented wheel. Public because an embedder converting from a
+// platform's "notches" needs it: SDL reports whole notches, so a notch up is
+// wc_host_add_wheel(host, 0, WC_WHEEL_DELTA).
+#define WC_WHEEL_DELTA 120
+
+void wc_host_add_wheel(wc_host_t* host, int32_t dx, int32_t dy);
 void wc_host_set_time(wc_host_t* host, double time_ms, double delta_ms, uint32_t frame);
 
 // ─── Peer connections (ABI v3) ─────────────────────────────────────────────

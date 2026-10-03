@@ -97,6 +97,13 @@ struct wc_host {
     size_t text_queue_len;
     size_t text_queue_cap;
 
+    // Scroll wheel (ABI v3.1), in 1/120 notch units. Accumulated across
+    // however many events arrive during a frame and zeroed after each
+    // wc_render, so the cart reads one delta per frame and never clears
+    // anything. A device with no wheel leaves these at zero forever.
+    int32_t wheel_dx;
+    int32_t wheel_dy;
+
     // Peer connections (ABI v3). Two kinds live in one table on purpose: a
     // connection the CART dialled (wc_peer_open) and a peer the HOST handed it
     // (wc_host_add_peer) are the same object to the cart, which is the whole
