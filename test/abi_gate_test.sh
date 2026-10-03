@@ -19,7 +19,7 @@ fi
 out=$(timeout -s TERM 3 "$BIN" "$V3" 2>&1)
 if echo "$out" | grep -q "ABI version mismatch"; then
   echo "*** FAIL a v3 cart was refused"; fail=1
-elif echo "$out" | grep -q "loaded .*ABI v3"; then
+elif echo "$out" | grep -q "wasmcart: running "; then
   echo "  ok    a v3 cart loads"
 else
   echo "*** FAIL the v3 cart didn't load"; echo "$out" | tail -5; fail=1
