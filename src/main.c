@@ -9,6 +9,8 @@
 #include "egl_context.h"
 #include "frame_clock.h"
 #include "audio_mix.h"
+#define PAD_SLOTS_MAX 4
+#include "pad_slots.h"
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
@@ -28,6 +30,11 @@
 #define MAX_CONTROLLERS 4
 
 static SDL_GameController* controllers[MAX_CONTROLLERS] = {0};
+
+// Which controller is which player. Plain first-free unless a Couchmix
+// supervisor asks for sticky slots (see the supervisor hooks below).
+static pad_slots_t g_slots;
+static void hb_write_slot(int slot, bool connected, const char* key);
 
 // Letterboxing is NOT done here. GL carts are scaled by wc_gl_blit_to_screen
 // (gl_imports.cpp), which computes a centred destination rect from the cart's
@@ -70,6 +77,39 @@ static void print_usage(const char* argv0) {
 
 // ─── Controller management ─────────────────────────────────────────────────
 
+// A string that names this physical controller across reconnects. On Linux
+// that's the input node's `uniq` (BlueZ and the HID drivers put the pad's
+// address there) or, failing that, its `phys` (the USB port path). Anywhere
+// else, or when neither is set, the instance ID: unique, but not stable.
+static void pad_key(int device_index, char* out, size_t n) {
+    out[0] = '\0';
+#if defined(__linux__) && SDL_VERSION_ATLEAST(2, 24, 0)
+    const char* path = SDL_JoystickPathForIndex(device_index);
+    if (path && strncmp(path, "/dev/input/", 11) == 0 && !strchr(path + 11, '/')) {
+        static const char* attrs[] = { "uniq", "phys" };
+        for (int a = 0; a < 2 && !out[0]; a++) {
+            char sys[128];
+            snprintf(sys, sizeof(sys), "/sys/class/input/%s/device/%s", path + 11, attrs[a]);
+            FILE* f = fopen(sys, "r");
+            if (!f) continue;
+            if (!fgets(out, (int)n, f)) out[0] = '\0';
+            fclose(f);
+            out[strcspn(out, "\r\n")] = '\0';
+        }
+    }
+#endif
+    if (!out[0])
+        snprintf(out, n, "sdl-%d", (int)SDL_JoystickGetDeviceInstanceID(device_index));
+}
+
+static int slot_of(SDL_JoystickID id) {
+    for (int i = 0; i < MAX_CONTROLLERS; i++)
+        if (controllers[i] &&
+            SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controllers[i])) == id)
+            return i;
+    return -1;
+}
+
 static void open_controller(int device_index) {
     if (!SDL_IsGameController(device_index)) return;
     // Pads already attached at startup get opened twice: once by the startup
@@ -79,34 +119,32 @@ static void open_controller(int device_index) {
     // that is already open, so without this check one pad filled two slots
     // (player 2 mirrored player 1), two pads filled all four, and a
     // disconnect freed only the first slot, leaving a "connected" ghost.
-    SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(device_index);
-    for (int i = 0; i < MAX_CONTROLLERS; i++) {
-        if (controllers[i] &&
-            SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controllers[i])) == id)
-            return;
+    if (slot_of(SDL_JoystickGetDeviceInstanceID(device_index)) >= 0) return;
+    char key[PAD_KEY_MAX];
+    pad_key(device_index, key, sizeof(key));
+    int slot = pad_slots_attach(&g_slots, key);
+    if (slot < 0) {
+        fprintf(stderr, "wasmcart: no free slot for controller %s\n", key);
+        return;
     }
-    for (int i = 0; i < MAX_CONTROLLERS; i++) {
-        if (!controllers[i]) {
-            controllers[i] = SDL_GameControllerOpen(device_index);
-            if (controllers[i]) {
-                fprintf(stderr, "wasmcart: controller %d connected: %s\n",
-                    i, SDL_GameControllerName(controllers[i]));
-            }
-            return;
-        }
+    controllers[slot] = SDL_GameControllerOpen(device_index);
+    if (!controllers[slot]) {
+        pad_slots_detach(&g_slots, slot);
+        return;
     }
+    fprintf(stderr, "wasmcart: controller %d connected: %s [%s]\n",
+        slot, SDL_GameControllerName(controllers[slot]), g_slots.key[slot]);
+    hb_write_slot(slot, true, g_slots.key[slot]);
 }
 
 static void close_controller(SDL_JoystickID id) {
-    for (int i = 0; i < MAX_CONTROLLERS; i++) {
-        if (controllers[i] &&
-            SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controllers[i])) == id) {
-            fprintf(stderr, "wasmcart: controller %d disconnected\n", i);
-            SDL_GameControllerClose(controllers[i]);
-            controllers[i] = NULL;
-            return;
-        }
-    }
+    int slot = slot_of(id);
+    if (slot < 0) return;
+    fprintf(stderr, "wasmcart: controller %d disconnected\n", slot);
+    SDL_GameControllerClose(controllers[slot]);
+    controllers[slot] = NULL;
+    hb_write_slot(slot, false, g_slots.key[slot]);
+    pad_slots_detach(&g_slots, slot);
 }
 
 // ─── Rumble ────────────────────────────────────────────────────────────────
@@ -375,6 +413,14 @@ static void dbg_poll_reply(wc_host_t* host, uint32_t* last_seq) {
 //   a minimize.
 // - Buttons held at a resume are masked until released, so the press that
 //   chose "Resume" in the supervisor's menu never reaches the cart.
+// - COUCHMIX_PAD_SLOTS, when set (even empty), makes player slots sticky and
+//   seeds them: "0=<key>,1=<key>" (src/pad_slots.h). A pad that drops keeps
+//   its slot and gets it back. Every slot change goes down the heartbeat fd
+//   as "L <slot> <monotonic_us> <0|1> <key>". A cart that declares one
+//   player (or none) gets every pad's input on slot 0, so a pad that went to
+//   sleep can't lock everyone else out.
+// - COUCHMIX_KEYBOARD_PAD=0 stops the keyboard driving pad 0. A TV's
+//   HDMI-CEC remote shows up as a keyboard.
 static volatile sig_atomic_t g_ext_suspend = 0;
 #ifndef _WIN32
 #include <errno.h>
@@ -413,6 +459,20 @@ static void hb_write(char kind, uint32_t frame) {
     }
 }
 
+static void hb_write_slot(int slot, bool connected, const char* key) {
+    if (g_hb_fd < 0) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    char line[PAD_KEY_MAX + 64];
+    int n = snprintf(line, sizeof(line), "L %d %llu %d %s\n", slot,
+        (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull,
+        connected ? 1 : 0, key);
+    if (write(g_hb_fd, line, (size_t)n) < 0 && errno != EAGAIN && errno != EINTR) {
+        close(g_hb_fd);
+        g_hb_fd = -1;
+    }
+}
+
 static void supervisor_hooks_init(void) {
     signal(SIGUSR1, on_suspend_signal);
     signal(SIGUSR2, on_resume_signal);
@@ -420,8 +480,45 @@ static void supervisor_hooks_init(void) {
 }
 #else
 static void hb_write(char kind, uint32_t frame) { (void)kind; (void)frame; }
+static void hb_write_slot(int slot, bool connected, const char* key) {
+    (void)slot; (void)connected; (void)key;
+}
 static void supervisor_hooks_init(void) {}
 #endif
+
+// Couchmix's pad policy: sticky slots, and one-player carts hear every pad.
+static bool g_couchmix_pads = false;
+static bool g_keyboard_pad = true;
+
+static void pad_policy_init(void) {
+    const char* seed = getenv("COUCHMIX_PAD_SLOTS");
+    g_couchmix_pads = seed != NULL;
+    pad_slots_init(&g_slots, g_couchmix_pads, seed);
+    const char* kb = getenv("COUCHMIX_KEYBOARD_PAD");
+    g_keyboard_pad = !(kb && strcmp(kb, "0") == 0);
+}
+
+static int16_t louder(int16_t a, int16_t b) { return abs(b) > abs(a) ? b : a; }
+
+// Fold every connected pad into slot 0: buttons OR'd, each stick axis from
+// whichever pad pushes it furthest, each trigger at its highest.
+static void merge_into_slot0(wc_pad_t pads[WC_MAX_PADS]) {
+    wc_pad_t m;
+    memset(&m, 0, sizeof(m));
+    for (int i = 0; i < WC_MAX_PADS; i++) {
+        if (!pads[i].connected) continue;
+        m.connected = 1;
+        m.buttons |= pads[i].buttons;
+        m.left_x = louder(m.left_x, pads[i].left_x);
+        m.left_y = louder(m.left_y, pads[i].left_y);
+        m.right_x = louder(m.right_x, pads[i].right_x);
+        m.right_y = louder(m.right_y, pads[i].right_y);
+        if (pads[i].left_trigger > m.left_trigger) m.left_trigger = pads[i].left_trigger;
+        if (pads[i].right_trigger > m.right_trigger) m.right_trigger = pads[i].right_trigger;
+    }
+    memset(pads, 0, sizeof(wc_pad_t) * WC_MAX_PADS);
+    pads[0] = m;
+}
 
 // ─── Save data ──────────────────────────────────────────────────────────
 //
@@ -1145,6 +1242,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // The supervisor hooks go first: the heartbeat fd has to be open to
+    // report the slots of the pads opened just below.
+    pad_policy_init();
+    supervisor_hooks_init();
+
     // 6. Open any already-connected controllers
     for (int i = 0; i < SDL_NumJoysticks(); i++) {
         open_controller(i);
@@ -1158,7 +1260,6 @@ int main(int argc, char* argv[]) {
     wc_host_enter_v8();
     signal(SIGINT, on_quit_signal);
     signal(SIGTERM, on_quit_signal);
-    supervisor_hooks_init();
     uint64_t last_alive_ticks = 0;
     uint32_t guard_mask[WC_MAX_PADS] = {0};
     bool running = true;
@@ -1240,6 +1341,9 @@ int main(int argc, char* argv[]) {
             if (hidden) {
                 if (wc_host_suspend(host)) {
                     hb_write('S', frame_count);
+                    // The cart can't stop a rumble it started while it's
+                    // suspended, and a paused game shouldn't buzz.
+                    rumble_stop_all();
                     fprintf(stderr, "wasmcart: suspended at frame %u\n", frame_count);
                     // A hidden app can be killed without ever reaching a
                     // graceful quit, so suspend is a persistence point.
@@ -1301,7 +1405,7 @@ int main(int argc, char* argv[]) {
         // Start. Gamepads are unaffected -- a controller keeps working while a
         // text field is open, which is what you want for a d-pad character
         // picker.
-        if (!wc_host_text_input_active(host)) {
+        if (g_keyboard_pad && !wc_host_text_input_active(host)) {
             poll_keyboard_as_pad(&pads[0]);
         }
         for (int i = 0; i < WC_MAX_PADS; i++) {
@@ -1309,6 +1413,7 @@ int main(int argc, char* argv[]) {
             guard_mask[i] &= pads[i].buttons;  // released buttons leave the mask
             pads[i].buttons &= ~guard_mask[i];
         }
+        if (g_couchmix_pads && manifest->players <= 1) merge_into_slot0(pads);
         wc_host_set_pads(host, pads);
 
         // Time. --fixed-step replaces the wall clock with frame * step, so a
