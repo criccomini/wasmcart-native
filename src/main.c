@@ -11,6 +11,7 @@
 #include "audio_mix.h"
 #define PAD_SLOTS_MAX 4
 #include "pad_slots.h"
+#include "save_file.h"
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
@@ -49,6 +50,8 @@ static void print_usage(const char* argv0) {
     fprintf(stderr, "  --fullscreen    Start in fullscreen mode\n");
     fprintf(stderr, "  --fps           Show FPS counter\n");
     fprintf(stderr, "  --uncapped      Disable vsync and frame cap\n");
+    fprintf(stderr, "  --save <path>   Save file (default: the cart's path + .sav)\n");
+    fprintf(stderr, "  --save-every <s>  Also write the save every s seconds if it changed\n");
 }
 
 // ─── Controller management ─────────────────────────────────────────────────
@@ -380,37 +383,39 @@ static void sav_path_for(const char* cart_path, char* out, size_t out_size) {
 // Returns a malloc'd buffer the caller frees, or NULL when there is no save
 // yet (the ordinary first run, not an error).
 static uint8_t* load_sav(const char* sav_path, uint32_t* out_size) {
-    *out_size = 0;
-    FILE* f = fopen(sav_path, "rb");
-    if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long n = ftell(f);
-    if (n <= 0) { fclose(f); return NULL; }
-    rewind(f);
-    uint8_t* buf = (uint8_t*)malloc((size_t)n);
-    if (!buf) { fclose(f); return NULL; }
-    size_t got = fread(buf, 1, (size_t)n, f);
-    fclose(f);
-    if (got != (size_t)n) { free(buf); return NULL; }
-    *out_size = (uint32_t)n;
-    return buf;
+    return save_file_read(sav_path, out_size);
 }
 
 // Must run BEFORE wc_host_destroy(): the pointer returned points INTO the
 // cart's linear memory, which is gone afterwards.
+static uint8_t* g_last_saved = NULL;  // what's on disk, to skip identical writes
+static uint32_t g_last_saved_size = 0;
+
 static void persist_sav(wc_host_t* host, const char* sav_path) {
     uint32_t size = 0;
     const uint8_t* data = wc_host_get_save_data(host, &size);
     if (!data || size == 0) return;  // cart declares no save block
-    FILE* f = fopen(sav_path, "wb");
-    if (!f) {
+    if (g_last_saved && g_last_saved_size == size && memcmp(g_last_saved, data, size) == 0)
+        return;  // nothing changed since the last write: spare the SD card
+    // An all-zero region from a cart that never saved isn't a save: writing
+    // it would create a .sav just by running the cart. With a save already
+    // on disk, zeros mean the player cleared it, and that must be written or
+    // the old save comes back next time (SPEC.md, "Saving is host-managed").
+    if (!g_last_saved) {
+        uint32_t i = 0;
+        while (i < size && data[i] == 0) i++;
+        if (i == size) return;
+    }
+    if (save_file_write(sav_path, data, size) != 0) {
         fprintf(stderr, "wasmcart: could not write save to %s\n", sav_path);
         return;
     }
-    if (fwrite(data, 1, size, f) != size) {
-        fprintf(stderr, "wasmcart: short write saving to %s\n", sav_path);
+    uint8_t* copy = (uint8_t*)realloc(g_last_saved, size);
+    if (copy) {
+        memcpy(copy, data, size);
+        g_last_saved = copy;
+        g_last_saved_size = size;
     }
-    fclose(f);
 }
 
 // ─── Native Wayland ───────────────────────────────────────────────────────
@@ -605,6 +610,8 @@ int main(int argc, char* argv[]) {
     bool fullscreen = false;
     bool show_fps = false;
     bool uncapped = false;
+    const char* save_override = NULL;
+    uint32_t save_every_s = 0;
     uint32_t pref_width = 0;
     uint32_t pref_height = 0;
 
@@ -626,6 +633,10 @@ int main(int argc, char* argv[]) {
             show_fps = true;
         else if (strcmp(argv[i], "--uncapped") == 0)
             uncapped = true;
+        else if (strcmp(argv[i], "--save") == 0 && i + 1 < argc)
+            save_override = argv[++i];
+        else if (strcmp(argv[i], "--save-every") == 0 && i + 1 < argc)
+            save_every_s = (uint32_t)atoi(argv[++i]);
     }
 
     // 1. Create host
@@ -669,9 +680,21 @@ int main(int argc, char* argv[]) {
 
     // 3. Load cart
     char sav_path[4096];
-    sav_path_for(cart_path, sav_path, sizeof(sav_path));
+    if (save_override)
+        snprintf(sav_path, sizeof(sav_path), "%s", save_override);
+    else
+        sav_path_for(cart_path, sav_path, sizeof(sav_path));
     uint32_t sav_size = 0;
     uint8_t* sav_data = load_sav(sav_path, &sav_size);
+    // The save as loaded is what's on disk: an exit without changes then
+    // doesn't rewrite it.
+    if (sav_data) {
+        g_last_saved = (uint8_t*)malloc(sav_size);
+        if (g_last_saved) {
+            memcpy(g_last_saved, sav_data, sav_size);
+            g_last_saved_size = sav_size;
+        }
+    }
 
     wc_host_options_t opts = {
         .preferred_width = pref_width,
@@ -1023,6 +1046,7 @@ int main(int argc, char* argv[]) {
     wc_frame_clock_t frame_clock;
     wc_frame_clock_start(&frame_clock, (double)start_ticks);
     bool window_focused = true;  // as the cart assumes at start (SPEC: Lifecycle)
+    uint64_t last_save_ticks = start_ticks;
 
     while (running) {
         uint64_t now = SDL_GetTicks64();
@@ -1268,6 +1292,13 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "wasmcart: FPS: %.1f\n", fps_counter * 1000.0 / (now - fps_last));
             fps_counter = 0;
             fps_last = now;
+        }
+
+        // Periodic saves: a crash or power cut then costs at most this long
+        // of progress. Unchanged saves aren't rewritten.
+        if (save_every_s && now - last_save_ticks >= (uint64_t)save_every_s * 1000) {
+            last_save_ticks = now;
+            persist_sav(host, sav_path);
         }
 
         // Frame timing — vsync handles it if available, otherwise manual delay
