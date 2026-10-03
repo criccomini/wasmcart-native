@@ -13,6 +13,7 @@
 #include "pad_slots.h"
 #include "save_file.h"
 #include "save_writer.h"
+#include <sys/stat.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
@@ -541,7 +542,17 @@ static void sav_path_for(const char* cart_path, char* out, size_t out_size) {
 
 // Returns a malloc'd buffer the caller frees, or NULL when there is no save
 // yet (the ordinary first run, not an error).
+static bool g_sav_too_big = false;
+
 static uint8_t* load_sav(const char* sav_path, uint32_t* out_size) {
+    // A save over the cap can't belong to any region the host would accept,
+    // so don't read it in (it could be any size): it gets set aside below.
+    struct stat st;
+    if (stat(sav_path, &st) == 0 && st.st_size > (off_t)WC_MAX_SAVE_SIZE) {
+        *out_size = 0;
+        g_sav_too_big = true;
+        return NULL;
+    }
     return save_file_read(sav_path, out_size);
 }
 
@@ -966,7 +977,14 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    if (wc_host_save_rejected(host)) set_aside_sav(sav_path);
+    if (wc_host_save_rejected(host) || g_sav_too_big) {
+        set_aside_sav(sav_path);
+        // What's on disk now is nothing: the never-saved guard applies again,
+        // so a cart that never saves doesn't get an all-zero file.
+        free(g_last_saved);
+        g_last_saved = NULL;
+        g_last_saved_size = 0;
+    }
 
     const wc_cart_info_t* info = wc_host_get_cart_info(host);
     const wc_manifest_t* manifest = wc_host_get_manifest(host);
