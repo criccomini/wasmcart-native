@@ -71,6 +71,7 @@ struct wc_host {
 
     // Error state
     bool trapped;
+    uint32_t oob_logged;  // which out-of-memory regions have been reported (region_ok)
     bool init_deferred;  // _initialize/wc_init not yet called
     wc_host_options_t deferred_opts;  // saved for finish_init
 
