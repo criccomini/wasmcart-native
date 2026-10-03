@@ -49,6 +49,8 @@ def main():
     env = dict(os.environ)
     env.setdefault("SDL_VIDEODRIVER", "dummy")
     env.setdefault("SDL_AUDIODRIVER", "dummy")
+    if not os.path.exists("/run/udev/control"):
+        env.setdefault("SDL_JOYSTICK_DISABLE_UDEV", "1")  # see pad_hotplug_test.py
     proc = subprocess.Popen([sys.argv[1], sys.argv[2]], env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 
@@ -65,7 +67,7 @@ def main():
                 eff = up.effect
                 if eff.type == e.FF_RUMBLE:
                     rm = eff.u.ff_rumble_effect
-                    uploads.append((rm.strong_magnitude, rm.weak_magnitude, eff.replay.length))
+                    uploads.append((rm.strong_magnitude, rm.weak_magnitude, eff.ff_replay.length))
                 pad.end_upload(up)
             elif ev.type == e.EV_UINPUT and ev.code == e.UI_FF_ERASE:
                 er = pad.begin_erase(ev.value)
