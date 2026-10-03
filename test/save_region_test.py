@@ -165,6 +165,17 @@ def main():
         kept = os.path.join(d, "wrong.sav.invalid-1")
         expect("a save of the wrong size isn't loaded", "not loaded" in err)
         expect("and is kept as .invalid-1", os.path.exists(kept) and open(kept, "rb").read() == b"short")
+        # The cart never wrote anything (its region stays zero), so nothing
+        # new appears where the old save was.
+        expect("and the cart's untouched region isn't saved in its place", not os.path.exists(save))
+
+        # A save file over the cap is never read in, only set aside.
+        save = os.path.join(d, "huge.sav")
+        with open(save, "wb") as f:
+            f.truncate(5 * 1024 * 1024)
+        rc, err = run(binary, wrong, save)
+        expect("a save over the cap is set aside unread",
+               os.path.exists(save + ".invalid-1") and not os.path.exists(save))
 
     print("\nall checks passed" if not failures else f"\nFAILED: {', '.join(failures)}")
     return 1 if failures else 0
