@@ -1965,20 +1965,23 @@ extern "C" const void* wc_host_get_audio(wc_host_t* host, uint32_t* num_frames, 
     }
     uint32_t write_cursor = wc_read_u32(host->memory, host->info.audio_write_ptr);
     uint32_t read_cursor = host->audio_read_cursor;
-    // A cursor past the ring's end would make "available" a huge count.
-    if (write_cursor >= cap || read_cursor >= cap) {
-        host->audio_read_cursor = write_cursor < cap ? write_cursor : 0;
+    // The cursor may wrap at cap or run free: wasmcart's SDKs only ever
+    // increment it and index the ring with % cap. Unsigned subtraction
+    // counts both, except a wrapped write cursor that is behind the read
+    // one. More than a ring's worth means the cart jumped or ran a whole ring
+    // ahead: skip to its cursor rather than read garbage or a huge count.
+    uint32_t pending = write_cursor - read_cursor;
+    if (write_cursor < read_cursor && read_cursor < cap && write_cursor < cap)
+        pending = cap - read_cursor + write_cursor;
+    if (pending > cap) {
+        host->audio_read_cursor = write_cursor;
         *num_frames = 0;
         return NULL;
     }
 
     if (write_cursor == read_cursor) { *num_frames = 0; return NULL; }
 
-    uint32_t available;
-    if (write_cursor >= read_cursor)
-        available = write_cursor - read_cursor;
-    else
-        available = cap - read_cursor + write_cursor;
+    uint32_t available = pending;
 
     if (available == 0) { *num_frames = 0; return NULL; }
 
