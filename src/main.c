@@ -42,6 +42,19 @@ static void print_usage(const char* argv0) {
 
 static void open_controller(int device_index) {
     if (!SDL_IsGameController(device_index)) return;
+    // Pads already attached at startup get opened twice: once by the startup
+    // loop in main(), and again from the CONTROLLERDEVICEADDED event SDL
+    // queues for each of them when the game controller subsystem starts.
+    // SDL_GameControllerOpen hands back the same refcounted object for a pad
+    // that is already open, so without this check one pad filled two slots
+    // (player 2 mirrored player 1), two pads filled all four, and a
+    // disconnect freed only the first slot, leaving a "connected" ghost.
+    SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(device_index);
+    for (int i = 0; i < MAX_CONTROLLERS; i++) {
+        if (controllers[i] &&
+            SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controllers[i])) == id)
+            return;
+    }
     for (int i = 0; i < MAX_CONTROLLERS; i++) {
         if (!controllers[i]) {
             controllers[i] = SDL_GameControllerOpen(device_index);
