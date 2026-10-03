@@ -851,8 +851,19 @@ int main(int argc, char* argv[]) {
     // Load embedded gamecontroller database
     {
         #include "../deps/gamecontrollerdb.h"
+        // The file covers every platform, and a line's GUID can mean a
+        // different device elsewhere. SDL_GameControllerAddMapping doesn't
+        // look at the platform field (only SDL's file loader does), so skip
+        // other platforms' lines here, or an iOS or Windows line can replace
+        // the right mapping for a pad on this one.
+        const char* platform = SDL_GetPlatform();
+        size_t platform_len = strlen(platform);
         int count = 0;
         for (const char** p = _gamecontrollerdb_lines; *p; p++) {
+            const char* tag = strstr(*p, "platform:");
+            if (tag && (strncmp(tag + 9, platform, platform_len) != 0 ||
+                        (tag[9 + platform_len] != ',' && tag[9 + platform_len] != '\0')))
+                continue;
             if (SDL_GameControllerAddMapping(*p) >= 0) count++;
         }
         fprintf(stderr, "wasmcart: loaded %d controller mappings\n", count);
