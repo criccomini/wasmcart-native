@@ -89,6 +89,7 @@ struct wc_host {
     bool save_loaded;    // the save passed in was copied into the region
     bool save_rejected;  // it wasn't: wrong size
     bool save_locked;    // don't hand the region out to be saved
+    uint32_t oob_logged;  // which out-of-memory regions have been reported (region_ok)
     bool init_deferred;  // _initialize/wc_init not yet called
     wc_host_options_t deferred_opts;  // saved for finish_init
 
