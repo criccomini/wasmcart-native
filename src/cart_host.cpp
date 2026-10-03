@@ -246,9 +246,32 @@ static void lock_save_if_moved(wc_host_t* host) {
     }
 }
 
+// Every region wc_info_t names is a cart-chosen offset into the cart's
+// memory, and the host reads and writes them every frame. A cart that names
+// one past the end of its memory sent those accesses outside it: V8's guard
+// pages turned that into a crash rather than corruption, but a host
+// shouldn't depend on it. Each access checks its region first and skips if
+// it doesn't fit, saying so once. (Memory only grows, so a region that fits
+// keeps fitting.) The check is per access rather than at load because v1
+// and v2 carts don't fill in the v3 fields, and a load-time check would
+// refuse carts that never use them.
+enum { OOB_INFO, OOB_HOST_INFO, OOB_PADS, OOB_KEYS, OOB_POINTERS, OOB_TIME, OOB_FB,
+       OOB_AUDIO_CURSOR, OOB_AUDIO_RING };
+
+static bool region_ok(wc_host_t* host, uint32_t ptr, uint64_t len, int which, const char* what) {
+    if ((uint64_t)ptr + len <= host->memory_size) return true;
+    if (!(host->oob_logged & (1u << which))) {
+        host->oob_logged |= 1u << which;
+        wc_log("wasmcart: cart's %s (%llu bytes at %u) is outside its memory (%u bytes): ignored\n",
+               what, (unsigned long long)len, ptr, host->memory_size);
+    }
+    return false;
+}
+
 static void parse_cart_info(wc_host_t* host, uint32_t info_ptr) {
     uint8_t* mem = host->memory;
     wc_cart_info_t* info = &host->info;
+    if (!region_ok(host, info_ptr, WC_INFO_GPU_API + 4, OOB_INFO, "wc_info_t")) return;
 
     info->version        = wc_read_u32(mem, info_ptr + WC_INFO_VERSION);
     info->width          = wc_read_u32(mem, info_ptr + WC_INFO_WIDTH);
@@ -286,6 +309,7 @@ static void write_host_info(wc_host_t* host, const wc_host_options_t* opts) {
     uint32_t ptr = host->info.host_info_ptr;
     if (ptr == 0) return;
     refresh_memory(host);
+    if (!region_ok(host, ptr, WC_HOST_INFO_SIZE, OOB_HOST_INFO, "wc_host_info_t")) return;
     uint8_t* mem = host->memory;
     // A manifest width/height is the cart author stating the size the cart
     // wants, so pass it as the host's preference when the caller has no
@@ -1267,17 +1291,20 @@ extern "C" void wc_host_set_rumble_backend(wc_host_t* host,
 
 extern "C" void wc_host_set_pads(wc_host_t* host, const wc_pad_t pads[WC_MAX_PADS]) {
     if (!host->memory || !host->info.input_ptr) return;
+    if (!region_ok(host, host->info.input_ptr, sizeof(wc_pad_t) * WC_MAX_PADS, OOB_PADS, "pad array")) return;
     memcpy(host->memory + host->info.input_ptr, pads, sizeof(wc_pad_t) * WC_MAX_PADS);
 }
 
 extern "C" void wc_host_set_keyboard(wc_host_t* host, const uint8_t keys[WC_KEYS_STATE_SIZE]) {
     if (!host->memory || !host->info.keys_ptr) return;
+    if (!region_ok(host, host->info.keys_ptr, WC_KEYS_STATE_SIZE, OOB_KEYS, "key state")) return;
     memcpy(host->memory + host->info.keys_ptr, keys, WC_KEYS_STATE_SIZE);
 }
 
 extern "C" void wc_host_set_pointer(wc_host_t* host, int index, int16_t x, int16_t y, uint8_t buttons, uint8_t active) {
     if (!host->memory || !host->info.pointer_ptr || index < 0 || index >= WC_MAX_POINTERS) return;
     uint32_t offset = host->info.pointer_ptr + (index * 8);
+    if (!region_ok(host, host->info.pointer_ptr, WC_MAX_POINTERS * 8, OOB_POINTERS, "pointer array")) return;
     *(int16_t*)(host->memory + offset + 0) = x;
     *(int16_t*)(host->memory + offset + 2) = y;
     host->memory[offset + 4] = buttons;
@@ -1289,6 +1316,7 @@ extern "C" void wc_host_set_pointer(wc_host_t* host, int index, int16_t x, int16
 extern "C" void wc_host_set_time(wc_host_t* host, double time_ms, double delta_ms, uint32_t frame) {
     if (!host->memory || !host->info.time_ptr) return;
     uint32_t ptr = host->info.time_ptr;
+    if (!region_ok(host, ptr, WC_TIME_SIZE, OOB_TIME, "wc_time_t")) return;
     wc_write_f64(host->memory, ptr + WC_TIME_TIME_MS, time_ms);
     wc_write_f64(host->memory, ptr + WC_TIME_DELTA_MS, delta_ms);
     wc_write_u32(host->memory, ptr + WC_TIME_FRAME, frame);
@@ -1814,7 +1842,9 @@ extern "C" void wc_host_run_frame(wc_host_t* host) {
 // ─── Readback (unchanged — pure C, reads host->memory) ────────────────
 
 extern "C" const uint8_t* wc_host_get_framebuffer(wc_host_t* host, uint32_t* width, uint32_t* height) {
-    if (!host->memory || !host->info.fb_ptr) {
+    if (!host->memory || !host->info.fb_ptr ||
+        !region_ok(host, host->info.fb_ptr, (uint64_t)host->info.width * host->info.height * 4,
+                   OOB_FB, "framebuffer")) {
         *width = 0; *height = 0;
         return NULL;
     }
@@ -1834,9 +1864,20 @@ extern "C" const void* wc_host_get_audio(wc_host_t* host, uint32_t* num_frames, 
 
     *is_f32 = (host->info.flags & WC_FLAG_AUDIO_F32) != 0;
 
+    uint32_t cap = host->info.audio_cap;
+    if (!region_ok(host, host->info.audio_write_ptr, 4, OOB_AUDIO_CURSOR, "audio write cursor") ||
+        !region_ok(host, host->info.audio_ptr, (uint64_t)cap * 2 * (*is_f32 ? 4 : 2), OOB_AUDIO_RING, "audio ring")) {
+        *num_frames = 0;
+        return NULL;
+    }
     uint32_t write_cursor = wc_read_u32(host->memory, host->info.audio_write_ptr);
     uint32_t read_cursor = host->audio_read_cursor;
-    uint32_t cap = host->info.audio_cap;
+    // A cursor past the ring's end would make "available" a huge count.
+    if (write_cursor >= cap || read_cursor >= cap) {
+        host->audio_read_cursor = write_cursor < cap ? write_cursor : 0;
+        *num_frames = 0;
+        return NULL;
+    }
 
     if (write_cursor == read_cursor) { *num_frames = 0; return NULL; }
 
