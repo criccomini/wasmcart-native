@@ -81,6 +81,13 @@ struct wc_host {
 
     // Error state
     bool trapped;
+    // The save region as it was when the save was loaded, and what came of
+    // it. A cart that moves its region in wc_init would otherwise have the
+    // loaded save ignored and then overwritten with a fresh one.
+    uint32_t save_ptr_loaded, save_size_loaded;
+    bool save_loaded;    // the save passed in was copied into the region
+    bool save_rejected;  // it wasn't: wrong size
+    bool save_locked;    // don't hand the region out to be saved
     bool init_deferred;  // _initialize/wc_init not yet called
     wc_host_options_t deferred_opts;  // saved for finish_init
 

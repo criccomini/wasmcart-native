@@ -560,6 +560,9 @@ static void save_done(bool ok) {
 // now: write it here and now, after anything the writer has in flight (the
 // final save on exit). Otherwise hand a snapshot to the writer thread.
 static void persist_sav(wc_host_t* host, const char* sav_path, bool now) {
+    // After a trap the cart may have died halfway through updating its
+    // save; the last save written while it was healthy is the better one.
+    if (wc_host_has_trapped(host)) return;
     uint32_t size = 0;
     const uint8_t* data = wc_host_get_save_data(host, &size);
     if (!data || size == 0) return;  // cart declares no save block
@@ -802,6 +805,20 @@ static void window_pixel_size(SDL_Window* window, int* w, int* h) {
 #endif
 }
 
+// A save the host refused to load (wrong size) would be overwritten by the
+// cart's fresh one at the next save. Keep it as <save>.invalid-<n> instead.
+static void set_aside_sav(const char* sav_path) {
+    char dest[4096 + 32];
+    for (int n = 1; n < 1000; n++) {
+        snprintf(dest, sizeof(dest), "%s.invalid-%d", sav_path, n);
+        FILE* f = fopen(dest, "rb");
+        if (f) { fclose(f); continue; }
+        if (rename(sav_path, dest) == 0)
+            fprintf(stderr, "wasmcart: kept the save it couldn't load as %s\n", dest);
+        return;
+    }
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         print_usage(argv[0]);
@@ -948,6 +965,8 @@ int main(int argc, char* argv[]) {
         free(sav_data);
         return 0;
     }
+
+    if (wc_host_save_rejected(host)) set_aside_sav(sav_path);
 
     const wc_cart_info_t* info = wc_host_get_cart_info(host);
     const wc_manifest_t* manifest = wc_host_get_manifest(host);
@@ -1676,6 +1695,10 @@ int main(int argc, char* argv[]) {
     rumble_stop_all();
     wc_host_exit_v8();
     fprintf(stderr, "wasmcart: shutting down\n");
+    // Save first: a crash in the GL, audio or SDL teardown below, or a
+    // supervisor that loses patience and kills us, mustn't cost the save.
+    persist_sav(host, sav_path, true);
+    save_writer_stop(&g_writer);
 
     if (audio_dev) SDL_CloseAudioDevice(audio_dev);
     audio_mix_free(&audio_mix);
@@ -1693,8 +1716,6 @@ int main(int argc, char* argv[]) {
 #ifdef WC_WAYLAND_EGL
     drop_boot_window();
 #endif
-    persist_sav(host, sav_path, true);  // before destroy: reads the cart's memory
-    save_writer_stop(&g_writer);
     wc_host_destroy(host);
     free(sav_data);
     SDL_Quit();
