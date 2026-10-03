@@ -57,7 +57,7 @@ def main():
         return 2
     binary, fixtures = sys.argv[1], sys.argv[2]
     savecart = os.path.join(fixtures, "savecart.wasc")
-    hello = os.path.join(fixtures, "hello.wasc")
+    nosave = os.path.join(fixtures, "rumble.wasc")  # declares no save region
     failures = []
 
     def expect(what, ok, detail=""):
@@ -80,8 +80,8 @@ def main():
         expect("the next run carries on from it", second is not None and first is not None
                and second > first, f"{first} -> {second}")
 
-        other = os.path.join(d, "hello.sav")
-        run(binary, hello, other, ("--save-every", "1"), seconds=1.5)
+        other = os.path.join(d, "rumble.sav")
+        run(binary, nosave, other, ("--save-every", "1"), seconds=1.5)
         expect("a cart with no save region writes nothing", not os.path.exists(other))
 
     if failures and err:
