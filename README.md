@@ -224,6 +224,7 @@ node ../wasmcart/test/wsserver.mjs --port 8796 &   # from the wasmcart repo
 ./net_test 8796         # require, nextTick, net.connect, WebSocket round-trip
 ./rumble_test ../wasmcart/test/fixtures/rumble.wasc
 ./text_test  test/textauto.wasc 5452 5456 5460 5472
+python3 test/import_bounds_test.py build/wasmcart-run   # a bad pointer to an import traps the cart (GL cases need a compositor)
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
