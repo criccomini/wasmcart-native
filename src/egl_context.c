@@ -14,7 +14,24 @@
 #ifndef EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE
 #define EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE 0x3489
 #endif
+#endif
+
 typedef EGLDisplay (*PFNEGLGETPLATFORMDISPLAYEXTPROC_WC)(EGLenum, void*, const EGLint*);
+
+#ifdef WC_HAVE_WAYLAND_EGL
+/* After EGL/egl.h on purpose: wayland-egl-core.h defines WL_EGL_PLATFORM,
+ * which would otherwise switch eglplatform.h's native types. */
+#include <wayland-client.h>
+#include <wayland-egl.h>
+#include <poll.h>
+#include <string.h>
+#include <time.h>
+#ifndef EGL_PLATFORM_WAYLAND_EXT
+#define EGL_PLATFORM_WAYLAND_EXT 0x31D8
+#endif
+#ifndef EGL_PRESENT_OPAQUE_EXT
+#define EGL_PRESENT_OPAQUE_EXT 0x31DF
+#endif
 #endif
 
 static EGLDisplay egl_display = EGL_NO_DISPLAY;
@@ -36,8 +53,94 @@ static int mac_desired_sync = -1;
 static bool mac_sync_applied = true;
 #endif
 
-int egl_create_context(uint32_t width, uint32_t height) {
+#ifdef WC_HAVE_WAYLAND_EGL
+/* Native Wayland. The EGL display lives on SDL's wl_display (never ours to
+ * disconnect), and the player owns the wl_egl_windows: SDL only makes one for
+ * an SDL_WINDOW_OPENGL window. wl_boot_win stands in for the pbuffer until the
+ * real window exists; wl_win is on the player window and follows its size. */
+static struct wl_display* wl_dpy = NULL;
+static struct wl_egl_window* wl_boot_win = NULL;
+static struct wl_egl_window* wl_win = NULL;
+static int wl_w = 0, wl_h = 0;
+static bool wl_opaque = false;
+
+/* Present pacing. Mesa honours eglSwapInterval(1) by blocking the next
+ * eglSwapBuffers on a frame callback, with no timeout, and compositors stop
+ * sending frame callbacks to a window that is covered or minimized: the main
+ * loop would stop dead, quit signals included. So, as SDL does for its own
+ * Wayland GL windows, the swap interval is 0 and we wait for the callback
+ * ourselves, on a private queue, for at most WL_FRAME_WAIT_MS. */
+#define WL_FRAME_WAIT_MS 50
+static struct wl_event_queue* wl_frame_queue = NULL;
+static struct wl_surface* wl_frame_surface = NULL;  // wrapper on wl_frame_queue
+static struct wl_callback* wl_frame_cb = NULL;
+static bool wl_frame_ready = false;
+static int wl_interval = 0;
+
+static void wl_frame_done(void* data, struct wl_callback* cb, uint32_t time);
+static const struct wl_callback_listener wl_frame_listener = { wl_frame_done };
+
+static void wl_request_frame(void) {
+    wl_frame_cb = wl_surface_frame(wl_frame_surface);
+    wl_callback_add_listener(wl_frame_cb, &wl_frame_listener, NULL);
+}
+
+static void wl_frame_done(void* data, struct wl_callback* cb, uint32_t time) {
+    (void)data;
+    (void)time;
+    wl_callback_destroy(cb);
+    wl_frame_ready = true;
+    // Ask for the next one now; Mesa's eglSwapBuffers commits it with the
+    // next frame.
+    wl_request_frame();
+}
+
+static uint64_t wl_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+// Wait for the compositor's go-ahead for the next frame, or the timeout.
+static void wl_wait_frame(void) {
+    uint64_t deadline = wl_now_ms() + WL_FRAME_WAIT_MS;
+    while (!wl_frame_ready) {
+        // A dead or errored connection never dispatches again, and
+        // prepare_read keeps failing while our event sits undispatched:
+        // without this the loop would spin forever. SDL reports the quit.
+        if (wl_display_get_error(wl_dpy)) break;
+        wl_display_flush(wl_dpy);
+        if (wl_display_prepare_read_queue(wl_dpy, wl_frame_queue) != 0) {
+            if (wl_display_dispatch_queue_pending(wl_dpy, wl_frame_queue) < 0) break;
+            continue;
+        }
+        uint64_t now = wl_now_ms();
+        struct pollfd pfd = { wl_display_get_fd(wl_dpy), POLLIN, 0 };
+        // Times out (or a signal arrives): present anyway.
+        if (now >= deadline || poll(&pfd, 1, (int)(deadline - now)) <= 0) {
+            wl_display_cancel_read(wl_dpy);
+            break;
+        }
+        if (wl_display_read_events(wl_dpy) < 0) break;
+        if (wl_display_dispatch_queue_pending(wl_dpy, wl_frame_queue) < 0) break;
+    }
+    wl_frame_ready = false;
+}
+
+static EGLSurface create_wl_surface(struct wl_egl_window* win) {
+    /* Opaque even if the cart leaves alpha below 1 in the framebuffer;
+     * otherwise the compositor would blend the game with what's behind it. */
+    static const EGLint opaque_attribs[] = { EGL_PRESENT_OPAQUE_EXT, EGL_TRUE, EGL_NONE };
+    return eglCreateWindowSurface(egl_display, egl_config, (EGLNativeWindowType)win,
+        wl_opaque ? opaque_attribs : NULL);
+}
+#endif
+
+static int create_context(void* wl_display, void* boot_wl_surface,
+                          uint32_t width, uint32_t height) {
 #ifdef __APPLE__
+    (void)wl_display;
+    (void)boot_wl_surface;
     /* Prefer ANGLE's Metal backend. The default display resolves to the
      * deprecated CGL backend, whose swap layer free-runs — eglSwapInterval
      * is a no-op there, so window presents can never sync to the display.
@@ -55,6 +158,21 @@ int egl_create_context(uint32_t width, uint32_t height) {
     if (egl_display == EGL_NO_DISPLAY)
         egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
 #else
+#ifdef WC_HAVE_WAYLAND_EGL
+    if (wl_display) {
+        /* Wayland objects belong to one connection, and SDL's window is on
+         * SDL's. EGL_DEFAULT_DISPLAY would make Mesa open a connection of its
+         * own (or pick its X11 platform, failing without DISPLAY). */
+        PFNEGLGETPLATFORMDISPLAYEXTPROC_WC get_platform_display =
+            (PFNEGLGETPLATFORMDISPLAYEXTPROC_WC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+        egl_display = get_platform_display
+            ? get_platform_display(EGL_PLATFORM_WAYLAND_EXT, wl_display, NULL)
+            : eglGetDisplay((EGLNativeDisplayType)wl_display);
+        wl_dpy = (struct wl_display*)wl_display;
+    } else
+#else
+    (void)boot_wl_surface;
+#endif
     egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
 #endif
     if (egl_display == EGL_NO_DISPLAY) {
@@ -69,10 +187,12 @@ int egl_create_context(uint32_t width, uint32_t height) {
     }
     fprintf(stderr, "wasmcart: EGL %d.%d\n", major, minor);
 
-    // Request GLES3 context
+    // Request GLES3 context. Mesa's Wayland platform has no pbuffer configs,
+    // so there the boot surface is a window too.
+    EGLint surface_type = wl_display ? EGL_WINDOW_BIT : (EGL_PBUFFER_BIT | EGL_WINDOW_BIT);
     EGLint config_attribs[] = {
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT | EGL_WINDOW_BIT,
+        EGL_SURFACE_TYPE, surface_type,
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8,
@@ -100,17 +220,38 @@ int egl_create_context(uint32_t width, uint32_t height) {
         return -1;
     }
 
-    // Create a pbuffer surface (will be replaced by window surface later if available)
-    EGLint pbuffer_attribs[] = {
-        EGL_WIDTH, width,
-        EGL_HEIGHT, height,
-        EGL_NONE
-    };
+#ifdef WC_HAVE_WAYLAND_EGL
+    if (wl_display) {
+        // Boot surface: a width x height wl_egl_window on a hidden window, so
+        // the cart's init sees the same complete default framebuffer the
+        // pbuffer gives elsewhere. Nothing is ever swapped to it, so nothing
+        // reaches the compositor, and what the cart draws there is discarded
+        // just as the pbuffer's contents were.
+        const char* exts = eglQueryString(egl_display, EGL_EXTENSIONS);
+        wl_opaque = exts && strstr(exts, "EGL_EXT_present_opaque");
+        wl_boot_win = boot_wl_surface
+            ? wl_egl_window_create((struct wl_surface*)boot_wl_surface, (int)width, (int)height)
+            : NULL;
+        egl_surface = wl_boot_win ? create_wl_surface(wl_boot_win) : EGL_NO_SURFACE;
+        if (egl_surface == EGL_NO_SURFACE) {
+            fprintf(stderr, "wasmcart: Wayland boot surface failed (0x%x)\n", eglGetError());
+            return -1;
+        }
+    } else
+#endif
+    {
+        // Create a pbuffer surface (will be replaced by window surface later if available)
+        EGLint pbuffer_attribs[] = {
+            EGL_WIDTH, width,
+            EGL_HEIGHT, height,
+            EGL_NONE
+        };
 
-    egl_surface = eglCreatePbufferSurface(egl_display, egl_config, pbuffer_attribs);
-    if (egl_surface == EGL_NO_SURFACE) {
-        fprintf(stderr, "wasmcart: eglCreatePbufferSurface failed (0x%x)\n", eglGetError());
-        return -1;
+        egl_surface = eglCreatePbufferSurface(egl_display, egl_config, pbuffer_attribs);
+        if (egl_surface == EGL_NO_SURFACE) {
+            fprintf(stderr, "wasmcart: eglCreatePbufferSurface failed (0x%x)\n", eglGetError());
+            return -1;
+        }
     }
 
     if (!eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context)) {
@@ -124,6 +265,65 @@ int egl_create_context(uint32_t width, uint32_t height) {
     fprintf(stderr, "wasmcart: GL version: %s\n", glGetString(GL_VERSION));
 
     return 0;
+}
+
+int egl_create_context(uint32_t width, uint32_t height) {
+    return create_context(NULL, NULL, width, height);
+}
+
+#ifdef WC_HAVE_WAYLAND_EGL
+int egl_create_wayland_context(void* wl_display, void* boot_wl_surface,
+                               uint32_t width, uint32_t height) {
+    return create_context(wl_display, boot_wl_surface, width, height);
+}
+
+int egl_create_wayland_window_surface(void* wl_surface, int width, int height) {
+    if (!initialized || !wl_dpy || !wl_surface || wl_win || width <= 0 || height <= 0) {
+        fprintf(stderr, "wasmcart: no EGL context on SDL's Wayland display\n");
+        return -1;
+    }
+    struct wl_egl_window* win = wl_egl_window_create((struct wl_surface*)wl_surface, width, height);
+    EGLSurface s = win ? create_wl_surface(win) : EGL_NO_SURFACE;
+    if (s == EGL_NO_SURFACE || !eglMakeCurrent(egl_display, s, s, egl_context)) {
+        fprintf(stderr, "wasmcart: Wayland window surface failed (0x%x)\n", eglGetError());
+        if (s != EGL_NO_SURFACE) eglDestroySurface(egl_display, s);
+        if (win) wl_egl_window_destroy(win);
+        return -1;  // the boot surface stays current
+    }
+    // Only now, with the new surface current, retire the boot surface; its
+    // wl_egl_window goes after the EGLSurface that used it.
+    eglDestroySurface(egl_display, egl_surface);
+    wl_egl_window_destroy(wl_boot_win);
+    wl_boot_win = NULL;
+    egl_surface = s;
+    wl_win = win;
+    wl_w = width;
+    wl_h = height;
+    window_surface = true;
+
+    // Frame callbacks on a queue of our own, so waiting for one never
+    // dispatches SDL's events.
+    wl_frame_queue = wl_display_create_queue(wl_dpy);
+    wl_frame_surface = (struct wl_surface*)wl_proxy_create_wrapper(wl_surface);
+    wl_proxy_set_queue((struct wl_proxy*)wl_frame_surface, wl_frame_queue);
+    wl_request_frame();
+    return 0;
+}
+#endif
+
+void egl_resize_window_surface(int width, int height) {
+#ifdef WC_HAVE_WAYLAND_EGL
+    // X11, Cocoa and Win32 surfaces follow their window; a wl_egl_window is
+    // a size we have to set. SDL would, but only for one it made itself.
+    if (wl_win && width > 0 && height > 0 && (width != wl_w || height != wl_h)) {
+        wl_egl_window_resize(wl_win, width, height, 0, 0);
+        wl_w = width;
+        wl_h = height;
+    }
+#else
+    (void)width;
+    (void)height;
+#endif
 }
 
 int egl_create_window_surface(void* native_window) {
@@ -160,6 +360,15 @@ int egl_create_window_surface(void* native_window) {
 
 bool egl_get_drawable_size(int* w, int* h) {
     if (!initialized || !window_surface) return false;
+#ifdef WC_HAVE_WAYLAND_EGL
+    // Mesa's eglQuerySurface keeps reporting the old size until it fetches
+    // the next back buffer, which is a frame late after a resize.
+    if (wl_win) {
+        *w = wl_w;
+        *h = wl_h;
+        return true;
+    }
+#endif
     EGLint sw = 0, sh = 0;
     if (!eglQuerySurface(egl_display, egl_surface, EGL_WIDTH, &sw) ||
         !eglQuerySurface(egl_display, egl_surface, EGL_HEIGHT, &sh) ||
@@ -177,6 +386,14 @@ void egl_make_current(void) {
 
 void egl_swap_buffers(void) {
     if (initialized) {
+#ifdef WC_HAVE_WAYLAND_EGL
+        if (wl_frame_surface && wl_interval > 0) {
+            // Get the frame's GL work to the GPU before waiting, so it renders
+            // during the wait, as it does when Mesa throttles inside the swap.
+            glFlush();
+            wl_wait_frame();
+        }
+#endif
         eglSwapBuffers(egl_display, egl_surface);
 #ifdef __APPLE__
         if (mac_layer) {
@@ -194,6 +411,14 @@ void egl_swap_buffers(void) {
 
 void egl_set_swap_interval(int interval) {
     if (!initialized) return;
+#ifdef WC_HAVE_WAYLAND_EGL
+    if (wl_dpy) {
+        // Paced by wl_wait_frame instead; see WL_FRAME_WAIT_MS.
+        wl_interval = interval;
+        eglSwapInterval(egl_display, 0);
+        return;
+    }
+#endif
     eglSwapInterval(egl_display, interval);
 #ifdef __APPLE__
     /* ANGLE Metal ignores eglSwapInterval; displaySyncEnabled is the real
@@ -206,18 +431,47 @@ void egl_set_swap_interval(int interval) {
 #endif
 }
 
+// Safe to call more than once, and after a partial egl_create_context:
+// on Wayland nothing Mesa made on SDL's wl_display may outlive SDL_Quit.
 void egl_destroy(void) {
-    if (!initialized) return;
 #ifdef __APPLE__
     mac_native_window = NULL;
     mac_layer = NULL;
     mac_desired_sync = -1;
     mac_sync_applied = true;
 #endif
-    eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    if (egl_surface != EGL_NO_SURFACE) eglDestroySurface(egl_display, egl_surface);
-    if (egl_context != EGL_NO_CONTEXT) eglDestroyContext(egl_display, egl_context);
-    if (egl_display != EGL_NO_DISPLAY) eglTerminate(egl_display);
+#ifdef WC_HAVE_WAYLAND_EGL
+    // Proxies before the queue they are on.
+    if (wl_frame_cb) wl_callback_destroy(wl_frame_cb);
+    if (wl_frame_surface) wl_proxy_wrapper_destroy(wl_frame_surface);
+    if (wl_frame_queue) wl_event_queue_destroy(wl_frame_queue);
+    wl_frame_cb = NULL;
+    wl_frame_surface = NULL;
+    wl_frame_queue = NULL;
+    wl_frame_ready = false;
+    wl_interval = 0;
+#endif
+    if (egl_display != EGL_NO_DISPLAY) {
+        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (egl_surface != EGL_NO_SURFACE) eglDestroySurface(egl_display, egl_surface);
+        if (egl_context != EGL_NO_CONTEXT) eglDestroyContext(egl_display, egl_context);
+        // On Wayland this is SDL's wl_display; Mesa only disconnects one it
+        // opened itself.
+        eglTerminate(egl_display);
+    }
+#ifdef WC_HAVE_WAYLAND_EGL
+    // The wl_egl_windows go after the EGLSurfaces that used them.
+    if (wl_win) wl_egl_window_destroy(wl_win);
+    if (wl_boot_win) wl_egl_window_destroy(wl_boot_win);
+    wl_win = NULL;
+    wl_boot_win = NULL;
+    wl_dpy = NULL;
+    wl_w = wl_h = 0;
+    wl_opaque = false;
+#endif
+    egl_display = EGL_NO_DISPLAY;
+    egl_context = EGL_NO_CONTEXT;
+    egl_surface = EGL_NO_SURFACE;
     initialized = false;
     window_surface = false;
 }

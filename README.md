@@ -50,6 +50,9 @@ V8's Liftoff baseline compiler starts WASM instantly — no compilation delay, e
 - C/C++ compiler (gcc/clang)
 - [SDL2](https://www.libsdl.org) dev headers (`sudo apt install libsdl2-dev`)
 - EGL + GLES dev headers (`sudo apt install libegl-dev libgles-dev`)
+- Wayland client + wayland-egl dev headers (`sudo apt install libwayland-dev`),
+  for GL carts on native Wayland. Optional: without them that path compiles
+  out and GL carts on a Wayland session need `SDL_VIDEODRIVER=x11`.
 
 ### Build from source
 
@@ -111,7 +114,7 @@ wasmcart-run (75MB, statically linked)
 ├── cart_host.cpp             — wasmcart ABI: load .wasc, manage V8, run frames
 ├── gl_imports.cpp            — ~209 GL functions registered as V8 callbacks
 ├── asset_loader.c            — .wasc ZIP reading (miniz) + manifest parsing (cJSON)
-├── egl_context.c             — EGL pbuffer + window surface management
+├── egl_context.c             — EGL context, boot surface (pbuffer; a hidden window on Wayland) + window surface
 └── main.c                    — SDL2 event loop, input, display, audio queue
 ```
 
@@ -225,6 +228,7 @@ node ../wasmcart/test/wsserver.mjs --port 8796 &   # from the wasmcart repo
 ./rumble_test ../wasmcart/test/fixtures/rumble.wasc
 ./text_test  test/textauto.wasc 5436 5440 5444 5456
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
+sh test/wayland_egl_guard_test.sh   # Wayland EGL stays on SDL's surface, torn down first
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 ./lifecycle_test ../wasmcart/test/fixtures/lifecycle.wasc 5484 5488 5492 5496 5500 5504 \
@@ -273,7 +277,32 @@ host on some GL carts (~860 vs ~716 FPS for Skia Ganesh). Both use V8 for WASM a
 
 ### Wayland vs X11
 
-SDL2 may choose X11 (via XWayland) on Wayland sessions. The `egl_create_window_surface` code does a runtime check on `wm_info.subsystem` (not compile-time `#ifdef`). Both backends work, but compositor behavior may differ for vsync.
+SDL2 prefers X11 (through Xwayland) whenever `DISPLAY` is set, so on most
+Wayland desktops the player runs on X11 unless you ask for
+`SDL_VIDEODRIVER=wayland`. sdl2-compat (SDL2's API over SDL3, which some
+distros ship as SDL2) is different: SDL3 prefers Wayland on compositors that
+offer `wp_fifo_v1`, so there native Wayland is the default. Both work for 2D
+and GL carts; the window-surface code checks `wm_info.subsystem` at runtime,
+not with a compile-time `#ifdef`.
+
+On native Wayland, EGL has to live on SDL's own `wl_display`: Wayland objects
+can't cross connections, and `EGL_DEFAULT_DISPLAY` would make Mesa open its
+own (or pick its X11 platform, which fails without `DISPLAY`). SDL2 only hands
+its `wl_display` out through a window, and GL carts run their init while
+loading, before the real window exists, so the player first creates a hidden
+16x16 window. The EGL display goes on its connection, and a `wl_egl_window` on
+its surface stands in for the pbuffer that Mesa's Wayland platform doesn't
+have; cart init sees the same 16x16 default framebuffer as elsewhere. The real
+window then gets a `wl_egl_window` the player owns and resizes to follow the
+window, since SDL only makes one for an `SDL_WINDOW_OPENGL` window. This needs
+`libwayland-dev` at build time. X11 keeps `EGL_DEFAULT_DISPLAY`, since X window
+IDs work across connections.
+
+Presents on Wayland are paced by the player, not by `eglSwapInterval(1)`: Mesa
+waits for the compositor's frame callback with no timeout, and compositors
+stop sending them to a covered or minimized window, which would freeze the
+loop, quit signals included. Like SDL's own Wayland GL path, the player swaps
+with interval 0 and waits for the callback itself, for at most 50ms.
 
 Lifecycle differs too. The player suspends a cart when its window is minimized
 or hidden and resumes it on restore (the cart's `wc_on_suspend`/`wc_on_resume`
