@@ -301,6 +301,7 @@ sh test/wgpu_test.sh          # WebGPU carts (needs a build with WebGPU support)
     ../wasmcart/test/fixtures/hello.wasc   # suspend/resume/focus order, no render while suspended
 
 cc -Iinclude -Isrc -o clock_test test/clock_test.c && ./clock_test   # no V8 or SDL needed
+cc -Iinclude -Isrc -o audio_fade_test test/audio_fade_test.c -lm && ./audio_fade_test
 ```
 
 `text_test` and `lifecycle_test` take the cart's debug-field offsets as arguments because they move

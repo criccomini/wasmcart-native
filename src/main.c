@@ -8,6 +8,7 @@
 #include "../include/wasmcart_host.h"
 #include "egl_context.h"
 #include "frame_clock.h"
+#include "audio_mix.h"
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
@@ -170,11 +171,9 @@ static void poll_keyboard_as_pad(wc_pad_t* pad) {
     if (pad->buttons) pad->connected = 1;
 }
 
-static void queue_silence(SDL_AudioDeviceID dev, uint32_t bytes) {
-    uint8_t* silence = calloc(1, bytes);
-    if (!silence) return;
-    SDL_QueueAudio(dev, silence, bytes);
-    free(silence);
+// The device pulls from the mixer (src/audio_mix.h) on its own thread.
+static void audio_callback(void* userdata, Uint8* stream, int len) {
+    audio_mix_pull((wc_audio_mix_t*)userdata, (float*)stream, (uint32_t)len / (2 * sizeof(float)));
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────
@@ -1052,25 +1051,26 @@ int main(int argc, char* argv[]) {
 
     // 5. Open audio device
     SDL_AudioDeviceID audio_dev = 0;
-    uint32_t audio_seed_bytes = 0;  // ~50ms of silence, re-queued on resume
+    wc_audio_mix_t audio_mix = {0};
     uint32_t audio_rate = info->audio_sample_rate ? info->audio_sample_rate : 48000;
     bool audio_f32 = (info->flags & WC_FLAG_AUDIO_F32) != 0;
 
     if (info->audio_ptr && info->audio_cap) {
+        // Float stereo through a callback, whatever the cart writes: the
+        // mixer converts S16 carts on the way in, and owning the samples is
+        // what lets it fade instead of cutting (see src/audio_mix.h).
         SDL_AudioSpec want = {0};
         want.freq = audio_rate;
-        want.format = audio_f32 ? AUDIO_F32 : AUDIO_S16;
+        want.format = AUDIO_F32;
         want.channels = 2;
         want.samples = 1024;
-        want.callback = NULL; // use SDL_QueueAudio
+        want.callback = audio_callback;
+        want.userdata = &audio_mix;
 
         SDL_AudioSpec have;
-        audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        if (audio_mix_init(&audio_mix, audio_rate, audio_rate / 2))
+            audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
         if (audio_dev) {
-            // Pre-seed with ~50ms of silence to prevent initial underruns
-            uint32_t seed_frames = have.freq / 20; // 50ms
-            audio_seed_bytes = seed_frames * have.channels * (audio_f32 ? 4 : 2);
-            queue_silence(audio_dev, audio_seed_bytes);
             SDL_PauseAudioDevice(audio_dev, 0);
             fprintf(stderr, "wasmcart: audio %uHz %s stereo\n",
                 have.freq, audio_f32 ? "F32" : "S16");
@@ -1176,9 +1176,10 @@ int main(int argc, char* argv[]) {
                     // A hidden app can be killed without ever reaching a
                     // graceful quit, so suspend is a persistence point.
                     persist_sav(host, sav_path);
-                    if (audio_dev) {
-                        SDL_PauseAudioDevice(audio_dev, 1);
-                        SDL_ClearQueuedAudio(audio_dev);
+                    if (audio_dev) {  // fades out, then drops what's left
+                        SDL_LockAudioDevice(audio_dev);
+                        audio_mix_set_paused(&audio_mix, true);
+                        SDL_UnlockAudioDevice(audio_dev);
                     }
                 }
             } else if (wc_host_is_suspended(host)) {
@@ -1192,9 +1193,10 @@ int main(int argc, char* argv[]) {
                 poll_pads(held);
                 for (int i = 0; i < WC_MAX_PADS; i++) guard_mask[i] = held[i].buttons;
                 fprintf(stderr, "wasmcart: resumed at frame %u\n", frame_count);
-                if (audio_dev) {
-                    queue_silence(audio_dev, audio_seed_bytes);
-                    SDL_PauseAudioDevice(audio_dev, 0);
+                if (audio_dev) {  // fades in once the cart has written enough
+                    SDL_LockAudioDevice(audio_dev);
+                    audio_mix_set_paused(&audio_mix, false);
+                    SDL_UnlockAudioDevice(audio_dev);
                 }
                 fps_counter = 0;
                 fps_last = now;
@@ -1419,8 +1421,10 @@ int main(int argc, char* argv[]) {
             bool is_f32_out;
             const void* audio = wc_host_get_audio(host, &num_audio_frames, &is_f32_out);
             if (num_audio_frames > 0) {
-                uint32_t bytes = num_audio_frames * (is_f32_out ? 8 : 4);
-                SDL_QueueAudio(audio_dev, audio, bytes);
+                SDL_LockAudioDevice(audio_dev);
+                if (is_f32_out) audio_mix_push_f32(&audio_mix, (const float*)audio, num_audio_frames);
+                else audio_mix_push_s16(&audio_mix, (const int16_t*)audio, num_audio_frames);
+                SDL_UnlockAudioDevice(audio_dev);
             }
         }
 
@@ -1448,6 +1452,7 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "wasmcart: shutting down\n");
 
     if (audio_dev) SDL_CloseAudioDevice(audio_dev);
+    audio_mix_free(&audio_mix);
     if (fb_tex) SDL_DestroyTexture(fb_tex);
     if (renderer) SDL_DestroyRenderer(renderer);
     // EGL before the window: on Wayland our surface sits on SDL's wl_surface
