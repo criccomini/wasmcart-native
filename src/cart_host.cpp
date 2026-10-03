@@ -185,6 +185,27 @@ extern "C" void wc_host_destroy(wc_host_t* host) {
 
 // ─── Parse wc_info_t from WASM memory (unchanged from wasmtime) ─────────
 
+// Refuse a cart built against an ABI this host doesn't speak, rather than
+// reading its structs with the wrong offsets.
+//
+// Only call this once the cart has filled in wc_info_t: the first
+// wc_get_info() runs before wc_init, and a deferred (GL) cart hasn't run at
+// all at load time, so the version can legitimately still read 0 there.
+//
+// The host never checked the version. That was harmless while layouts only
+// grew, and stopped being so at ABI v4, which moved every wc_pad_t field
+// after buttons: a v4 cart here loads and reads its input from the wrong
+// bytes. Same check and message as upstream's v4 host, with v3's range.
+static int check_abi_version(wc_host_t* host) {
+    if (host->info.version < WC_MIN_ABI_VERSION || host->info.version > WC_ABI_VERSION) {
+        wc_log("wasmcart: ABI version mismatch: cart=%u, host supports %d-%d. "
+               "Rebuild the cart against the current wasmcart.h.\n",
+               host->info.version, WC_MIN_ABI_VERSION, WC_ABI_VERSION);
+        return -1;
+    }
+    return 0;
+}
+
 static void parse_cart_info(wc_host_t* host, uint32_t info_ptr) {
     uint8_t* mem = host->memory;
     wc_cart_info_t* info = &host->info;
@@ -1078,6 +1099,10 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
         }
     } // end else (non-deferred init)
 
+    // A deferred cart hasn't run yet, so its version isn't known here;
+    // wc_host_finish_init() checks it once the cart has filled wc_info_t in.
+    if (!host->init_deferred && check_abi_version(host) != 0) return -1;
+
     wc_log( "wasmcart: loaded %s (%ux%u, %s, ABI v%u)\n",
         host->manifest.name,
         host->info.width, host->info.height,
@@ -1136,6 +1161,11 @@ extern "C" int wc_host_finish_init(wc_host_t* host) {
             parse_cart_info(host, result.ToLocalChecked()->Uint32Value(ctx()).FromJust());
         }
     }
+
+    // The cart has run now, so this is the first point on the deferred path
+    // where its ABI version is known. Refuse before wc_init, so an
+    // incompatible cart never gets to touch the structs.
+    if (check_abi_version(host) != 0) return -1;
 
     // Write host info (preferred dimensions, etc.) before wc_init
     write_host_info(host, &host->deferred_opts);
