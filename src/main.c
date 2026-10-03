@@ -12,6 +12,7 @@
 #define PAD_SLOTS_MAX 4
 #include "pad_slots.h"
 #include "save_file.h"
+#include "save_writer.h"
 #include <sys/stat.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -435,17 +436,30 @@ static uint8_t* load_sav(const char* sav_path, uint32_t* out_size) {
 
 // Must run BEFORE wc_host_destroy(): the pointer returned points INTO the
 // cart's linear memory, which is gone afterwards.
-static uint8_t* g_last_saved = NULL;  // what's on disk, to skip identical writes
+static uint8_t* g_last_saved = NULL;  // the last save written or handed over
 static uint32_t g_last_saved_size = 0;
+static save_writer_t g_writer;           // writes periodic saves off the game's thread
+static bool g_save_retry = false;        // a write failed: send the next one regardless
 
-static void persist_sav(wc_host_t* host, const char* sav_path) {
+// Called after every save write, on whichever thread did it. The heartbeat
+// lines are single non-blocking writes, so the writer thread can send them.
+static void save_done(bool ok) {
+    if (!ok) fprintf(stderr, "wasmcart: could not write a save\n");
+    hb_note(ok ? 'W' : 'E', ok ? NULL : "write_failed");
+}
+
+// now: write it here and now, after anything the writer has in flight (the
+// final save on exit). Otherwise hand a snapshot to the writer thread.
+static void persist_sav(wc_host_t* host, const char* sav_path, bool now) {
     // After a trap the cart may have died halfway through updating its
     // save; the last save written while it was healthy is the better one.
     if (wc_host_has_trapped(host)) return;
     uint32_t size = 0;
     const uint8_t* data = wc_host_get_save_data(host, &size);
     if (!data || size == 0) return;  // cart declares no save block
-    if (g_last_saved && g_last_saved_size == size && memcmp(g_last_saved, data, size) == 0)
+    if (save_writer_take_failure(&g_writer)) g_save_retry = true;
+    if (!g_save_retry && g_last_saved && g_last_saved_size == size &&
+        memcmp(g_last_saved, data, size) == 0)
         return;  // nothing changed since the last write: spare the SD card
     // An all-zero region from a cart that never saved isn't a save: writing
     // it would create a .sav just by running the cart. With a save already
@@ -456,12 +470,13 @@ static void persist_sav(wc_host_t* host, const char* sav_path) {
         while (i < size && data[i] == 0) i++;
         if (i == size) return;
     }
-    if (save_file_write(sav_path, data, size) != 0) {
-        fprintf(stderr, "wasmcart: could not write save to %s\n", sav_path);
-        hb_note('E', "write_failed");
-        return;
+    if (now || !save_writer_post(&g_writer, data, size)) {
+        save_writer_flush(&g_writer);
+        bool ok = save_file_write(sav_path, data, size) == 0;
+        save_done(ok);
+        if (!ok) return;
     }
-    hb_note('W', NULL);
+    g_save_retry = false;
     uint8_t* copy = (uint8_t*)realloc(g_last_saved, size);
     if (copy) {
         memcpy(copy, data, size);
@@ -754,6 +769,8 @@ int main(int argc, char* argv[]) {
         sav_path_for(cart_path, sav_path, sizeof(sav_path));
     uint32_t sav_size = 0;
     uint8_t* sav_data = load_sav(sav_path, &sav_size);
+    if (!save_writer_start(&g_writer, sav_path, save_done))
+        fprintf(stderr, "wasmcart: no save writer thread; saves happen between frames\n");
     // The save as loaded is what's on disk: an exit without changes then
     // doesn't rewrite it.
     if (sav_data) {
@@ -1207,7 +1224,9 @@ int main(int argc, char* argv[]) {
                     fprintf(stderr, "wasmcart: suspended at frame %u\n", frame_count);
                     // A hidden app can be killed without ever reaching a
                     // graceful quit, so suspend is a persistence point.
-                    persist_sav(host, sav_path);
+                    // On the writer thread: an fsync can take seconds on an
+                    // SD card, and a paused game must keep its heartbeat.
+                    persist_sav(host, sav_path, false);
                     if (audio_dev) {  // fades out, then drops what's left
                         SDL_LockAudioDevice(audio_dev);
                         audio_mix_set_paused(&audio_mix, true);
@@ -1381,7 +1400,7 @@ int main(int argc, char* argv[]) {
         // of progress. Unchanged saves aren't rewritten.
         if (save_every_s && now - last_save_ticks >= (uint64_t)save_every_s * 1000) {
             last_save_ticks = now;
-            persist_sav(host, sav_path);
+            persist_sav(host, sav_path, false);
         }
 
         // Frame timing — vsync handles it if available, otherwise manual delay
@@ -1400,7 +1419,8 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "wasmcart: shutting down\n");
     // Save first: a crash in the GL, audio or SDL teardown below, or a
     // supervisor that loses patience and kills us, mustn't cost the save.
-    persist_sav(host, sav_path);
+    persist_sav(host, sav_path, true);
+    save_writer_stop(&g_writer);
 
     if (audio_dev) SDL_CloseAudioDevice(audio_dev);
     audio_mix_free(&audio_mix);
