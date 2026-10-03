@@ -169,4 +169,11 @@ void wc_gl_imports_init(wc_host_t* host);
 // ─── Env imports ───────────────────────────────────────────────────────
 // (handled in cart_host.cpp for V8 version)
 
+// ─── Cart pointers handed to imports ───────────────────────────────────
+// Is [ptr, ptr + len) inside the cart's memory? If not, the cart has been
+// trapped (see cart_host.cpp) and the import must return without touching it.
+bool wc_cart_range_ok(wc_host_t* host, const char* import, uint64_t ptr, uint64_t len);
+// The same for a NUL-terminated string: its terminator has to be in there too.
+bool wc_cart_str_ok(wc_host_t* host, const char* import, uint64_t ptr);
+
 #endif // WC_CART_HOST_INTERNAL_H

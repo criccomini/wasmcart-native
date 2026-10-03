@@ -43,7 +43,24 @@ function log(text) {
 
 const u8 = () => new Uint8Array(memory.buffer);
 const dv = () => new DataView(memory.buffer);
-const readStr = (ptr, len) => Buffer.from(u8().slice(ptr, ptr + len)).toString('utf8');
+
+// A pointer outside the cart's memory traps the thread, as one handed to an
+// import traps the main thread (cart_host.cpp, wc_cart_range_ok): a
+// RangeError thrown back into the cart. DataView accessors and
+// TypedArray.set throw one by themselves; slice and copyWithin would quietly
+// clamp instead, so those ranges are checked here. wasm hands i32s over
+// signed, hence the >>> 0.
+function need(name, ptr, len) {
+  ptr >>>= 0; len >>>= 0;
+  const size = memory.buffer.byteLength;
+  if (ptr + len > size)
+    throw new RangeError(`${name}: ${len} bytes at ${ptr} are outside the cart's memory (${size} bytes)`);
+  return ptr;
+}
+const readStr = (name, ptr, len) => {
+  ptr = need(name, ptr, len);
+  return Buffer.from(u8().slice(ptr, ptr + (len >>> 0))).toString('utf8');
+};
 
 // ---- assets: read the .wasc ourselves, same lookup rules as asset_loader.c ----
 let zipFd = null;
@@ -68,13 +85,17 @@ function readEntry(e) {
   return null;
 }
 function assetSize(pathPtr, pathLen) {
-  const path = readStr(pathPtr, pathLen);
+  const path = readStr('wc_asset_size', pathPtr, pathLen);
   if (path === '_filelist.txt') return cfg.fileList === null ? -1 : Buffer.byteLength(cfg.fileList);
   const e = locate(path);
   return e ? e.usize : -1;
 }
 function loadAsset(pathPtr, pathLen, destPtr, maxSize) {
-  const path = readStr(pathPtr, pathLen);
+  const path = readStr('wc_load_asset', pathPtr, pathLen);
+  // The whole of dest, as on the main thread: maxSize is the cart's word for
+  // how big its buffer is.
+  destPtr = need('wc_load_asset', destPtr, maxSize);
+  maxSize >>>= 0;
   let data;
   if (path === '_filelist.txt') {
     if (cfg.fileList === null) return -1;
@@ -117,6 +138,7 @@ const wasi = {
     for (let i = 0; i < iovsLen; i++) {
       const p = v.getUint32(iovs + i * 8, true);
       const l = v.getUint32(iovs + i * 8 + 4, true);
+      need('fd_write', p, l);
       if (l) chunks.push(Buffer.from(u8().slice(p, p + l)));
       total += l;
     }
@@ -215,11 +237,14 @@ for (const imp of WebAssembly.Module.imports(wasmModule)) {
   else if (imp.module === 'gl') val = notOnWorker(imp.name);
   else if (imp.module === 'env') {
     const n = imp.name;
-    if (n === 'wc_log') val = (p, l) => log(readStr(p, l));
+    if (n === 'wc_log') val = (p, l) => log(readStr('wc_log', p, l));
     else if (n === 'wc_asset_size') val = assetSize;
     else if (n === 'wc_load_asset') val = loadAsset;
     else if (n === 'wc_debug_mark' || n === 'wc_frame_yield') val = () => {};
-    else if (n === 'emscripten_memcpy_js') val = (d, s, c) => { u8().copyWithin(d, s, s + c); };
+    else if (n === 'emscripten_memcpy_js') val = (d, s, c) => {
+      s = need('emscripten_memcpy_js', s, c); d = need('emscripten_memcpy_js', d, c);
+      u8().copyWithin(d, s, s + (c >>> 0));
+    };
     else if (n.startsWith('wc_') || /^gl[A-Z]/.test(n) || n.startsWith('emscripten_gl')) val = notOnWorker(n);
     else val = () => 0;
   } else val = () => 0;

@@ -1386,6 +1386,7 @@ int main(int argc, char* argv[]) {
     uint64_t last_alive_ticks = 0;
     uint32_t guard_mask[WC_MAX_PADS] = {0};
     bool running = true;
+    int exit_code = 0;
     uint32_t frame_count = 0;
     uint64_t start_ticks = SDL_GetTicks64();
     uint32_t fps_counter = 0;
@@ -1625,6 +1626,7 @@ int main(int argc, char* argv[]) {
 
         if (wc_host_has_trapped(host)) {
             fprintf(stderr, "wasmcart: cart trapped, exiting\n");
+            exit_code = 1;  // a trap is a failure, not a quit
             running = false;
             break;
         }
@@ -1784,5 +1786,5 @@ int main(int argc, char* argv[]) {
     free(sav_data);
     SDL_Quit();
 
-    return 0;
+    return exit_code;
 }

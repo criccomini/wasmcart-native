@@ -27,6 +27,7 @@ extern "C" {
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 #include <random>
 #include <thread>
 #include <chrono>
@@ -81,6 +82,14 @@ v8::Local<v8::Context> ctx() {
 
 static void refresh_memory(wc_host_t* host) {
     auto state = (v8_host_state*)host->v8_state;
+    // No exported memory (yet: an import called from the start function runs
+    // before the exports are read). Every pointer check then fails cleanly
+    // instead of the Cast below dereferencing an empty handle.
+    if (state->memory_obj.IsEmpty()) {
+        host->memory = NULL;
+        host->memory_size = 0;
+        return;
+    }
     auto mem = state->memory_obj.Get(g_isolate);
     // Use WasmMemoryObject::Buffer() for direct access
     auto wasm_mem = v8::WasmMemoryObject::Cast(*mem);
@@ -402,15 +411,63 @@ static v8::Local<v8::Function> make_fn(host_fn_cb cb) {
     return v8::Function::New(ctx(), cb).ToLocalChecked();
 }
 
+// ─── Cart pointers ─────────────────────────────────────────────────────
+//
+// Every pointer an import is handed is an offset the cart chose, so it is
+// checked against the cart's memory before the host follows it. Otherwise a
+// cart could point the host at the host's own memory. The sums are 64-bit, so
+// ptr + len can't wrap.
+//
+// A failed check traps the cart the way an out-of-bounds load or store in its
+// own code would: a RangeError thrown back through the import, unwinding to
+// whichever export the host called. The host is marked trapped as well, so it
+// stops calling the cart even if the cart catches the error (wasm can catch a
+// JS exception, which it can't do with a real trap). The caller must return
+// straight away without touching the region.
+
+static void trap_cart(wc_host_t* host, const char* fmt, ...) {
+    char msg[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    // Logged here as well as wherever the exception lands: if the cart
+    // catches it, this is the only record of why it stopped.
+    wc_log("wasmcart: cart trapped: RangeError: %s\n", msg);
+    host->trapped = true;
+    g_isolate->ThrowException(v8::Exception::RangeError(v8str(msg)));
+}
+
+extern "C" bool wc_cart_range_ok(wc_host_t* host, const char* import,
+                                 uint64_t ptr, uint64_t len) {
+    if (ptr <= host->memory_size && len <= host->memory_size - ptr) return true;
+    trap_cart(host, "%s: %llu bytes at %llu are outside the cart's memory (%u bytes)",
+              import, (unsigned long long)len, (unsigned long long)ptr, host->memory_size);
+    return false;
+}
+
+extern "C" bool wc_cart_str_ok(wc_host_t* host, const char* import, uint64_t ptr) {
+    if (host->memory && ptr < host->memory_size &&
+        memchr(host->memory + ptr, 0, host->memory_size - ptr)) return true;
+    trap_cart(host, "%s: the string at %llu has no terminator inside the cart's memory (%u bytes)",
+              import, (unsigned long long)ptr, host->memory_size);
+    return false;
+}
+
 // ─── Host function callbacks (env module) ─────────────────────────────
 
 static wc_host_t* _current_host = nullptr; // set before instantiation
 
 static void v8_wc_log(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    refresh_memory(_current_host);
+    wc_host_t* host = _current_host;
+    refresh_memory(host);
     uint32_t ptr = args[0]->Uint32Value(ctx()).FromJust();
     uint32_t len = args[1]->Uint32Value(ctx()).FromJust();
-    wc_log( "wasmcart [cart]: %.*s\n", (int)len, (const char*)(_current_host->memory + ptr));
+    if (!wc_cart_range_ok(host, "wc_log", ptr, len)) return;
+    // %.*s takes an int. A length past INT_MAX would turn negative and print
+    // up to the next NUL instead, wherever that is.
+    int n = len > INT_MAX ? INT_MAX : (int)len;
+    wc_log( "wasmcart [cart]: %.*s\n", n, (const char*)(host->memory + ptr));
 }
 
 static void v8_emscripten_notify_memory_growth(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -420,43 +477,46 @@ static void v8_emscripten_notify_memory_growth(const v8::FunctionCallbackInfo<v8
 }
 
 static void v8_emscripten_memcpy_js(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    refresh_memory(_current_host);
+    wc_host_t* host = _current_host;
+    refresh_memory(host);
     uint32_t dest = args[0]->Uint32Value(ctx()).FromJust();
     uint32_t src = args[1]->Uint32Value(ctx()).FromJust();
     uint32_t n = args[2]->Uint32Value(ctx()).FromJust();
-    memmove(_current_host->memory + dest, _current_host->memory + src, n);
+    if (!wc_cart_range_ok(host, "emscripten_memcpy_js", src, n) ||
+        !wc_cart_range_ok(host, "emscripten_memcpy_js", dest, n)) return;
+    memmove(host->memory + dest, host->memory + src, n);
 }
 
 static void v8_wc_asset_size(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    refresh_memory(_current_host);
+    wc_host_t* host = _current_host;
+    refresh_memory(host);
     uint32_t path_ptr = args[0]->Uint32Value(ctx()).FromJust();
     uint32_t path_len = args[1]->Uint32Value(ctx()).FromJust();
+    if (!wc_cart_range_ok(host, "wc_asset_size", path_ptr, path_len)) return;
     char path[512];
     uint32_t len = path_len < 511 ? path_len : 511;
-    memcpy(path, _current_host->memory + path_ptr, len);
+    memcpy(path, host->memory + path_ptr, len);
     path[len] = '\0';
-    int32_t size = wc_archive_asset_size(_current_host, path);
+    int32_t size = wc_archive_asset_size(host, path);
     args.GetReturnValue().Set(v8::Integer::New(g_isolate, size));
 }
 
 static void v8_wc_load_asset(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    refresh_memory(_current_host);
+    wc_host_t* host = _current_host;
+    refresh_memory(host);
     uint32_t path_ptr = args[0]->Uint32Value(ctx()).FromJust();
     uint32_t path_len = args[1]->Uint32Value(ctx()).FromJust();
     uint32_t dest_ptr = args[2]->Uint32Value(ctx()).FromJust();
     uint32_t max_size = args[3]->Uint32Value(ctx()).FromJust();
+    // The whole of dest, not just what this asset fills: max_size is the
+    // cart's statement of how big its buffer is.
+    if (!wc_cart_range_ok(host, "wc_load_asset", path_ptr, path_len) ||
+        !wc_cart_range_ok(host, "wc_load_asset", dest_ptr, max_size)) return;
     char path[512];
     uint32_t len = path_len < 511 ? path_len : 511;
-    memcpy(path, _current_host->memory + path_ptr, len);
+    memcpy(path, host->memory + path_ptr, len);
     path[len] = '\0';
-    if (dest_ptr + max_size > _current_host->memory_size) {
-        wc_log( "wasmcart: asset %s: dest_ptr=%u + max_size=%u > memory_size=%u\n",
-            path, dest_ptr, max_size, _current_host->memory_size);
-        args.GetReturnValue().Set(-1);
-        return;
-    }
-    int32_t bytes = wc_archive_load_asset(_current_host, path,
-        _current_host->memory + dest_ptr, max_size);
+    int32_t bytes = wc_archive_load_asset(host, path, host->memory + dest_ptr, max_size);
     args.GetReturnValue().Set(v8::Integer::New(g_isolate, bytes));
 }
 
@@ -600,6 +660,8 @@ static void v8_wc_peer_open(const v8::FunctionCallbackInfo<v8::Value>& args) {
     char addr[512];
     uint32_t ptr = args[0]->Uint32Value(ctx()).FromMaybe(0);
     uint32_t len = args[1]->Uint32Value(ctx()).FromMaybe(0);
+    refresh_memory(host);
+    if (!wc_cart_range_ok(host, "wc_peer_open", ptr, len)) return;
     if (!read_cart_str(host, ptr, len, addr, sizeof addr)) return;
 
     if (!peer_addr_granted(host, addr)) {
@@ -711,11 +773,15 @@ static void v8_wc_peer_send(const v8::FunctionCallbackInfo<v8::Value>& args) {
     wc_host_t* host = _current_host;
     args.GetReturnValue().Set(v8::Integer::New(g_isolate, -1));
     if (!host) return;
+    uint32_t ptr = args[1]->Uint32Value(ctx()).FromMaybe(0);
+    uint32_t len = args[2]->Uint32Value(ctx()).FromMaybe(0);
+    // Checked before the peer is looked up, so a bad buffer traps whether or
+    // not anyone is connected, not only once someone is.
+    refresh_memory(host);
+    if (!wc_cart_range_ok(host, "wc_peer_send", ptr, len)) return;
     wc_peer_t* p = peer_find(host, args[0]->Int32Value(ctx()).FromMaybe(-1));
     if (!p) return;
-    int r = peer_send_bytes(host, p,
-                            args[1]->Uint32Value(ctx()).FromMaybe(0),
-                            args[2]->Uint32Value(ctx()).FromMaybe(0));
+    int r = peer_send_bytes(host, p, ptr, len);
     args.GetReturnValue().Set(v8::Integer::New(g_isolate, r));
 }
 
@@ -725,6 +791,8 @@ static void v8_wc_peer_broadcast(const v8::FunctionCallbackInfo<v8::Value>& args
     if (!host) return;
     uint32_t ptr = args[0]->Uint32Value(ctx()).FromMaybe(0);
     uint32_t len = args[1]->Uint32Value(ctx()).FromMaybe(0);
+    refresh_memory(host);
+    if (!wc_cart_range_ok(host, "wc_peer_broadcast", ptr, len)) return;
     int sent = 0;
     for (uint32_t i = 0; i < host->peer_count; i++)
         if (peer_send_bytes(host, &host->peers[i], ptr, len) > 0) sent++;
@@ -754,12 +822,13 @@ static void v8_wc_peer_id(const v8::FunctionCallbackInfo<v8::Value>& args) {
 static void v8_wc_peer_name(const v8::FunctionCallbackInfo<v8::Value>& args) {
     wc_host_t* host = _current_host;
     args.GetReturnValue().Set(v8::Integer::New(g_isolate, 0));
-    if (!host || !host->memory) return;
-    wc_peer_t* p = peer_find(host, args[0]->Int32Value(ctx()).FromMaybe(-1));
-    if (!p) return;
+    if (!host) return;
     uint32_t dest = args[1]->Uint32Value(ctx()).FromMaybe(0);
     uint32_t cap  = args[2]->Uint32Value(ctx()).FromMaybe(0);
-    if (cap == 0 || (uint64_t)dest + cap > host->memory_size) return;
+    refresh_memory(host);
+    if (!wc_cart_range_ok(host, "wc_peer_name", dest, cap)) return;
+    wc_peer_t* p = peer_find(host, args[0]->Int32Value(ctx()).FromMaybe(-1));
+    if (!p || cap == 0) return;
 
     /* Truncate the TEXT and always NUL-terminate. Writing cap bytes and losing
      * the terminator would hand the cart an unterminated string -- the same
@@ -861,22 +930,33 @@ extern "C" void wc_gl_build_v8_imports(v8::Isolate* isolate, v8::Local<v8::Conte
 
 static void v8_fd_write(const v8::FunctionCallbackInfo<v8::Value>& args) {
     // fd_write(fd, iovs_ptr, iovs_len, nwritten_ptr) -> errno
-    refresh_memory(_current_host);
+    wc_host_t* host = _current_host;
+    refresh_memory(host);
     uint32_t fd = args[0]->Uint32Value(ctx()).FromJust();
     uint32_t iovs_ptr = args[1]->Uint32Value(ctx()).FromJust();
     uint32_t iovs_len = args[2]->Uint32Value(ctx()).FromJust();
     uint32_t nwritten_ptr = args[3]->Uint32Value(ctx()).FromJust();
 
-    uint8_t* mem = _current_host->memory;
+    // Each iovec is 8 bytes: buf, buf_len. All of them, and the buffers they
+    // name, are checked before anything is written, so a bad one late in the
+    // list doesn't leave half a message out. The list is copied first and
+    // the copy is what's checked and followed: a threaded cart's other
+    // threads can rewrite it in between.
+    if (!wc_cart_range_ok(host, "fd_write", iovs_ptr, (uint64_t)iovs_len * 8) ||
+        !wc_cart_range_ok(host, "fd_write", nwritten_ptr, 4)) return;
+    uint8_t* mem = host->memory;
+    std::vector<uint32_t> iovs((size_t)iovs_len * 2);
+    if (iovs_len) memcpy(iovs.data(), mem + iovs_ptr, (size_t)iovs_len * 8);
+    for (uint32_t i = 0; i < iovs_len; i++)
+        if (!wc_cart_range_ok(host, "fd_write", iovs[2 * i], iovs[2 * i + 1])) return;
     uint32_t total = 0;
     for (uint32_t i = 0; i < iovs_len; i++) {
-        uint32_t buf_ptr = *(uint32_t*)(mem + iovs_ptr + i * 8);
-        uint32_t buf_len = *(uint32_t*)(mem + iovs_ptr + i * 8 + 4);
-        if (fd == 1) fwrite(mem + buf_ptr, 1, buf_len, stdout);
-        else if (fd == 2) fwrite(mem + buf_ptr, 1, buf_len, stderr);
-        total += buf_len;
+        uint32_t buf = iovs[2 * i], len = iovs[2 * i + 1];
+        if (fd == 1) fwrite(mem + buf, 1, len, stdout);
+        else if (fd == 2) fwrite(mem + buf, 1, len, stderr);
+        total += len;
     }
-    *(uint32_t*)(mem + nwritten_ptr) = total;
+    memcpy(mem + nwritten_ptr, &total, 4);
     args.GetReturnValue().Set(0); // success
 }
 
@@ -885,18 +965,12 @@ static void v8_fd_write(const v8::FunctionCallbackInfo<v8::Value>& args) {
 #define WC_WASI_EINVAL  28
 #define WC_WASI_ENOTSUP 58
 
-// True when [ptr, ptr+len) lies inside the cart's memory. Cart pointers are
-// untrusted; an out-of-range one must not become a host write.
-static bool cart_range_ok(uint32_t ptr, uint64_t len) {
-    return _current_host && _current_host->memory &&
-           (uint64_t)ptr + len <= _current_host->memory_size;
-}
-
 static void v8_fd_read(const v8::FunctionCallbackInfo<v8::Value>& args) {
     // No stdin: report end of file (nread = 0) rather than leave nread unset.
     refresh_memory(_current_host);
     uint32_t nread_ptr = args[3]->Uint32Value(ctx()).FromMaybe(0);
-    if (cart_range_ok(nread_ptr, 4)) wc_write_u32(_current_host->memory, nread_ptr, 0);
+    if (!wc_cart_range_ok(_current_host, "fd_read", nread_ptr, 4)) return;
+    wc_write_u32(_current_host->memory, nread_ptr, 0);
     args.GetReturnValue().Set(0);
 }
 
@@ -914,7 +988,7 @@ static void v8_fd_fdstat_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
     uint32_t fd = args[0]->Uint32Value(ctx()).FromMaybe(0);
     uint32_t ptr = args[1]->Uint32Value(ctx()).FromMaybe(0);
     if (fd > 2) { args.GetReturnValue().Set(WC_WASI_EBADF); return; }
-    if (!cart_range_ok(ptr, 24)) { args.GetReturnValue().Set(WC_WASI_EINVAL); return; }
+    if (!wc_cart_range_ok(_current_host, "fd_fdstat_get", ptr, 24)) return;
     uint8_t* m = _current_host->memory + ptr;
     memset(m, 0, 24);
     m[0] = 2;                               // filetype: character device
@@ -933,7 +1007,7 @@ static void v8_fd_filestat_get(const v8::FunctionCallbackInfo<v8::Value>& args) 
     uint32_t fd = args[0]->Uint32Value(ctx()).FromMaybe(0);
     uint32_t ptr = args[1]->Uint32Value(ctx()).FromMaybe(0);
     if (fd > 2) { args.GetReturnValue().Set(WC_WASI_EBADF); return; }
-    if (!cart_range_ok(ptr, 64)) { args.GetReturnValue().Set(WC_WASI_EINVAL); return; }
+    if (!wc_cart_range_ok(_current_host, "fd_filestat_get", ptr, 64)) return;
     memset(_current_host->memory + ptr, 0, 64);
     _current_host->memory[ptr + 16] = 2;    // filetype: character device
     args.GetReturnValue().Set(0);
@@ -952,8 +1026,10 @@ static void v8_sizes_get_zero(const v8::FunctionCallbackInfo<v8::Value>& args) {
     refresh_memory(_current_host);
     uint32_t count_ptr = args[0]->Uint32Value(ctx()).FromMaybe(0);
     uint32_t size_ptr = args[1]->Uint32Value(ctx()).FromMaybe(0);
-    if (cart_range_ok(count_ptr, 4)) wc_write_u32(_current_host->memory, count_ptr, 0);
-    if (cart_range_ok(size_ptr, 4)) wc_write_u32(_current_host->memory, size_ptr, 0);
+    if (!wc_cart_range_ok(_current_host, "environ/args_sizes_get", count_ptr, 4) ||
+        !wc_cart_range_ok(_current_host, "environ/args_sizes_get", size_ptr, 4)) return;
+    wc_write_u32(_current_host->memory, count_ptr, 0);
+    wc_write_u32(_current_host->memory, size_ptr, 0);
     args.GetReturnValue().Set(0);
 }
 
@@ -979,7 +1055,7 @@ static void v8_clock_time_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
     refresh_memory(_current_host);
     uint32_t ts_ptr = args[2]->Uint32Value(ctx()).FromJust();
     uint64_t nanos = wasi_now_ns();
-    if (!cart_range_ok(ts_ptr, 8)) { args.GetReturnValue().Set(WC_WASI_EINVAL); return; }
+    if (!wc_cart_range_ok(_current_host, "clock_time_get", ts_ptr, 8)) return;
     memcpy(_current_host->memory + ts_ptr, &nanos, 8);
     args.GetReturnValue().Set(0);
 }
@@ -988,7 +1064,7 @@ static void v8_clock_res_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
     refresh_memory(_current_host);
     uint32_t ptr = args[1]->Uint32Value(ctx()).FromMaybe(0);
     uint64_t res = 1000;  // 1us
-    if (!cart_range_ok(ptr, 8)) { args.GetReturnValue().Set(WC_WASI_EINVAL); return; }
+    if (!wc_cart_range_ok(_current_host, "clock_res_get", ptr, 8)) return;
     memcpy(_current_host->memory + ptr, &res, 8);
     args.GetReturnValue().Set(0);
 }
@@ -1009,11 +1085,9 @@ static void v8_poll_oneoff(const v8::FunctionCallbackInfo<v8::Value>& args) {
     uint32_t nsubs = args[2]->Uint32Value(ctx()).FromMaybe(0);
     uint32_t nevents_ptr = args[3]->Uint32Value(ctx()).FromMaybe(0);
     if (nsubs == 0) { args.GetReturnValue().Set(WC_WASI_EINVAL); return; }
-    if (!cart_range_ok(in_ptr, (uint64_t)nsubs * 48) || !cart_range_ok(out_ptr, (uint64_t)nsubs * 32) ||
-        !cart_range_ok(nevents_ptr, 4)) {
-        args.GetReturnValue().Set(WC_WASI_EINVAL);
-        return;
-    }
+    if (!wc_cart_range_ok(_current_host, "poll_oneoff", in_ptr, (uint64_t)nsubs * 48) ||
+        !wc_cart_range_ok(_current_host, "poll_oneoff", out_ptr, (uint64_t)nsubs * 32) ||
+        !wc_cart_range_ok(_current_host, "poll_oneoff", nevents_ptr, 4)) return;
     uint64_t now = wasi_now_ns();
     bool have_clock = false;
     uint64_t wait_ns = 0;
@@ -1048,6 +1122,7 @@ static void v8_random_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
     refresh_memory(_current_host);
     uint32_t buf_ptr = args[0]->Uint32Value(ctx()).FromJust();
     uint32_t buf_len = args[1]->Uint32Value(ctx()).FromJust();
+    if (!wc_cart_range_ok(_current_host, "random_get", buf_ptr, buf_len)) return;
     uint8_t* dest = _current_host->memory + buf_ptr;
     for (uint32_t i = 0; i < buf_len; i++) dest[i] = rand() & 0xff;
     args.GetReturnValue().Set(0);
@@ -2183,6 +2258,8 @@ static void deliver_peers(wc_host_t* host) {
         wc_peer_t* p = &host->peers[i];
         for (uint32_t k = 0; k < p->events_len; k++) {
             wc_peer_event_t* ev = &p->events[k];
+            // A cart that trapped in an earlier handler isn't called again.
+            if (host->trapped) { free(ev->data); continue; }
             v8::TryCatch tc(g_isolate);
             if (ev->type == WC_PEER_EV_CONNECT) {
                 p->state = WC_PEER_OPEN;
@@ -2316,7 +2393,7 @@ static void deliver_text(wc_host_t* host) {
     auto malloc_fn = state->fn_malloc.Get(g_isolate);
 
     size_t pos = 0;
-    while (pos < host->text_queue_len) {
+    while (pos < host->text_queue_len && !host->trapped) {
         const char* str = host->text_queue + pos;
         size_t slen = strlen(str);
         pos += slen + 1;
@@ -2329,7 +2406,7 @@ static void deliver_text(wc_host_t* host) {
         if (ptr == 0) continue;
 
         refresh_memory(host);
-        if (!host->memory || ptr + slen > host->memory_size) continue;
+        if (!host->memory || (uint64_t)ptr + slen > host->memory_size) continue;
         memcpy(host->memory + ptr, str, slen);
 
         v8::Local<v8::Value> argv[2] = {
@@ -2558,6 +2635,8 @@ extern "C" void wc_host_run_frame(wc_host_t* host) {
     deliver_peers(host);        // then into the cart, at a known point
     deliver_text(host);         // before render, like every other input
     deliver_wheel(host);        // frame total in, zeroed again after render
+    // An import can trap the cart inside those callbacks too.
+    if (host->trapped) return;
     if (host->uses_wgpu) wgpu_call(host, "begin");
 
     auto result = state->fn_wc_render.Get(g_isolate)->Call(
