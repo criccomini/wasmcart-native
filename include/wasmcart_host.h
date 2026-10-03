@@ -205,6 +205,11 @@ typedef struct {
     // rng_seed exactly, same as the JS hosts' deterministic:{seed}.
     uint32_t rng_seed;
     bool     rng_seed_set;
+    // The player turned networking off for this cart: wc_peer_open refuses
+    // every address, whatever the manifest grants, and the cart sees -1 as it
+    // would for an ungranted host. Peers the host supplies (wc_host_add_peer)
+    // are the embedder's own choice and aren't affected.
+    bool     deny_net;
 } wc_host_options_t;
 
 // ─── Host API ──────────────────────────────────────────────────────────────
