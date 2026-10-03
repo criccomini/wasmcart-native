@@ -223,7 +223,7 @@ gcc -O0 -o net_test  test/net_test.c  -Iinclude -Isrc \
 node ../wasmcart/test/wsserver.mjs --port 8796 &   # from the wasmcart repo
 ./net_test 8796         # require, nextTick, net.connect, WebSocket round-trip
 ./rumble_test ../wasmcart/test/fixtures/rumble.wasc
-./text_test  test/textauto.wasc 5436 5440 5444 5456
+./text_test  test/textauto.wasc 5452 5456 5460 5472
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
