@@ -13,10 +13,11 @@
 //   - A paused stage throws away what it held once the fade is done, so a
 //     resume never replays stale audio.
 //   - A stage stopped for good, because the device is about to close, fades
-//     out over AUDIO_STOP_FADE_MS and then plays AUDIO_TAIL_MS of silence.
-//     Closing the device mid-wave is the same step as any other cut, and
-//     the tail means whatever the device still holds when it closes is
-//     silence too.
+//     out over AUDIO_STOP_FADE_MS, or over what it still holds if that's
+//     less (but not under AUDIO_FADE_MS), and then plays AUDIO_TAIL_MS of
+//     silence. Closing the device mid-wave is the same step as any other
+//     cut, and the tail means whatever the device still holds when it
+//     closes is silence too.
 //
 // Interleaved stereo float. One producer (the frame loop) and one consumer
 // (the audio callback); the caller serializes them (SDL_LockAudioDevice).
@@ -93,10 +94,22 @@ static inline void audio_mix_set_paused(wc_audio_mix_t* m, bool paused) {
 }
 
 // Stop for good: the device is about to close. Fades out from wherever the
-// gain is (a paused stage is already silent), and doesn't come back.
+// gain is (a paused stage is already silent), and doesn't come back. The
+// cart writes nothing more, so with less than the fade's worth in the ring
+// the fade would run dry part-way down and the last sample would drop in
+// AUDIO_DECAY_MS, a thump: a cart writing what each frame needs keeps about
+// AUDIO_PRIME_MS queued. Then the fade fits what's left and reaches zero
+// with its last sample, but is never quicker than the pause's.
 static inline void audio_mix_stop(wc_audio_mix_t* m) {
+    float pause_step = m->step;
     m->paused = true;
     m->step = m->stop_step;
+    if (m->playing && m->count > 0 && m->gain > 0.0f) {
+        // A hair steeper than exact, so float error can't leave the gain
+        // above zero when the ring runs out.
+        float fit = m->gain / (float)m->count * 1.001f;
+        if (fit > m->step) m->step = fit < pause_step ? fit : pause_step;
+    }
 }
 
 // A stopped stage has faded out and played its tail of silence: the device

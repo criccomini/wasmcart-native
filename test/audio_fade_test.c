@@ -88,14 +88,16 @@ static float run(bool fade) {
     return worst;
 }
 
-// The stop's own timing: a playing stage fades over about AUDIO_STOP_FADE_MS
-// and then plays its tail; a paused one, silent already, is done at once.
+// The stop's own timing: a playing stage with enough queued fades over about
+// AUDIO_STOP_FADE_MS and then plays its tail; a paused one, silent already,
+// is done at once.
 static int stop_timing(void) {
     const double buf_ms = 1024 * 1000.0 / RATE;
     int failures = 0;
     wc_audio_mix_t m;
     if (!audio_mix_init(&m, RATE, RATE / 2)) { fprintf(stderr, "FAIL: init\n"); exit(2); }
     play(&m, 30, true);
+    push_tone(&m, 1600);                  // more than the fade's worth queued (see stop_short)
     uint32_t fade_frames, pulled = stop(&m, &fade_frames);
     double fade_ms = fade_frames * 1000.0 / RATE, total_ms = pulled * 1000.0 / RATE;
     audio_mix_free(&m);
@@ -124,6 +126,64 @@ static int stop_timing(void) {
     return failures;
 }
 
+// A stop with less than the fade's worth queued. A cart that writes what
+// each frame needs keeps about AUDIO_PRIME_MS in the ring, less just after
+// the device has taken a buffer, and nothing more comes once the loop has
+// ended. Fading at the full fade's pace, the ring ran dry part-way down and
+// the last sample fell to zero in AUDIO_DECAY_MS, from wherever the gain had
+// got to: a thump. Now the fade fits what's queued and is at zero with its
+// last sample, and with only a few ms queued it takes AUDIO_FADE_MS, as a
+// pause does, so whatever is left when it runs dry is less.
+static int stop_short(void) {
+    int failures = 0;
+    const double queued_ms[] = {30.0, 20.0, 4.0};
+    const uint32_t fade_min = (uint32_t)(RATE * AUDIO_FADE_MS / 1000.0);
+    for (int c = 0; c < 3; c++) {
+        wc_audio_mix_t m;
+        if (!audio_mix_init(&m, RATE, RATE / 2)) { fprintf(stderr, "FAIL: init\n"); exit(2); }
+        phase = 0;
+        play(&m, 30, true);               // steady, AUDIO_PRIME_MS queued
+        uint32_t left = (uint32_t)(RATE * queued_ms[c] / 1000.0);
+        pull(&m, m.count - left);         // the device takes the rest
+        audio_mix_stop(&m);
+        float buf[2 * 2], prev = last, step = 0, after = 0;
+        uint32_t zero_at = 0;
+        for (uint32_t i = 0; i < left + 1024; i++) {
+            audio_mix_pull(&m, buf, 1);
+            if (fabsf(buf[0] - prev) > step) step = fabsf(buf[0] - prev);
+            prev = buf[0];
+            if (!zero_at && m.gain == 0.0f) zero_at = i + 1;
+            if (i >= left && fabsf(buf[0]) > after) after = fabsf(buf[0]);
+        }
+        audio_mix_free(&m);
+        char when[48];
+        if (zero_at) snprintf(when, sizeof when, "after %.1f ms", zero_at * 1000.0 / RATE);
+        else snprintf(when, sizeof when, "never in %.0f ms", (left + 1024) * 1000.0 / RATE);
+        if (queued_ms[c] >= AUDIO_FADE_MS) {
+            if (!zero_at || zero_at > left || zero_at + 4 < left) {
+                fprintf(stderr, "FAIL: %.0f ms queued: silent %s, not with the last sample\n",
+                        queued_ms[c], when);
+                failures++;
+            }
+            if (after > 0.0f) {
+                fprintf(stderr, "FAIL: %.0f ms queued: %.4f still playing once it ran out\n", queued_ms[c], after);
+                failures++;
+            }
+        } else if (!zero_at || zero_at < fade_min || zero_at > fade_min + 1) {
+            fprintf(stderr, "FAIL: %.0f ms queued: silent %s, not after the pause's %.0f ms\n",
+                    queued_ms[c], when, AUDIO_FADE_MS);
+            failures++;
+        }
+        if (step > 0.04f) {
+            fprintf(stderr, "FAIL: %.0f ms queued: a step of %.4f\n", queued_ms[c], step);
+            failures++;
+        }
+        if (!failures)
+            printf("stop with %.0f ms queued: silent %s\n", queued_ms[c], when);
+    }
+    return failures;
+}
+
 int main(void) {
     // A 440 Hz sine at this amplitude moves at most AMP * 2*pi*440/RATE per
     // sample (about 0.029); allow a little for the ramps on top.
@@ -140,6 +200,7 @@ int main(void) {
         failures++;
     }
     failures += stop_timing();
+    failures += stop_short();
     if (failures) return 1;
     printf("PASS: largest step %.4f with fades (hard cuts: %.4f)\n", faded, cut);
     return 0;
