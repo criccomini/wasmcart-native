@@ -28,6 +28,7 @@ extern "C" {
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include <time.h>
 #include <random>
 #include <thread>
 #include <chrono>
@@ -1047,18 +1048,37 @@ static void v8_proc_exit(const v8::FunctionCallbackInfo<v8::Value>& args) {
     g_isolate->ThrowException(v8::Exception::Error(v8str(msg)));
 }
 
+// WASI's clocks, in one place for everything that reads them:
+// clock_time_get, the absolute timeouts poll_oneoff waits for, and the
+// cart's worker threads (thread_worker_js.h), which are handed the origin.
+//
+// REALTIME (id 0) is the wall clock. The rest (MONOTONIC and the CPU-time
+// clocks, which a cart can't tell from it) count from when the cart's
+// imports were built, as the reference host's performance.now() does. They
+// used to count from the machine's boot. An Emscripten cart's clock() is a
+// 32-bit count of microseconds, and musl returns -1 for good once that
+// passes 2^31, 35.8 minutes in: on a machine up longer than that, Lua's
+// os.clock() never moved, and a Defold game that spaces its sounds out with
+// it (Planetoid) never played one.
+//
 // One clock for every thread: uv_hrtime is what a worker's
 // process.hrtime.bigint() reads, so a deadline computed on one thread means
 // the same instant on another (pthread_cond_timedwait depends on that).
-static uint64_t wasi_now_ns(void) {
-    return uv_hrtime();
+static uint64_t g_clock_origin_ns = 0;
+
+static uint64_t wasi_now_ns(uint32_t id) {
+    struct timespec wall;
+    if (id == 0 && timespec_get(&wall, TIME_UTC) == TIME_UTC)
+        return (uint64_t)wall.tv_sec * 1000000000ULL + wall.tv_nsec;
+    return uv_hrtime() - g_clock_origin_ns;
 }
 
 static void v8_clock_time_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
     // clock_time_get(id, precision, timestamp_ptr) -> errno
     refresh_memory(_current_host);
+    uint32_t id = args[0]->Uint32Value(ctx()).FromJust();
     uint32_t ts_ptr = args[2]->Uint32Value(ctx()).FromJust();
-    uint64_t nanos = wasi_now_ns();
+    uint64_t nanos = wasi_now_ns(id);
     if (!wc_cart_range_ok(_current_host, "clock_time_get", ts_ptr, 8)) return;
     memcpy(_current_host->memory + ts_ptr, &nanos, 8);
     args.GetReturnValue().Set(0);
@@ -1092,16 +1112,19 @@ static void v8_poll_oneoff(const v8::FunctionCallbackInfo<v8::Value>& args) {
     if (!wc_cart_range_ok(_current_host, "poll_oneoff", in_ptr, (uint64_t)nsubs * 48) ||
         !wc_cart_range_ok(_current_host, "poll_oneoff", out_ptr, (uint64_t)nsubs * 32) ||
         !wc_cart_range_ok(_current_host, "poll_oneoff", nevents_ptr, 4)) return;
-    uint64_t now = wasi_now_ns();
     bool have_clock = false;
     uint64_t wait_ns = 0;
     for (uint32_t i = 0; i < nsubs; i++) {
         const uint8_t* sub = _current_host->memory + in_ptr + i * 48;
         if (sub[8] != 0) continue;           // not a clock subscription
-        uint64_t timeout; uint16_t flags;
+        uint32_t clock_id; uint64_t timeout; uint16_t flags;
+        memcpy(&clock_id, sub + 16, 4);
         memcpy(&timeout, sub + 24, 8);
         memcpy(&flags, sub + 40, 2);
-        if (flags & 1) timeout = timeout > now ? timeout - now : 0;   // absolute
+        if (flags & 1) {                     // absolute, on the clock it names
+            uint64_t now = wasi_now_ns(clock_id);
+            timeout = timeout > now ? timeout - now : 0;
+        }
         if (!have_clock || timeout < wait_ns) wait_ns = timeout;
         have_clock = true;
     }
@@ -1133,6 +1156,7 @@ static void v8_random_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
 }
 
 static v8::Local<v8::Object> build_wasi_imports() {
+    g_clock_origin_ns = uv_hrtime();
     auto wasi = v8::Object::New(g_isolate);
     wasi->Set(ctx(), v8str("fd_write"), make_fn(v8_fd_write)).Check();
     wasi->Set(ctx(), v8str("fd_close"), make_fn(v8_fd_close)).Check();
@@ -1301,6 +1325,9 @@ static v8::Local<v8::Object> build_thread_cfg(wc_host_t* host, const char* wasc_
     } else {
         cfg->Set(ctx(), v8str("fileList"), v8::Null(g_isolate)).Check();
     }
+    // The origin of the cart's clocks (wasi_now_ns), so a thread reads the
+    // same MONOTONIC as the main thread.
+    cfg->Set(ctx(), v8str("clockOriginNs"), v8::BigInt::NewFromUnsigned(g_isolate, g_clock_origin_ns)).Check();
     return cfg;
 }
 

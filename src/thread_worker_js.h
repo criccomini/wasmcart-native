@@ -116,7 +116,14 @@ function loadAsset(pathPtr, pathLen, destPtr, maxSize) {
 // ---- WASI (preview1) as threaded wasi-libc uses it ----
 const EBADF = 8, EINVAL = 28, ENOTSUP = 58;
 const sleepCell = new Int32Array(new SharedArrayBuffer(4));
-const nowNs = () => process.hrtime.bigint();   // uv_hrtime: same clock as the main thread
+// The cart's clocks, read as the main thread reads them (cart_host.cpp,
+// wasi_now_ns): REALTIME (id 0) is the wall clock, the rest count from the
+// origin the main thread took when it built the cart's imports, on uv_hrtime,
+// which is what process.hrtime.bigint() reads. A deadline computed on one
+// thread then means the same instant on another.
+const clockNs = (id) => id === 0
+  ? BigInt(Math.round((performance.timeOrigin + performance.now()) * 1e6))
+  : process.hrtime.bigint() - cfg.clockOriginNs;
 class ProcExit extends Error {}
 
 function fdStat(fd, ptr) {
@@ -168,7 +175,7 @@ const wasi = {
   environ_get() { return 0; },
   args_sizes_get(countPtr, sizePtr) { const v = dv(); v.setUint32(countPtr, 0, true); v.setUint32(sizePtr, 0, true); return 0; },
   args_get() { return 0; },
-  clock_time_get(id, precision, resultPtr) { dv().setBigUint64(resultPtr, nowNs(), true); return 0; },
+  clock_time_get(id, precision, resultPtr) { dv().setBigUint64(resultPtr, clockNs(id), true); return 0; },
   clock_res_get(id, resultPtr) { dv().setBigUint64(resultPtr, 1000n, true); return 0; },
   random_get(ptr, len) {
     const tmp = Buffer.alloc(len);
@@ -182,13 +189,15 @@ const wasi = {
   poll_oneoff(inPtr, outPtr, nsubs, neventsPtr) {
     if (nsubs === 0) return EINVAL;
     const v = dv();
-    const now = nowNs();
     let wake = null;
     for (let i = 0; i < nsubs; i++) {
       const s = inPtr + i * 48;
       if (v.getUint8(s + 8) !== 0) continue;
       let t = v.getBigUint64(s + 24, true);
-      if (v.getUint16(s + 40, true) & 1) t = t > now ? t - now : 0n;   // abstime
+      if (v.getUint16(s + 40, true) & 1) {                 // abstime, on the clock it names
+        const now = clockNs(v.getUint32(s + 16, true));
+        t = t > now ? t - now : 0n;
+      }
       if (wake === null || t < wake) wake = t;
     }
     if (wake !== null && wake > 0n) Atomics.wait(sleepCell, 0, 0, Number(wake) / 1e6);
