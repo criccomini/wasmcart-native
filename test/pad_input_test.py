@@ -10,8 +10,10 @@ Checked twice:
 - plain: two pads in slots 0 and 1, every button the pad sends (Guide
   included, bit 14), triggers at full travel read 32767;
 - under Couchmix (COUCHMIX_PAD_SLOTS set) with a one-player cart: Guide is
-  the supervisor's and never reaches the cart, and both pads' input is
-  merged into slot 0.
+  the supervisor's and never reaches the cart, both pads' input is merged
+  into slot 0, and each pad's slot goes down the heartbeat fd as an L line;
+  then a pause and resume (SIGUSR1, SIGUSR2) with the buttons still held:
+  they stay masked until released, and a fresh press gets through.
 
 Linux only. Needs write access to /dev/uinput and python3-evdev; in a
 container, /dev/input has to be the host's so SDL sees the new nodes.
@@ -23,6 +25,7 @@ import io
 import json
 import os
 import re
+import signal
 import struct
 import subprocess
 import sys
@@ -147,12 +150,21 @@ class Runner:
         env.setdefault("SDL_AUDIODRIVER", "dummy")
         env["COUCHMIX_KEYBOARD_PAD"] = "0"
         env.pop("COUCHMIX_PAD_SLOTS", None)
+        self.hb, fds = None, ()
         if couchmix:
             env["COUCHMIX_PAD_SLOTS"] = ""
+            r, w = os.pipe()
+            env["COUCHMIX_HEARTBEAT_FD"] = str(w)
+            self.hb, fds = os.fdopen(r), (w,)
         if not os.path.exists("/run/udev/control"):
             env.setdefault("SDL_JOYSTICK_DISABLE_UDEV", "1")
         self.proc = subprocess.Popen([binary, cart], env=env, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.PIPE, text=True)
+                                     stderr=subprocess.PIPE, text=True, pass_fds=fds)
+        for fd in fds:
+            os.close(fd)
+        self.slots = []  # (slot, connected) from L lines
+        if self.hb:
+            threading.Thread(target=self._read_hb, daemon=True).start()
         self.last = None
         self.connected = 0
         self.tail = []
@@ -167,6 +179,12 @@ class Runner:
             if "controller" in line and "connected" in line and "disconnected" not in line:
                 self.connected += 1
             self.tail = (self.tail + [line.rstrip()])[-20:]
+
+    def _read_hb(self):
+        for line in self.hb:
+            parts = line.split()
+            if len(parts) == 5 and parts[0] == "L":
+                self.slots.append((int(parts[1]), parts[3] == "1"))
 
     def pads(self):
         if self.last is None:
@@ -238,6 +256,22 @@ def main():
                     check("slot 0: triggers and sticks merged", lt == 32767 and 12000 < rt < 21000
                           and lx > 32000 and ry < -32000, (lx, ly, rx, ry, lt, rt))
                     check("slots 1-3 empty", all(q[7] == 0 and q[0] == 0 for q in p[1:]), p[1:])
+                    check("L lines: slots 0 and 1 connected", sorted(r.slots) == [(0, True), (1, True)],
+                          r.slots)
+                    r.proc.send_signal(signal.SIGUSR1)
+                    time.sleep(0.5)
+                    r.proc.send_signal(signal.SIGUSR2)
+                    time.sleep(0.5)
+                    b0 = r.pads()[0][0]
+                    check("after a resume, buttons still held are masked", b0 == 0, hex(b0))
+                    a.write(e.EV_KEY, e.BTN_A, 0)
+                    a.syn()
+                    time.sleep(0.3)
+                    a.write(e.EV_KEY, e.BTN_A, 1)
+                    a.syn()
+                    time.sleep(0.5)
+                    b0 = r.pads()[0][0]
+                    check("a fresh press gets through; B, still held, doesn't", b0 == BTN_A, hex(b0))
             finally:
                 r.stop()
                 a.close()
