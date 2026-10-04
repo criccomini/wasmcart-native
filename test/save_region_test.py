@@ -65,7 +65,7 @@ def cart(save_ptr, save_size, moved_ptr=None, late_size=None):
     """A 2D cart, 8x8, one page of memory, whose save region is as given.
     With moved_ptr, wc_init rewrites save_ptr in its wc_info_t, and with
     late_size save_size too."""
-    info = struct.pack("<12I", 3, 8, 8, 2048, 0, 0, 0, 0, save_ptr, save_size, 0, 0)
+    info = struct.pack("<12I", 4, 8, 8, 2048, 0, 0, 0, 0, save_ptr, save_size, 0, 0)
     info += struct.pack("<I", 0)  # flags
     types = vec([b"\x60\x00\x01\x7f", b"\x60\x00\x00"])  # () -> i32, () -> ()
     funcs = vec([leb(0), leb(1), leb(1)])  # wc_get_info, wc_render, wc_init
@@ -88,7 +88,7 @@ def cart(save_ptr, save_size, moved_ptr=None, late_size=None):
             section(5, mem) + section(7, exports) + section(10, code) + section(11, data))
     z = io.BytesIO()
     with zipfile.ZipFile(z, "w") as f:
-        f.writestr("manifest.json", json.dumps({"name": "regiontest", "abi": 3, "entry": "cart.wasm"}))
+        f.writestr("manifest.json", json.dumps({"name": "regiontest", "abi": 4, "entry": "cart.wasm"}))
         f.writestr("cart.wasm", wasm)
     return z.getvalue()
 
