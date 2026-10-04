@@ -3,7 +3,9 @@
 
 Runs a cart that plays a steady 480 Hz sine through SDL's disk audio driver,
 which writes the device's stream to a file sample for sample, ends it the
-ways Couchmix ends a game, and looks at the last 200 ms of what was played:
+ways Couchmix ends a game, and looks at the last 200 ms of what was played.
+The cart writes by the clock, 150 ms ahead, so the runner has more than the
+fade's worth queued at any frame rate:
 
   quit        SIGTERM while it plays: Quit or Restart with the game in
               front, a shutdown, a stopped session
@@ -40,9 +42,15 @@ import zipfile
 RATE = 48000
 AMP = 0.25
 PERIOD = 100                  # samples: 480 Hz
-INFO, FB, CURSOR, SAVE, TABLE, RING, CAP = 1024, 2048, 4096, 4352, 4608, 8192, 4096
+INFO, FB, CURSOR, SAVE, TIME, TABLE, RING, CAP = 1024, 2048, 4096, 4352, 4480, 4608, 8192, 4096
 SAVE_SIZE = 16
-PER_RENDER = 900              # a little more than a 60 fps frame's worth, so it never runs dry
+# The cart writes by the clock, LEAD ahead of it, so the runner's ring holds
+# about that much whatever the frame rate: more than the stop's fade, which
+# fits what's queued when less is. A fixed amount a frame didn't: at the
+# 50 fps an offscreen sim container manages, 900 a frame ran the ring dry
+# over and over, and a quit then found too little queued for its fade.
+LEAD = RATE * 150 // 1000     # frames
+MAX_PER_RENDER = 3000         # under the cart's ring (CAP), for the first frames and a slow one
 WC_FLAG_AUDIO_F32 = 1
 
 TONE_STEP = AMP * 2 * math.pi / PERIOD   # the most the sine moves in one sample
@@ -95,7 +103,7 @@ def sine_cart():
     # version, width, height, fb, audio, audio_cap, audio_write, input, save,
     # save_size, time, host_info, flags, audio_sample_rate, pointer, keys,
     # gpu_api, wheel
-    info = struct.pack("<18I", 4, 8, 8, FB, RING, CAP, CURSOR, 0, SAVE, SAVE_SIZE, 0, 0,
+    info = struct.pack("<18I", 4, 8, 8, FB, RING, CAP, CURSOR, 0, SAVE, SAVE_SIZE, TIME, 0,
                        WC_FLAG_AUDIO_F32, RATE, 0, 0, 0, 0)
     table = struct.pack(f"<{PERIOD}f", *(AMP * math.sin(2 * math.pi * i / PERIOD)
                                          for i in range(PERIOD)))
@@ -105,16 +113,20 @@ def sine_cart():
     exports = vec([name("memory") + b"\x02" + leb(0), name("wc_get_info") + b"\x00" + leb(0),
                    name("wc_render") + b"\x00" + leb(1)])
     load_cursor = i32(CURSOR) + b"\x28\x02\x00"  # i32.load
-    # locals: 0 = n (i32), 1 = addr (i32), 2 = sample (f32)
+    # locals: 0 = n (i32), 1 = addr (i32), 2 = target (i32), 3 = sample (f32)
     render = (
-        b"\x02\x40\x03\x40"                                          # block, loop
-        + b"\x20\x00" + i32(PER_RENDER) + b"\x4f\x0d\x01"            # n >= PER_RENDER: out
+        i32(TIME) + b"\x2b\x03\x00"                                 # time_ms (f64.load)
+        + b"\x44" + struct.pack("<d", RATE / 1000) + b"\xa2\xab"     # * frames per ms, i32.trunc_f64_u
+        + i32(LEAD) + b"\x6a\x21\x02"                                # + LEAD, target =
+        + b"\x02\x40\x03\x40"                                        # block, loop
+        + b"\x20\x00" + i32(MAX_PER_RENDER) + b"\x4f\x0d\x01"        # n >= MAX_PER_RENDER: out
+        + load_cursor + b"\x20\x02\x4f\x0d\x01"                       # cursor >= target: out
         + i32(RING) + load_cursor + i32(CAP) + b"\x70"               # RING + cursor % CAP
         + i32(8) + b"\x6c\x6a\x21\x01"                               # * 8, +, addr =
         + i32(TABLE) + load_cursor + i32(PERIOD) + b"\x70"           # TABLE + cursor % PERIOD
-        + i32(4) + b"\x6c\x6a\x2a\x02\x00\x21\x02"                   # * 4, +, f32.load, sample =
-        + b"\x20\x01\x20\x02\x38\x02\x00"                            # left
-        + b"\x20\x01\x20\x02\x38\x02\x04"                            # right
+        + i32(4) + b"\x6c\x6a\x2a\x02\x00\x21\x03"                   # * 4, +, f32.load, sample =
+        + b"\x20\x01\x20\x03\x38\x02\x00"                            # left
+        + b"\x20\x01\x20\x03\x38\x02\x04"                            # right
         + i32(CURSOR) + load_cursor + i32(1) + b"\x6a\x36\x02\x00"   # cursor++
         + b"\x20\x00" + i32(1) + b"\x6a\x21\x00"                     # n++
         + b"\x0c\x00\x0b\x0b"                                        # br loop, end, end
@@ -125,7 +137,7 @@ def sine_cart():
         b = locals_ + code + b"\x0b"
         return leb(len(b)) + b
 
-    code = vec([body(b"\x00", i32(INFO)), body(b"\x02\x02\x7f\x01\x7d", render)])
+    code = vec([body(b"\x00", i32(INFO)), body(b"\x02\x03\x7f\x01\x7d", render)])
     data = vec([b"\x00" + i32(INFO) + b"\x0b" + leb(len(info)) + info,
                 b"\x00" + i32(TABLE) + b"\x0b" + leb(len(table)) + table])
     wasm = (b"\x00asm\x01\x00\x00\x00" + section(1, types) + section(3, funcs) +
