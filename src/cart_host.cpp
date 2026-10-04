@@ -26,6 +26,7 @@ extern "C" {
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #include <random>
 #include "wc_log.h"
 extern "C" FILE* _wc_log_file = NULL;
@@ -776,21 +777,40 @@ static void v8_proc_exit(const v8::FunctionCallbackInfo<v8::Value>& args) {
     // Do nothing — cart tried to exit
 }
 
-static void v8_clock_time_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    // clock_time_get(id, precision, timestamp_ptr) -> errno
-    refresh_memory(_current_host);
-    uint32_t ts_ptr = args[2]->Uint32Value(ctx()).FromJust();
-    uint64_t nanos;
+static uint64_t monotonic_ns(void) {
 #ifdef _WIN32
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    nanos = (uint64_t)((double)count.QuadPart / freq.QuadPart * 1000000000.0);
+    return (uint64_t)((double)count.QuadPart / freq.QuadPart * 1000000000.0);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    nanos = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 #endif
+}
+
+// WASI's clocks. REALTIME (id 0) is the wall clock. The rest (MONOTONIC and
+// the CPU-time clocks, which a cart can't tell from it) count from when the
+// cart's imports were built, as the reference host's performance.now() does.
+// They used to count from the machine's boot. An Emscripten cart's clock()
+// is a 32-bit count of microseconds, and musl returns -1 for good once that
+// passes 2^31, 35.8 minutes in: on a machine up longer than that, Lua's
+// os.clock() never moved, and a Defold game that spaces its sounds out with
+// it (Planetoid) never played one.
+static uint64_t g_clock_origin_ns = 0;
+
+static void v8_clock_time_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    // clock_time_get(id, precision, timestamp_ptr) -> errno
+    refresh_memory(_current_host);
+    uint32_t id = args[0]->Uint32Value(ctx()).FromJust();
+    uint32_t ts_ptr = args[2]->Uint32Value(ctx()).FromJust();
+    uint64_t nanos;
+    struct timespec wall;
+    if (id == 0 && timespec_get(&wall, TIME_UTC) == TIME_UTC)
+        nanos = (uint64_t)wall.tv_sec * 1000000000ULL + wall.tv_nsec;
+    else
+        nanos = monotonic_ns() - g_clock_origin_ns;
     *(uint64_t*)(_current_host->memory + ts_ptr) = nanos;
     args.GetReturnValue().Set(0);
 }
@@ -805,6 +825,7 @@ static void v8_random_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
 }
 
 static v8::Local<v8::Object> build_wasi_imports() {
+    g_clock_origin_ns = monotonic_ns();
     auto wasi = v8::Object::New(g_isolate);
     wasi->Set(ctx(), v8str("fd_write"), make_fn(v8_fd_write)).Check();
     wasi->Set(ctx(), v8str("fd_close"), make_fn(v8_fd_close)).Check();
