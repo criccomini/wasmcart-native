@@ -234,6 +234,7 @@ node ../wasmcart/test/wsserver.mjs --port 8796 &   # from the wasmcart repo
 python3 test/rumble_sdl_test.py build/wasmcart-run ../wasmcart/test/fixtures/rumble.wasc   # reaches a real pad (Linux, uinput)
 ./text_test  test/textauto.wasc 5452 5456 5460 5472
 python3 test/import_bounds_test.py build/wasmcart-run   # a bad pointer to an import traps the cart (GL cases need a compositor)
+python3 test/gl_no_context_test.py build/wasmcart-run   # with no display, a GL cart is refused at load, not crashed
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 sh test/wayland_egl_guard_test.sh   # Wayland EGL stays on SDL's surface, torn down first
 sh test/kmsdrm_gl_guard_test.sh     # KMSDRM GL follows SDL's ordering rules
