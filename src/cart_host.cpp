@@ -214,11 +214,10 @@ static int check_abi_version(wc_host_t* host) {
 // pages turned that into a crash rather than corruption, but a host
 // shouldn't depend on it. Each access checks its region first and skips if
 // it doesn't fit, saying so once. (Memory only grows, so a region that fits
-// keeps fitting.) The check is per access rather than at load because v1
-// and v2 carts don't fill in the v3 fields, and a load-time check would
-// refuse carts that never use them.
+// keeps fitting.) The check is per access rather than at load, so a cart
+// is only held to the regions it actually uses.
 enum { OOB_INFO, OOB_HOST_INFO, OOB_PADS, OOB_KEYS, OOB_POINTERS, OOB_TIME, OOB_FB,
-       OOB_AUDIO_CURSOR, OOB_AUDIO_RING };
+       OOB_AUDIO_CURSOR, OOB_AUDIO_RING, OOB_WHEEL };
 
 static bool region_ok(wc_host_t* host, uint32_t ptr, uint64_t len, int which, const char* what) {
     if ((uint64_t)ptr + len <= host->memory_size) return true;
@@ -233,7 +232,8 @@ static bool region_ok(wc_host_t* host, uint32_t ptr, uint64_t len, int which, co
 static void parse_cart_info(wc_host_t* host, uint32_t info_ptr) {
     uint8_t* mem = host->memory;
     wc_cart_info_t* info = &host->info;
-    if (!region_ok(host, info_ptr, WC_INFO_GPU_API + 4, OOB_INFO, "wc_info_t")) return;
+    // Through wheel_ptr, the last field read below.
+    if (!region_ok(host, info_ptr, WC_INFO_WHEEL_PTR + 4, OOB_INFO, "wc_info_t")) return;
 
     info->version        = wc_read_u32(mem, info_ptr + WC_INFO_VERSION);
     info->width          = wc_read_u32(mem, info_ptr + WC_INFO_WIDTH);
@@ -1687,11 +1687,17 @@ extern "C" void wc_host_pump(wc_host_t* host) {
     pump_node(host);
 }
 
+// wc_wheel_t is a cart-chosen region like the others, checked the same way.
+static bool wheel_ok(wc_host_t* host) {
+    return host->memory && host->info.wheel_ptr &&
+           region_ok(host, host->info.wheel_ptr, WC_WHEEL_SIZE, OOB_WHEEL, "wc_wheel_t");
+}
+
 // Write the frame's accumulated wheel delta where the cart reads it. Separate
 // from wc_host_add_wheel so events can arrive at any time and the cart still
 // sees a single coherent value for the frame.
 static void deliver_wheel(wc_host_t* host) {
-    if (!host->memory || !host->info.wheel_ptr) return;
+    if (!wheel_ok(host)) return;
     wc_write_u32(host->memory, host->info.wheel_ptr + WC_WHEEL_DX, (uint32_t) host->wheel_dx);
     wc_write_u32(host->memory, host->info.wheel_ptr + WC_WHEEL_DY, (uint32_t) host->wheel_dy);
 }
@@ -1726,7 +1732,7 @@ extern "C" void wc_host_run_frame(wc_host_t* host) {
 
     // Clear AFTER the frame, not before: the cart has now read the total, and
     // leaving it set would scroll forever off a single flick.
-    if (host->memory && host->info.wheel_ptr) {
+    if (wheel_ok(host)) {
         wc_write_u32(host->memory, host->info.wheel_ptr + WC_WHEEL_DX, 0);
         wc_write_u32(host->memory, host->info.wheel_ptr + WC_WHEEL_DY, 0);
     }
