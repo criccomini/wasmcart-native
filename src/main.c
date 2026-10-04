@@ -134,12 +134,46 @@ static void close_controller(SDL_JoystickID id) {
 // ─── Rumble ────────────────────────────────────────────────────────────────
 //
 // The cart's wc_pad_rumble imports land here. The host library has already
-// clamped the magnitudes to 0..1 and capped the duration, so this only maps
-// them onto SDL's 0..65535 motors. Without a backend the imports are silent
-// no-ops and wc_pad_has_rumble reports 0 for every pad.
+// clamped the magnitudes to 0..1 and capped the duration. Without a backend
+// the imports are silent no-ops and wc_pad_has_rumble reports 0 for every pad.
+//
+// A cart holds a rumble by asking again every frame. The pad gets the
+// strength when it changes, the same strength again every RUMBLE_REFRESH_MS
+// while the cart keeps asking, and a stop when the cart's last request runs
+// out (rumble_tick, once a frame) or the cart stops it. The refresh is for
+// Switch pads: hid-nintendo feeds a pad its rumble for only a few hundred ms
+// after each effect it's handed, and the pad goes quiet without it. SDL's own
+// refresh comes every 2 s.
+
+#define RUMBLE_REFRESH_MS 500
+
+typedef struct {
+    SDL_GameController* gc;  // the pad this rumble is on; NULL when off
+    Uint16 low, high;        // the strength the cart asked for
+    Uint16 sent_low, sent_high;  // what SDL was last given for this pad
+    Uint64 until;            // when the cart's last request runs out
+    Uint64 sent;             // when SDL was last given it
+} rumble_state_t;
+
+static rumble_state_t rumble_state[MAX_CONTROLLERS];
 
 static SDL_GameController* rumble_pad(uint32_t pad_id) {
     return pad_id < MAX_CONTROLLERS ? controllers[pad_id] : NULL;
+}
+
+// SDL passes a call on to the pad only when its strengths differ from the
+// previous call's; a repeat just moves SDL's end time. So a repeat gets the
+// low bit of the high-frequency motor flipped, a 1/65535 step no motor shows.
+// SDL's own end is a backstop two refreshes past the cart's: rumble_tick
+// ends the rumble on time.
+static void rumble_send(rumble_state_t* r, Uint64 now) {
+    Uint16 high = r->high;
+    if (r->low == r->sent_low && high == r->sent_high) high ^= 1;
+    Uint64 left = r->until - now + 2 * RUMBLE_REFRESH_MS;
+    SDL_GameControllerRumble(r->gc, r->low, high, left > 0xFFFF ? 0xFFFF : (Uint32)left);
+    r->sent_low = r->low;
+    r->sent_high = high;
+    r->sent = now;
 }
 
 static int rumble_has(void* user, uint32_t pad_id) {
@@ -153,18 +187,50 @@ static int rumble_has(void* user, uint32_t pad_id) {
 #endif
 }
 
-static void rumble_play(void* user, uint32_t pad_id, float low, float high,
-                        uint32_t duration_ms) {
-    (void)user;
-    SDL_GameController* gc = rumble_pad(pad_id);
-    if (gc) SDL_GameControllerRumble(gc, (Uint16)(low * 65535.0f + 0.5f),
-                                     (Uint16)(high * 65535.0f + 0.5f), duration_ms);
-}
-
 static void rumble_stop(void* user, uint32_t pad_id) {
     (void)user;
     SDL_GameController* gc = rumble_pad(pad_id);
     if (gc) SDL_GameControllerRumble(gc, 0, 0, 0);
+    if (pad_id < MAX_CONTROLLERS) {
+        rumble_state_t* r = &rumble_state[pad_id];
+        r->gc = NULL;
+        r->sent_low = r->sent_high = 0;
+    }
+}
+
+static void rumble_play(void* user, uint32_t pad_id, float low, float high,
+                        uint32_t duration_ms) {
+    (void)user;
+    SDL_GameController* gc = rumble_pad(pad_id);
+    if (!gc) return;
+    Uint16 lo = (Uint16)(low * 65535.0f + 0.5f);
+    Uint16 hi = (Uint16)(high * 65535.0f + 0.5f);
+    if (!lo && !hi) {
+        rumble_stop(NULL, pad_id);
+        return;
+    }
+    rumble_state_t* r = &rumble_state[pad_id];
+    Uint64 now = SDL_GetTicks64();
+    r->until = now + duration_ms;  // the latest request decides, as in SDL
+    if (r->gc == gc && r->low == lo && r->high == hi) return;  // rumble_tick refreshes it
+    if (r->gc != gc) r->sent_low = r->sent_high = 0;  // another pad: SDL has it off
+    r->gc = gc;
+    r->low = lo;
+    r->high = hi;
+    rumble_send(r, now);
+}
+
+// Once a frame, after the cart's: end the rumbles whose time is up, and
+// refresh the rest when they're due.
+static void rumble_tick(void) {
+    Uint64 now = SDL_GetTicks64();
+    for (uint32_t i = 0; i < MAX_CONTROLLERS; i++) {
+        rumble_state_t* r = &rumble_state[i];
+        if (!r->gc) continue;
+        if (r->gc != controllers[i]) r->gc = NULL;  // the pad went away
+        else if (now >= r->until) rumble_stop(NULL, i);
+        else if (now - r->sent >= RUMBLE_REFRESH_MS) rumble_send(r, now);
+    }
 }
 
 static void rumble_stop_all(void) {
@@ -1379,6 +1445,7 @@ static int run_player(int argc, char* argv[]) {
 
         // Run frame
         wc_host_run_frame(host);
+        rumble_tick();
 
         // After first frame: cart may have resized (Godot reads host_info and reconfigures)
         // Resize redirect FBO to match actual render dimensions
