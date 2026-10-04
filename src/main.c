@@ -886,7 +886,26 @@ static void set_aside_sav(const char* sav_path) {
     }
 }
 
+static int run_player(int argc, char* argv[]);
+
+// The player's own teardown (the save, audio, GL, SDL_Quit) is done by the
+// time run_player returns. What exit() does after that is node's: static
+// destructors dispose the isolate and shut the platform down, which joins
+// the platform's delayed-task thread. That thread runs a libuv loop until
+// its last timer is closed, and the shutdown races with V8 posting one:
+// disposing the heap hands its pages to V8's memory pool, whose release
+// task, on a worker thread, posts itself again 8 s out. When that lands
+// after the platform has closed the other timers, the join, and so the
+// exit, waits the 8 s, and a supervisor that gives up first sees a game
+// that wouldn't quit. Nothing that teardown does outlives the process, so
+// it is skipped.
 int main(int argc, char* argv[]) {
+    int code = run_player(argc, argv);
+    fflush(NULL);
+    _Exit(code);
+}
+
+static int run_player(int argc, char* argv[]) {
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
