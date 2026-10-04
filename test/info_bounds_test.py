@@ -3,7 +3,7 @@
 
 Builds tiny carts byte by byte whose wc_info_t names regions past the end of
 their one page of memory (pads, framebuffer, time, the audio ring and its
-cursor, and wc_info_t itself) and runs wasmcart-run on each. The host must
+cursor, the wheel, and wc_info_t itself) and runs wasmcart-run on each. The host must
 skip those accesses and say so, not crash.
 
 Run:  python3 test/info_bounds_test.py build/wasmcart-run
@@ -57,10 +57,12 @@ def name(s):
     return leb(len(s)) + s.encode()
 
 
-def cart(info_at=INFO, fb=2048, audio=0, audio_cap=0, audio_write=0, inp=0, time_=0, extra=()):
+def cart(info_at=INFO, fb=2048, audio=0, audio_cap=0, audio_write=0, inp=0, time_=0, wheel=0,
+         extra=()):
     """One page of memory; wc_get_info returns info_at. extra: (addr, bytes) data."""
-    info = struct.pack("<12I", 3, 8, 8, fb, audio, audio_cap, audio_write, inp, 0, 0, time_, 0)
-    info += struct.pack("<I", 0)
+    # ABI v4 wc_info_t: 18 u32s, wheel_ptr last (offset 68).
+    info = struct.pack("<12I", 4, 8, 8, fb, audio, audio_cap, audio_write, inp, 0, 0, time_, 0)
+    info += struct.pack("<6I", 0, 0, 0, 0, 0, wheel)
     types = vec([b"\x60\x00\x01\x7f", b"\x60\x00\x00"])
     funcs = vec([leb(0), leb(1)])
     mem = vec([b"\x00" + leb(1)])
@@ -78,19 +80,22 @@ def cart(info_at=INFO, fb=2048, audio=0, audio_cap=0, audio_write=0, inp=0, time
             section(5, mem) + section(7, exports) + section(10, code) + section(11, data))
     z = io.BytesIO()
     with zipfile.ZipFile(z, "w") as f:
-        f.writestr("manifest.json", json.dumps({"name": "boundstest", "abi": 3}))
+        f.writestr("manifest.json", json.dumps({"name": "boundstest", "abi": 4}))
         f.writestr("cart.wasm", wasm)
     return z.getvalue()
 
 
 CASES = [
-    ("pads past the end", dict(inp=PAGE - 16), "pad array"),
+    ("pads past the end", dict(inp=PAGE - 64), "pad array"),  # four 20-byte pads need 80
     ("framebuffer past the end", dict(fb=PAGE - 64), "framebuffer"),
     ("time past the end", dict(time_=PAGE - 8), "wc_time_t"),
     ("audio ring past the end", dict(audio=PAGE - 64, audio_cap=1024, audio_write=4096), "audio ring"),
     ("audio cursor past the ring", dict(audio=8192, audio_cap=256, audio_write=4096,
                                         extra=[(4096, struct.pack("<I", 999999))]), None),
+    ("wheel past the end", dict(wheel=PAGE - 4), "wc_wheel_t"),
     ("wc_info_t past the end", dict(info_at=PAGE - 8), "wc_info_t"),
+    # Every field but wheel_ptr fits: reading wheel_ptr would leave memory.
+    ("wc_info_t's last field past the end", dict(info_at=PAGE - 68), "wc_info_t"),
 ]
 
 

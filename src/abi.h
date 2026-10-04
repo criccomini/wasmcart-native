@@ -37,6 +37,7 @@
 // trackpad reports fractions of it, which is why the unit is not "clicks".
 #define WC_WHEEL_DX            0
 #define WC_WHEEL_DY            4
+#define WC_WHEEL_SIZE          8
 // WC_WHEEL_DELTA lives in the public header: embedders converting from a
 // platform's notch counts need it, and one definition avoids the two drifting.
 
