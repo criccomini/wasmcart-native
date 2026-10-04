@@ -9,7 +9,7 @@
 //
 // Usage:
 //   ./lifecycle_test ../wasmcart/test/fixtures/lifecycle.wasc
-//       5484 5488 5492 5496 5500 5504 ../wasmcart/test/fixtures/hello.wasc
+//       5500 5504 5508 5512 5516 5520 ../wasmcart/test/fixtures/hello.wasc
 // The offsets are the fixture's debug fields (suspend, resume, focus_lost,
 // focus_gained, frames, sequence); read them with wasmcart's readDebugState().
 

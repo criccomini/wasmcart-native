@@ -251,7 +251,7 @@ python3 test/info_bounds_test.py build/wasmcart-run   # wc_info_t regions outsid
 python3 test/audio_flow_test.py build/wasmcart-run [<cart with a steady tone>]   # audio keeps going past the first ring
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
-./lifecycle_test ../wasmcart/test/fixtures/lifecycle.wasc 5484 5488 5492 5496 5500 5504 \
+./lifecycle_test ../wasmcart/test/fixtures/lifecycle.wasc 5500 5504 5508 5512 5516 5520 \
     ../wasmcart/test/fixtures/hello.wasc   # suspend/resume/focus order, no render while suspended
 
 cc -Iinclude -Isrc -o clock_test test/clock_test.c && ./clock_test   # no V8 or SDL needed
