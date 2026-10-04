@@ -170,7 +170,7 @@ class Cart:
         return i32(value) + b"\x46\x04\x40" + self.log(text) + b"\x0b"
 
     def wasm(self):
-        info = struct.pack("<12I", 3, 8, 8, 0 if self.gl else 2048, 0, 0, 0, 0, 0, 0, 0, 0)
+        info = struct.pack("<12I", 4, 8, 8, 0 if self.gl else 2048, 0, 0, 0, 0, 0, 0, 0, 0)
         info += struct.pack("<I", 0)
         types = []
 
@@ -202,7 +202,7 @@ class Cart:
     def wasc(self):
         z = io.BytesIO()
         with zipfile.ZipFile(z, "w") as f:
-            f.writestr("manifest.json", json.dumps({"name": "importtest", "abi": 3}))
+            f.writestr("manifest.json", json.dumps({"name": "importtest", "abi": 4}))
             f.writestr("cart.wasm", self.wasm())
             f.writestr("assets/a.bin", bytes(range(64)))
         return z.getvalue()

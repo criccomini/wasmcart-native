@@ -75,7 +75,7 @@ def cart(addr):
     opened, refused = b"peer open: ok", b"peer open: refused"
     # version, width, height, fb, audio, audio_cap, audio_write, input,
     # save, save_size, time, host_info, flags
-    info = struct.pack("<13I", 3, 8, 8, FB, 0, 0, 0, 0, 0, 0, 0, 0, WC_FLAG_NET_PEER)
+    info = struct.pack("<13I", 4, 8, 8, FB, 0, 0, 0, 0, 0, 0, 0, 0, WC_FLAG_NET_PEER)
     types = vec([b"\x60\x02\x7f\x7f\x01\x7f",   # 0: wc_peer_open(ptr, len) -> id
                  b"\x60\x02\x7f\x7f\x00",       # 1: wc_log(ptr, len)
                  b"\x60\x00\x01\x7f",           # 2: wc_get_info() -> ptr
@@ -109,7 +109,7 @@ def cart(addr):
     z = io.BytesIO()
     with zipfile.ZipFile(z, "w") as f:
         f.writestr("manifest.json", json.dumps(
-            {"name": "nonettest", "abi": 3, "net": {"domains": ["127.0.0.1"]}}))
+            {"name": "nonettest", "abi": 4, "net": {"domains": ["127.0.0.1"]}}))
         f.writestr("cart.wasm", wasm)
     return z.getvalue()
 

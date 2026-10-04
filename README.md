@@ -237,7 +237,7 @@ python3 test/import_bounds_test.py build/wasmcart-run   # a bad pointer to an im
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 sh test/wayland_egl_guard_test.sh   # Wayland EGL stays on SDL's surface, torn down first
 sh test/kmsdrm_gl_guard_test.sh     # KMSDRM GL follows SDL's ordering rules
-cc -Iinclude -o pad_layout_test test/pad_layout_test.c && ./pad_layout_test   # wc_pad_t is the ABI's 16 bytes
+cc -Iinclude -o pad_layout_test test/pad_layout_test.c && ./pad_layout_test   # wc_pad_t is the ABI's 20 bytes
 sh test/controller_db_platform_test.sh build/wasmcart-run test/snake.wasc   # this platform's mappings only
 python3 test/pad_hotplug_test.py build/wasmcart-run test/snake.wasc   # one slot per pad (Linux, uinput)
 cc -Isrc -o save_file_test test/save_file_test.c && ./save_file_test   # a save is replaced whole or not at all
@@ -247,7 +247,7 @@ python3 test/abi_gate_test.py build/wasmcart-run [<v3 cart> ../wasmcart/test/fix
 python3 test/save_region_test.py build/wasmcart-run   # save region checked; a wrong-size save kept aside
 cc -Isrc -o peer_addr_test test/peer_addr_test.c && ./peer_addr_test   # the allowlist checks the host really reached
 python3 test/info_bounds_test.py build/wasmcart-run   # wc_info_t regions outside memory are skipped, not crashed on
-python3 test/audio_flow_test.py build/wasmcart-run <cart with a steady tone>   # audio keeps going past the first ring
+python3 test/audio_flow_test.py build/wasmcart-run [<cart with a steady tone>]   # audio keeps going past the first ring
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 ./lifecycle_test ../wasmcart/test/fixtures/lifecycle.wasc 5484 5488 5492 5496 5500 5504 \
