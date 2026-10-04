@@ -294,6 +294,7 @@ sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 python3 test/gl_no_context_test.py build/wasmcart-run   # with no display, a GL cart is refused at load, not crashed
 sh test/wayland_egl_guard_test.sh   # Wayland EGL stays on SDL's surface, torn down first
 sh test/kmsdrm_gl_guard_test.sh     # KMSDRM GL follows SDL's ordering rules
+cc -Iinclude -o pad_layout_test test/pad_layout_test.c && ./pad_layout_test   # wc_pad_t is the ABI's 20 bytes
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 sh test/wgpu_test.sh          # WebGPU carts (needs a build with WebGPU support)
