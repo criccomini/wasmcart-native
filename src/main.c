@@ -282,7 +282,8 @@ static void on_quit_signal(int sig) { (void)sig; g_should_quit = 1; }
 //   its slot and gets it back. Every slot change goes down the heartbeat fd
 //   as "L <slot> <monotonic_us> <0|1> <key>". A cart that declares one
 //   player (or none) gets every pad's input on slot 0, so a pad that went to
-//   sleep can't lock everyone else out.
+//   sleep can't lock everyone else out. The Home button (ABI v4's
+//   WC_BUTTON_GUIDE) is the supervisor's, and never reaches the cart.
 // - Saves are reported too: "W 0 <monotonic_us>" once a save is on disk,
 //   "E 0 <monotonic_us> <reason>" when one couldn't be written
 //   (write_failed) or a save that couldn't be loaded was set aside
@@ -1313,7 +1314,11 @@ int main(int argc, char* argv[]) {
             guard_mask[i] &= pads[i].buttons;  // released buttons leave the mask
             pads[i].buttons &= ~guard_mask[i];
         }
-        if (g_couchmix_pads && manifest->players <= 1) merge_into_slot0(pads);
+        if (g_couchmix_pads) {
+            // Home opens Couchmix's menu, so it isn't the cart's button too.
+            for (int i = 0; i < WC_MAX_PADS; i++) pads[i].buttons &= ~(uint32_t)WC_BUTTON_GUIDE;
+            if (manifest->players <= 1) merge_into_slot0(pads);
+        }
         wc_host_set_pads(host, pads);
 
         // Time: delta clamped to WC_MAX_DELTA_MS, time_ms kept consistent

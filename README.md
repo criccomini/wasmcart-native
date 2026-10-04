@@ -240,6 +240,7 @@ sh test/kmsdrm_gl_guard_test.sh     # KMSDRM GL follows SDL's ordering rules
 cc -Iinclude -o pad_layout_test test/pad_layout_test.c && ./pad_layout_test   # wc_pad_t is the ABI's 20 bytes
 sh test/controller_db_platform_test.sh build/wasmcart-run test/snake.wasc   # this platform's mappings only
 python3 test/pad_hotplug_test.py build/wasmcart-run test/snake.wasc   # one slot per pad (Linux, uinput)
+python3 test/pad_input_test.py build/wasmcart-run   # a real pad's input at v4's offsets; Guide withheld under Couchmix (Linux, uinput)
 cc -Isrc -o save_file_test test/save_file_test.c && ./save_file_test   # a save is replaced whole or not at all
 cc -Isrc -o save_writer_test test/save_writer_test.c $(pkg-config --cflags --libs sdl2) && ./save_writer_test
 python3 test/save_test.py build/wasmcart-run ../wasmcart/test/fixtures   # --save, --save-every, kills
