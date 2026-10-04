@@ -225,6 +225,7 @@ node ../wasmcart/test/wsserver.mjs --port 8796 &   # from the wasmcart repo
 ./rumble_test ../wasmcart/test/fixtures/rumble.wasc
 ./text_test  test/textauto.wasc 5452 5456 5460 5472
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
+python3 test/abi_gate_test.py build/wasmcart-run [<v3 cart> ../wasmcart/test/fixtures/hello.wasc]   # v1-v3 refused, before wc_init when it can be
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 ```

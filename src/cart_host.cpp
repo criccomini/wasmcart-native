@@ -1055,6 +1055,12 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
             }
         }
 
+        // Most carts fill wc_info_t in statically, so the version is often
+        // there already. When it is and it's wrong, refuse now: an old cart's
+        // wc_init never runs (a big engine spends seconds in it) and its save
+        // is never loaded. A version still 0 is checked after wc_init below.
+        if (host->info.version != 0 && check_abi_version(host) != 0) return -1;
+
         write_host_info(host, opts);
 
         if (opts && opts->save_data && host->info.save_ptr && opts->save_data_size > 0) {
