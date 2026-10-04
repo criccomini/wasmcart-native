@@ -226,7 +226,7 @@ node ../wasmcart/test/wsserver.mjs --port 8796 &   # from the wasmcart repo
 ./text_test  test/textauto.wasc 5452 5456 5460 5472
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 python3 test/info_bounds_test.py build/wasmcart-run   # wc_info_t regions outside memory are skipped, not crashed on
-python3 test/audio_flow_test.py build/wasmcart-run <cart with a steady tone>   # audio keeps going past the first ring
+python3 test/audio_flow_test.py build/wasmcart-run [<cart with a steady tone>]   # audio keeps going past the first ring
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 ```
