@@ -226,6 +226,7 @@ node ../wasmcart/test/wsserver.mjs --port 8796 &   # from the wasmcart repo
 ./text_test  test/textauto.wasc 5452 5456 5460 5472
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
+python3 test/cursor_test.py build/wasmcart-run   # no pointer over the picture (labwc, wlrctl, grim, wtype)
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 ```
 
