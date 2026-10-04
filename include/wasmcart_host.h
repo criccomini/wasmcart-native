@@ -20,7 +20,7 @@ extern "C" {
 #define WC_MIN_ABI_VERSION 4
 
 #define WC_MAX_PADS        4
-#define WC_PAD_SIZE        16
+#define WC_PAD_SIZE        20
 #define WC_TIME_SIZE       20
 #define WC_MAX_POINTERS    10
 #define WC_KEYS_STATE_SIZE 32
