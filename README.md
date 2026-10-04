@@ -307,6 +307,7 @@ python3 test/pad_hotplug_test.py build/wasmcart-run test/snake.wasc   # one slot
 cc -Isrc -o save_file_test test/save_file_test.c && ./save_file_test   # a save is replaced whole or not at all
 cc -Isrc -o save_writer_test test/save_writer_test.c $(pkg-config --cflags --libs sdl2) && ./save_writer_test
 python3 test/save_test.py build/wasmcart-run ../wasmcart/test/fixtures   # --save, --save-every, kills
+python3 test/abi_gate_test.py build/wasmcart-run [<v3 cart> ../wasmcart/test/fixtures/hello.wasc]   # v1-v3 refused, before wc_init when it can be
 python3 test/save_region_test.py build/wasmcart-run   # save region checked; a wrong-size save kept aside
 cc -Isrc -o peer_addr_test test/peer_addr_test.c && ./peer_addr_test   # the allowlist checks the host really reached
 python3 test/info_bounds_test.py build/wasmcart-run   # wc_info_t regions outside memory are skipped, not crashed on
