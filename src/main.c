@@ -850,6 +850,17 @@ int main(int argc, char* argv[]) {
     const wc_manifest_t* manifest = wc_host_get_manifest(host);
     bool is_gl = wc_host_uses_gl(host);
 
+    // A GL cart cannot run without a GL context, and its first GL call through
+    // an unresolved proc is a NULL jump. Say why instead of segfaulting. On
+    // KMSDRM the context is SDL's, not EGL's.
+    if (is_gl && !egl_is_initialized() && !kms_ctx) {
+        fprintf(stderr, "wasmcart: %s is a GL cart but EGL failed to initialize "
+            "(no usable display?); 2D carts still run without it\n", cart_path);
+        wc_host_destroy(host);
+        free(sav_data);
+        return 1;
+    }
+
     uint32_t cart_w = info->width;
     uint32_t cart_h = info->height;
     uint32_t win_w, win_h;
