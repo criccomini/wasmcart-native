@@ -28,6 +28,17 @@
 #define WC_INFO_POINTER_PTR    56   // u32 index 14
 #define WC_INFO_KEYS_PTR       60   // u32 index 15
 #define WC_INFO_GPU_API        64   // u32 index 16 — 0=2D, 1=WebGL2/GLES3, 2=WebGPU, 3=Vulkan
+#define WC_INFO_WHEEL_PTR      68   // u32 index 17 — wc_wheel_t, 0 = not used (v3.1)
+
+// Scroll wheel (ABI v3.1): i32 dx, i32 dy, in 1/120 notch units, right and UP
+// positive. The host accumulates events, writes the frame total before
+// wc_render and zeroes it after, so the cart reads a per-frame delta and
+// never clears anything. One notch of a detented wheel is WC_WHEEL_DELTA; a
+// trackpad reports fractions of it, which is why the unit is not "clicks".
+#define WC_WHEEL_DX            0
+#define WC_WHEEL_DY            4
+// WC_WHEEL_DELTA lives in the public header: embedders converting from a
+// platform's notch counts need it, and one definition avoids the two drifting.
 
 // ─── wc_host_info_t field offsets (written by host before wc_init) ──────────
 

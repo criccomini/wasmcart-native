@@ -195,17 +195,20 @@ extern "C" void wc_host_destroy(wc_host_t* host) {
 
 // ─── Parse wc_info_t from WASM memory (unchanged from wasmtime) ─────────
 
-// Refuse a cart built against an ABI this host doesn't speak, rather than
-// reading its structs with the wrong offsets.
+// REFUSE a cart built against an incompatible ABI, rather than reading its
+// structs with the wrong offsets.
 //
-// Only call this once the cart has filled in wc_info_t: the first
-// wc_get_info() runs before wc_init, and a deferred (GL) cart hasn't run at
-// all at load time, so the version can legitimately still read 0 there.
+// MUST be called only once the cart has actually populated wc_info_t. The
+// first wc_get_info() happens before wc_init, and a GL cart under libretro
+// defers everything until the GL context exists -- in both cases the version
+// legitimately still reads 0, so checking too early refuses every cart.
 //
-// The host never checked the version. That was harmless while layouts only
-// grew, and stopped being so at ABI v4, which moved every wc_pad_t field
-// after buttons: a v4 cart here loads and reads its input from the wrong
-// bytes. Same check and message as upstream's v4 host, with v3's range.
+// This host never validated the version at all: WC_ABI_VERSION existed only
+// as a default for a manifest that omitted one. That was survivable while
+// layouts were additive and stopped being so at v4, which moved every field
+// after wc_pad_t.buttons. A v3 cart would otherwise load and read
+// `connected` out of a trigger byte, reporting every pad as unplugged: a
+// silent, baffling failure instead of a clear one.
 static int check_abi_version(wc_host_t* host) {
     if (host->info.version < WC_MIN_ABI_VERSION || host->info.version > WC_ABI_VERSION) {
         wc_log("wasmcart: ABI version mismatch: cart=%u, host supports %d-%d. "
@@ -300,6 +303,7 @@ static void parse_cart_info(wc_host_t* host, uint32_t info_ptr) {
     info->pointer_ptr      = wc_read_u32(mem, info_ptr + WC_INFO_POINTER_PTR);
     info->keys_ptr         = wc_read_u32(mem, info_ptr + WC_INFO_KEYS_PTR);
     info->gpu_api          = wc_read_u32(mem, info_ptr + WC_INFO_GPU_API);
+    info->wheel_ptr        = wc_read_u32(mem, info_ptr + WC_INFO_WHEEL_PTR);
 
     // Determine rendering mode: gpu_api is authoritative when set. For old
     // carts built before the field existed (gpu_api == 0), fall back to
@@ -1254,7 +1258,7 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
         lock_save_if_moved(host);
     } // end else (non-deferred init)
 
-    // A deferred cart hasn't run yet, so its version isn't known here;
+    // A deferred cart has not run yet, so its version is not knowable here;
     // wc_host_finish_init() checks it once the cart has filled wc_info_t in.
     if (!host->init_deferred && check_abi_version(host) != 0) return -1;
 
@@ -1400,6 +1404,16 @@ extern "C" void wc_host_set_pointer(wc_host_t* host, int index, int16_t x, int16
     host->memory[offset + 5] = active;
     host->memory[offset + 6] = 0;
     host->memory[offset + 7] = 0;
+}
+
+// Wheel (ABI v3.1). ACCUMULATES: an embedder calls this once per event and
+// the host hands the cart the frame's total, which is what makes a trackpad
+// flick one delta instead of a number that depends on how long the frame
+// took. Zeroed after each frame in run_frame, so the cart only ever reads.
+extern "C" void wc_host_add_wheel(wc_host_t* host, int32_t dx, int32_t dy) {
+    if (!host->memory || !host->info.wheel_ptr) return;
+    host->wheel_dx += dx;
+    host->wheel_dy += dy;
 }
 
 extern "C" void wc_host_set_time(wc_host_t* host, double time_ms, double delta_ms, uint32_t frame) {
@@ -1901,6 +1915,15 @@ extern "C" void wc_host_pump(wc_host_t* host) {
     pump_node(host);
 }
 
+// Write the frame's accumulated wheel delta where the cart reads it. Separate
+// from wc_host_add_wheel so events can arrive at any time and the cart still
+// sees a single coherent value for the frame.
+static void deliver_wheel(wc_host_t* host) {
+    if (!host->memory || !host->info.wheel_ptr) return;
+    wc_write_u32(host->memory, host->info.wheel_ptr + WC_WHEEL_DX, (uint32_t) host->wheel_dx);
+    wc_write_u32(host->memory, host->info.wheel_ptr + WC_WHEEL_DY, (uint32_t) host->wheel_dy);
+}
+
 extern "C" void wc_host_run_frame(wc_host_t* host) {
     // The spec's one MUST for suspension: no wc_render while suspended.
     if (!host->fn_wc_render || host->trapped || host->suspended) return;
@@ -1916,6 +1939,7 @@ extern "C" void wc_host_run_frame(wc_host_t* host) {
     drain_js_peer_events(host); // move socket events into the peer records
     deliver_peers(host);        // then into the cart, at a known point
     deliver_text(host);         // before render, like every other input
+    deliver_wheel(host);        // frame total in, zeroed again after render
     // An import can trap the cart inside those callbacks too.
     if (host->trapped) return;
 
@@ -1930,6 +1954,15 @@ extern "C" void wc_host_run_frame(wc_host_t* host) {
     }
 
     refresh_memory(host);
+
+    // Clear AFTER the frame, not before: the cart has now read the total, and
+    // leaving it set would scroll forever off a single flick.
+    if (host->memory && host->info.wheel_ptr) {
+        wc_write_u32(host->memory, host->info.wheel_ptr + WC_WHEEL_DX, 0);
+        wc_write_u32(host->memory, host->info.wheel_ptr + WC_WHEEL_DY, 0);
+    }
+    host->wheel_dx = 0;
+    host->wheel_dy = 0;
 }
 
 // ─── Readback (unchanged — pure C, reads host->memory) ────────────────

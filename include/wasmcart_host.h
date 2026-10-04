@@ -14,11 +14,13 @@ extern "C" {
 
 // ─── ABI Constants (matches abi.js) ────────────────────────────────────────
 
-#define WC_ABI_VERSION     3
-#define WC_MIN_ABI_VERSION 1
+#define WC_ABI_VERSION     4
+// v4 moved every field after wc_pad_t.buttons, so a v1-v3 cart cannot be read
+// with v4 offsets: it is refused at load rather than reinterpreted.
+#define WC_MIN_ABI_VERSION 4
 
 #define WC_MAX_PADS        4
-#define WC_PAD_SIZE        16
+#define WC_PAD_SIZE        20
 #define WC_TIME_SIZE       20
 #define WC_MAX_POINTERS    10
 #define WC_KEYS_STATE_SIZE 32
@@ -44,6 +46,21 @@ extern "C" {
 #define WC_BUTTON_RIGHT  (1 << 11)
 #define WC_BUTTON_L3     (1 << 12)
 #define WC_BUTTON_R3     (1 << 13)
+// ABI v4: the rest of SDL2's controller button set, which libretro mirrors.
+// Bits 0-13 above keep the meanings they have always had. A pad lacking one
+// of these never sets the bit, so a cart may read them unconditionally.
+#define WC_BUTTON_GUIDE    (1 << 14)  // centre/home/logo
+#define WC_BUTTON_MISC1    (1 << 15)  // share/capture/microphone, varies
+#define WC_BUTTON_PADDLE1  (1 << 16)  // upper right paddle (Elite/Pro)
+#define WC_BUTTON_PADDLE2  (1 << 17)  // upper left paddle
+#define WC_BUTTON_PADDLE3  (1 << 18)  // lower right paddle
+#define WC_BUTTON_PADDLE4  (1 << 19)  // lower left paddle
+#define WC_BUTTON_TOUCHPAD (1 << 20)  // touchpad click (DualShock)
+// Bits 21-31 reserved.
+
+// Full travel on a trigger. Matches SDL2 and libretro, so an embedder reading
+// either assigns the value through rather than scaling it.
+#define WC_TRIGGER_MAX     32767
 
 // Cart info flags
 #define WC_FLAG_AUDIO_F32 (1 << 0)
@@ -56,29 +73,34 @@ extern "C" {
 
 // ─── Structs ───────────────────────────────────────────────────────────────
 
-// Matches the in-memory layout of wc_pad_t (16 bytes, ABI v3).
+// Matches the in-memory layout of wc_pad_t (20 bytes, ABI v4).
 //
-// wc_host_set_pads memcpy's four of these into cart memory with sizeof(), so
-// the size is the ABI. This used to say "16 bytes" while declaring a single
-// byte of padding, which compiles to 14: the copy moved 56 bytes where the
-// cart reads 64, and pads 1-3 landed at the wrong offsets. The assertion
-// keeps the comment honest.
+// EVERY ANALOG AXIS IS int16: sticks -32768..32767, triggers 0..32767. That
+// is bit-for-bit what SDL_GameControllerGetAxis and libretro's
+// RETRO_DEVICE_ANALOG already report, so an embedder assigns the value
+// straight through with no scaling at all.
+//
+// The static assert below is load-bearing. This struct is memcpy'd into cart
+// memory with sizeof(), and the previous version declared itself as "16
+// bytes" in a comment while actually compiling to FOURTEEN -- so the copy
+// moved 56 bytes where the cart expected 64, and pads 1 through 3 were
+// silently misaligned. A comment cannot hold a layout; an assertion can.
 typedef struct {
-    uint16_t buttons;
+    uint32_t buttons;        // WC_BTN_* bitmask; bits 21-31 reserved
     int16_t  left_x;
     int16_t  left_y;
     int16_t  right_x;
     int16_t  right_y;
-    uint8_t  left_trigger;
-    uint8_t  right_trigger;
+    int16_t  left_trigger;   // 0..32767, never negative
+    int16_t  right_trigger;  // 0..32767, never negative
     uint8_t  connected;
     uint8_t  _pad[3];
 } wc_pad_t;
 
 #ifdef __cplusplus
-static_assert(sizeof(wc_pad_t) == 16, "wc_pad_t must be exactly 16 bytes (ABI v3)");
+static_assert(sizeof(wc_pad_t) == 20, "wc_pad_t must be exactly 20 bytes (ABI v4)");
 #else
-_Static_assert(sizeof(wc_pad_t) == 16, "wc_pad_t must be exactly 16 bytes (ABI v3)");
+_Static_assert(sizeof(wc_pad_t) == 20, "wc_pad_t must be exactly 20 bytes (ABI v4)");
 #endif
 
 // Parsed from wc_get_info() return
@@ -101,6 +123,8 @@ typedef struct {
     uint32_t pointer_ptr;
     uint32_t keys_ptr;
     uint32_t gpu_api;          // 0=2D, 1=WebGL2/GLES3, 2=WebGPU, 3=Vulkan
+    // v3.1
+    uint32_t wheel_ptr;        // wc_wheel_t, 0 = cart does not read the wheel
 } wc_cart_info_t;
 
 // GPU API values
@@ -263,6 +287,24 @@ int  wc_host_text_input_active(wc_host_t* host);
 void wc_host_set_pads(wc_host_t* host, const wc_pad_t pads[WC_MAX_PADS]);
 void wc_host_set_keyboard(wc_host_t* host, const uint8_t keys[WC_KEYS_STATE_SIZE]);
 void wc_host_set_pointer(wc_host_t* host, int index, int16_t x, int16_t y, uint8_t buttons, uint8_t active);
+
+// Scroll wheel (ABI v3.1). Units are 1/120 of a notch, right and UP positive:
+// one click of a detented wheel is 120, and a trackpad or free-spin wheel
+// reports whatever fraction it actually moved, so smooth scrolling survives
+// instead of being rounded to a click.
+//
+// ACCUMULATE, DO NOT ASSIGN. Call this once per event as they arrive; the host
+// sums them, hands the cart the frame's total, and zeroes it afterwards. That
+// is what makes a trackpad flick (dozens of events) one delta, and makes a
+// cart behave the same at 30fps as at 144. An embedder that never calls this
+// leaves the field zero forever, which is how a device with no wheel looks.
+// One click of a detented wheel. Public because an embedder converting from a
+// platform's "notches" needs it: SDL reports whole notches, so a notch up is
+// wc_host_add_wheel(host, 0, WC_WHEEL_DELTA).
+#define WC_WHEEL_DELTA 120
+
+void wc_host_add_wheel(wc_host_t* host, int32_t dx, int32_t dy);
+
 // Written verbatim. Clamping delta_ms to WC_MAX_DELTA_MS is the caller's job,
 // because a harness passing a fixed step must get exactly the step it asked for.
 void wc_host_set_time(wc_host_t* host, double time_ms, double delta_ms, uint32_t frame);
