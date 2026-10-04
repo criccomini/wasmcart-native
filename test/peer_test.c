@@ -24,6 +24,13 @@
  */
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#define nap_ms(n) Sleep(n)
+#else
+#include <unistd.h>
+#define nap_ms(n) usleep((n) * 1000)
+#endif
 #include "wasmcart_host.h"
 
 int32_t wc_test_call_export(wc_host_t*, const char*, uint32_t, uint32_t, uint32_t, int);
@@ -36,11 +43,15 @@ static void check(const char* what, long got, long want) {
     else { printf("*** FAIL %-44s got %ld, want %ld\n", what, got, want); failures++; }
 }
 
-/* Run frames until `probe` reports non-zero, or we give up. */
+/* Run frames until `probe` reports non-zero, or we give up. 10 ms apart, as
+ * a player's frames would be: this cart's render does nothing, so back to
+ * back the 300 frames were over in a few milliseconds, and on a busy machine
+ * the local WebSocket hadn't opened by then (2 runs in 8 failed). */
 static int pump_until(wc_host_t* h, const char* probe, int frames) {
     for (int i = 0; i < frames; i++) {
         wc_host_run_frame(h);
         if (wc_test_call_export(h, probe, 0, 0, 0, 0) > 0) return 1;
+        nap_ms(10);
     }
     return 0;
 }
