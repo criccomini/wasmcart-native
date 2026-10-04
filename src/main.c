@@ -251,6 +251,20 @@ static void audio_callback(void* userdata, Uint8* stream, int len) {
     audio_mix_pull((wc_audio_mix_t*)userdata, (float*)stream, (uint32_t)len / (2 * sizeof(float)));
 }
 
+// Wait for a stopped mixer to fade out and play its tail of silence, so
+// closing the device doesn't cut the sound off mid-wave. Bounded, in case the
+// device has stopped pulling.
+static void audio_wait_stopped(SDL_AudioDeviceID dev, wc_audio_mix_t* mix) {
+    uint64_t give_up = SDL_GetTicks64() + (uint64_t)(AUDIO_STOP_FADE_MS + AUDIO_TAIL_MS) + 200;
+    while (SDL_GetAudioDeviceStatus(dev) == SDL_AUDIO_PLAYING) {
+        SDL_LockAudioDevice(dev);
+        bool stopped = audio_mix_stopped(mix);
+        SDL_UnlockAudioDevice(dev);
+        if (stopped || SDL_GetTicks64() >= give_up) break;
+        SDL_Delay(2);
+    }
+}
+
 // ─── Main ──────────────────────────────────────────────────────────────────
 
 // Set from a signal handler, so it must be sig_atomic_t and volatile: the
@@ -1450,6 +1464,14 @@ int main(int argc, char* argv[]) {
     }
 
     // 8. Cleanup
+    // Start the sound fading out now, so the fade plays while the save below
+    // is written: the save doesn't wait for it, and the cart's last audio is
+    // still there to fade rather than run dry.
+    if (audio_dev) {
+        SDL_LockAudioDevice(audio_dev);
+        audio_mix_stop(&audio_mix);
+        SDL_UnlockAudioDevice(audio_dev);
+    }
     // A long rumble would otherwise run out its duration after the window
     // closes (SDL only stops it when the pad is closed, in SDL_Quit).
     rumble_stop_all();
@@ -1460,7 +1482,10 @@ int main(int argc, char* argv[]) {
     persist_sav(host, sav_path, true);
     save_writer_stop(&g_writer);
 
-    if (audio_dev) SDL_CloseAudioDevice(audio_dev);
+    if (audio_dev) {
+        audio_wait_stopped(audio_dev, &audio_mix);
+        SDL_CloseAudioDevice(audio_dev);
+    }
     audio_mix_free(&audio_mix);
     if (fb_tex) SDL_DestroyTexture(fb_tex);
     if (renderer) SDL_DestroyRenderer(renderer);

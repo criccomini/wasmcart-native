@@ -12,6 +12,11 @@
 //     samples would just run dry again.
 //   - A paused stage throws away what it held once the fade is done, so a
 //     resume never replays stale audio.
+//   - A stage stopped for good, because the device is about to close, fades
+//     out over AUDIO_STOP_FADE_MS and then plays AUDIO_TAIL_MS of silence.
+//     Closing the device mid-wave is the same step as any other cut, and
+//     the tail means whatever the device still holds when it closes is
+//     silence too.
 //
 // Interleaved stereo float. One producer (the frame loop) and one consumer
 // (the audio callback); the caller serializes them (SDL_LockAudioDevice).
@@ -28,12 +33,17 @@
 #define AUDIO_FADE_MS  10.0
 #define AUDIO_DECAY_MS 5.0
 #define AUDIO_PRIME_MS 50.0
+#define AUDIO_STOP_FADE_MS 50.0
+#define AUDIO_TAIL_MS  25.0  // more than one 1024-frame device buffer at 48kHz
 
 typedef struct {
     float* ring;          // cap frames of L,R
     uint32_t cap, head, count;
     uint32_t prime;       // frames to wait for before playing
     float gain, step;     // current gain and its per-frame ramp
+    float stop_step;      // the ramp once stopped for good
+    uint32_t silent;      // frames of silence put out in a row
+    uint32_t tail;        // frames of silence a stopped stage plays before it's done
     float decay;          // per-frame factor for a dry ring
     float last_l, last_r; // last sample out, decayed when the ring is dry
     bool paused, playing;
@@ -47,6 +57,8 @@ static inline bool audio_mix_init(wc_audio_mix_t* m, uint32_t rate, uint32_t cap
     m->prime = (uint32_t)(rate * AUDIO_PRIME_MS / 1000.0);
     if (m->prime > cap_frames / 2) m->prime = cap_frames / 2;
     m->step = (float)(1.0 / (rate * AUDIO_FADE_MS / 1000.0));
+    m->stop_step = (float)(1.0 / (rate * AUDIO_STOP_FADE_MS / 1000.0));
+    m->tail = (uint32_t)(rate * AUDIO_TAIL_MS / 1000.0);
     m->decay = (float)exp(log(0.001) / (rate * AUDIO_DECAY_MS / 1000.0));
     return true;
 }
@@ -80,6 +92,19 @@ static inline void audio_mix_set_paused(wc_audio_mix_t* m, bool paused) {
     m->paused = paused;
 }
 
+// Stop for good: the device is about to close. Fades out from wherever the
+// gain is (a paused stage is already silent), and doesn't come back.
+static inline void audio_mix_stop(wc_audio_mix_t* m) {
+    m->paused = true;
+    m->step = m->stop_step;
+}
+
+// A stopped stage has faded out and played its tail of silence: the device
+// can close now without a click.
+static inline bool audio_mix_stopped(const wc_audio_mix_t* m) {
+    return m->paused && m->gain == 0.0f && m->silent >= m->tail;
+}
+
 // Consumer: fill `frames` frames of interleaved stereo float.
 static inline void audio_mix_pull(wc_audio_mix_t* m, float* out, uint32_t frames) {
     for (uint32_t i = 0; i < frames; i++) {
@@ -107,6 +132,8 @@ static inline void audio_mix_pull(wc_audio_mix_t* m, float* out, uint32_t frames
 
         out[i * 2] = l * m->gain;
         out[i * 2 + 1] = r * m->gain;
+        if (m->gain > 0.0f) m->silent = 0;
+        else if (m->silent < UINT32_MAX) m->silent++;
 
         // Faded all the way out while paused: drop what's left, so the
         // resume starts from the cart's next samples, not old ones.
