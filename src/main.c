@@ -1170,6 +1170,13 @@ static int run_player(int argc, char* argv[]) {
         return 1;
     }
 
+    // No pointer over the picture. This player hands the cart no mouse input,
+    // so a pointer would only be in the way, and on a TV one appears with no
+    // mouse at all: HDMI-CEC inputs report motion, and the compositor draws a
+    // pointer for them. SDL applies this whenever the pointer enters the
+    // window, so it holds across fullscreen toggles.
+    SDL_ShowCursor(SDL_DISABLE);
+
     SDL_Renderer* renderer = NULL;
     SDL_Texture* fb_tex = NULL;
 
