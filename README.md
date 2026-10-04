@@ -313,6 +313,7 @@ python3 test/save_region_test.py build/wasmcart-run   # save region checked; a w
 cc -Isrc -o peer_addr_test test/peer_addr_test.c && ./peer_addr_test   # the allowlist checks the host really reached
 python3 test/info_bounds_test.py build/wasmcart-run   # wc_info_t regions outside memory are skipped, not crashed on
 python3 test/audio_flow_test.py build/wasmcart-run [<cart with a steady tone>]   # audio keeps going past the first ring
+python3 test/quit_fade_test.py build/wasmcart-run   # quitting fades out, after the save, instead of clicking
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
 sh test/wgpu_test.sh          # WebGPU carts (needs a build with WebGPU support)
