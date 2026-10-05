@@ -17,6 +17,11 @@
 #include <string.h>
 #include <stdbool.h>
 #include <signal.h>
+#ifdef __linux__
+#include <fcntl.h>
+#include <unistd.h>
+#include "switch_rumble.h"
+#endif
 
 #define MAX_CONTROLLERS 4
 
@@ -79,6 +84,11 @@ static void close_controller(SDL_JoystickID id) {
 // Switch pads: hid-nintendo feeds a pad its rumble for only a few hundred ms
 // after each effect it's handed, and the pad goes quiet without it. SDL's own
 // refresh comes every 2 s.
+//
+// On Linux, a Switch pad that hid-nintendo drives gets its rumble straight
+// from the player through its hidraw node instead (switch_rumble.h): the
+// driver can hold each rumble packet back by seconds. Without access to the
+// node, it goes through SDL like any other pad.
 
 #define RUMBLE_REFRESH_MS 500
 
@@ -96,12 +106,75 @@ static SDL_GameController* rumble_pad(uint32_t pad_id) {
     return pad_id < MAX_CONTROLLERS ? controllers[pad_id] : NULL;
 }
 
+#ifdef __linux__
+// Each slot's hidraw rumble, for the pad connection it was looked up for.
+typedef struct {
+    bool looked;           // looked up for inst
+    SDL_JoystickID inst;
+    switch_rumble_t s;
+} hid_rumble_t;
+
+static hid_rumble_t hid_rumble[MAX_CONTROLLERS];
+
+static void hid_rumble_drop(hid_rumble_t* h) {
+    if (h->s.fd >= 0) close(h->s.fd);
+    h->s.fd = -1;
+}
+
+// The slot's hidraw rumble if its pad has one, looking it up the first time
+// for each connection (lookup false: only if already looked up).
+static switch_rumble_t* hid_rumble_for(uint32_t pad_id, bool lookup) {
+    SDL_GameController* gc = rumble_pad(pad_id);
+    if (!gc) return NULL;
+    SDL_Joystick* js = SDL_GameControllerGetJoystick(gc);
+    SDL_JoystickID inst = SDL_JoystickInstanceID(js);
+    hid_rumble_t* h = &hid_rumble[pad_id];
+    if (!h->looked || h->inst != inst) {
+        if (h->looked) hid_rumble_drop(h);
+        if (!lookup) return NULL;
+        switch_rumble_init(&h->s);
+        h->looked = true;
+        h->inst = inst;
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+        // SDL's own HIDAPI drivers give a hidraw path here, not an evdev one,
+        // and send the rumble themselves.
+        const char* path = SDL_JoystickPath(js);
+        char node[64];
+        if (path && strncmp(path, "/dev/input/", 11) == 0 &&
+            switch_rumble_find_hidraw("/sys", path + 11, node, sizeof(node)) == 0) {
+            h->s.fd = open(node, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+            if (h->s.fd >= 0)
+                fprintf(stderr, "wasmcart: controller %u rumbles through %s\n", pad_id, node);
+            else
+                fprintf(stderr, "wasmcart: controller %u: can't open %s (%s), so its "
+                        "rumble goes through hid-nintendo\n", pad_id, node, strerror(errno));
+        }
+#endif
+    }
+    return h->s.fd >= 0 ? &h->s : NULL;
+}
+
+// A write to a node that failed (the pad went away) drops it.
+static void hid_rumble_check(uint32_t pad_id, bool ok) {
+    if (!ok) hid_rumble_drop(&hid_rumble[pad_id]);
+}
+#endif
+
 // SDL passes a call on to the pad only when its strengths differ from the
 // previous call's; a repeat just moves SDL's end time. So a repeat gets the
 // low bit of the high-frequency motor flipped, a 1/65535 step no motor shows.
 // SDL's own end is a backstop two refreshes past the cart's: rumble_tick
 // ends the rumble on time.
-static void rumble_send(rumble_state_t* r, Uint64 now) {
+static void rumble_send(uint32_t pad_id, Uint64 now) {
+    rumble_state_t* r = &rumble_state[pad_id];
+#ifdef __linux__
+    switch_rumble_t* s = hid_rumble_for(pad_id, true);
+    if (s) {
+        hid_rumble_check(pad_id, switch_rumble_set(s, r->low, r->high, now));
+        r->sent = now;
+        return;
+    }
+#endif
     Uint16 high = r->high;
     if (r->low == r->sent_low && high == r->sent_high) high ^= 1;
     Uint64 left = r->until - now + 2 * RUMBLE_REFRESH_MS;
@@ -125,6 +198,10 @@ static int rumble_has(void* user, uint32_t pad_id) {
 static void rumble_stop(void* user, uint32_t pad_id) {
     (void)user;
     SDL_GameController* gc = rumble_pad(pad_id);
+#ifdef __linux__
+    switch_rumble_t* s = hid_rumble_for(pad_id, false);
+    if (s) hid_rumble_check(pad_id, switch_rumble_stop(s, SDL_GetTicks64()));
+#endif
     if (gc) SDL_GameControllerRumble(gc, 0, 0, 0);
     if (pad_id < MAX_CONTROLLERS) {
         rumble_state_t* r = &rumble_state[pad_id];
@@ -152,7 +229,7 @@ static void rumble_play(void* user, uint32_t pad_id, float low, float high,
     r->gc = gc;
     r->low = lo;
     r->high = hi;
-    rumble_send(r, now);
+    rumble_send(pad_id, now);
 }
 
 // Once a frame, after the cart's: end the rumbles whose time is up, and
@@ -161,10 +238,24 @@ static void rumble_tick(void) {
     Uint64 now = SDL_GetTicks64();
     for (uint32_t i = 0; i < MAX_CONTROLLERS; i++) {
         rumble_state_t* r = &rumble_state[i];
+#ifdef __linux__
+        switch_rumble_t* s = hid_rumble_for(i, false);
+        if (s) {
+            // A change that had to wait, or the pad's 50 ms refresh.
+            if (r->gc == controllers[i] && now < r->until)
+                hid_rumble_check(i, switch_rumble_tick(s, now));
+        } else if (hid_rumble[i].looked && !controllers[i]) {
+            hid_rumble_drop(&hid_rumble[i]);  // the pad went away
+            hid_rumble[i].looked = false;
+        }
+#endif
         if (!r->gc) continue;
         if (r->gc != controllers[i]) r->gc = NULL;  // the pad went away
         else if (now >= r->until) rumble_stop(NULL, i);
-        else if (now - r->sent >= RUMBLE_REFRESH_MS) rumble_send(r, now);
+#ifdef __linux__
+        else if (s) continue;
+#endif
+        else if (now - r->sent >= RUMBLE_REFRESH_MS) rumble_send(i, now);
     }
 }
 

@@ -122,7 +122,10 @@ wasmcart-run (75MB, statically linked)
 - **4 players**: Up to 4 controllers supported simultaneously
 - **Hot-plug**: Controllers can be connected/disconnected during play
 - **Rumble**: `wc_pad_rumble` routed to SDL2's haptics, with the ABI's clamping
-  applied once in the host library so every embedder behaves the same
+  applied once in the host library so every embedder behaves the same. On
+  Linux, Switch pads that hid-nintendo drives get their rumble report written
+  to their hidraw node every 50 ms instead (`src/switch_rumble.h`), when the
+  player may open it
 - **Text input**: `wc_on_text` fed from `SDL_TEXTINPUT`, so a cart receives
   characters the OS already composed -- layout, shift, dead keys and IME -- and
   never has to reimplement a keyboard layout. `SDL_StartTextInput` is mirrored
@@ -225,6 +228,8 @@ node ../wasmcart/test/wsserver.mjs --port 8796 &   # from the wasmcart repo
 ./rumble_test ../wasmcart/test/fixtures/rumble.wasc
 python3 test/rumble_sdl_test.py build/wasmcart-run ../wasmcart/test/fixtures/rumble.wasc   # reaches a real pad (Linux, uinput)
 python3 test/rumble_rate_test.py build/wasmcart-run   # a held rumble: refreshed twice a second, not every frame, and off on time
+python3 test/rumble_rate_test.py build/wasmcart-run --switch   # the same for a Switch pad without a hidraw node
+cc -Isrc -o switch_rumble_test test/switch_rumble_test.c -lm && ./switch_rumble_test   # Switch pads' hidraw rumble
 ./text_test  test/textauto.wasc 5452 5456 5460 5472
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
