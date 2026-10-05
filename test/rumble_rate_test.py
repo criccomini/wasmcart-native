@@ -21,7 +21,11 @@ than 3 times a second, and stops when it should.
 Linux only. Needs write access to /dev/uinput and python3-evdev. In a
 container, /dev/input has to be the host's (e.g. -v /dev/input:/dev/input).
 
-Run:  python3 test/rumble_rate_test.py build/wasmcart-run
+With --switch the pad poses as a Switch Pro Controller over Bluetooth. A
+uinput pad has no hidraw node, so the player can't write its rumble report
+itself (src/switch_rumble.h) and has to fall back to SDL like any other pad.
+
+Run:  python3 test/rumble_rate_test.py build/wasmcart-run [--switch]
 """
 
 import io
@@ -138,7 +142,7 @@ def rumble_cart():
 
 # ── The pad ──
 
-def make_pad():
+def make_pad(switch=False):
     stick = AbsInfo(0, -32768, 32767, 16, 128, 0)
     trig = AbsInfo(0, 0, 255, 0, 0, 0)
     hat = AbsInfo(0, -1, 1, 0, 0, 0)
@@ -149,6 +153,9 @@ def make_pad():
                    (e.ABS_RY, stick), (e.ABS_RZ, trig), (e.ABS_HAT0X, hat), (e.ABS_HAT0Y, hat)],
         e.EV_FF: [e.FF_RUMBLE, e.FF_GAIN],
     }
+    if switch:
+        return UInput(caps, name="Pro Controller", vendor=0x057E, product=0x2009,
+                      version=0x8011, bustype=e.BUS_BLUETOOTH, max_effects=16)
     return UInput(caps, name="Microsoft X-Box 360 pad", vendor=0x045E, product=0x028E,
                   version=0x110, bustype=e.BUS_USB, max_effects=16)
 
@@ -156,8 +163,8 @@ def make_pad():
 class Pad:
     """Answers the kernel's force-feedback requests and records them."""
 
-    def __init__(self):
-        self.dev = make_pad()
+    def __init__(self, switch=False):
+        self.dev = make_pad(switch)
         self.log = []  # (monotonic, kind, ...)
 
     def service(self, until):
@@ -281,10 +288,12 @@ def check_hold(what, log, pressed, released, want, stop_within, failures):
 
 
 def main():
-    if len(sys.argv) != 2:
+    args = [a for a in sys.argv[1:] if a != "--switch"]
+    switch = "--switch" in sys.argv[1:]
+    if len(args) != 1:
         print(__doc__)
         return 2
-    pad = Pad()
+    pad = Pad(switch)
     time.sleep(1.0)
     with tempfile.TemporaryDirectory() as d:
         cart = os.path.join(d, "rumblerate.wasc")
@@ -294,7 +303,7 @@ def main():
         env.setdefault("SDL_AUDIODRIVER", "dummy")
         if not os.path.exists("/run/udev/control"):
             env.setdefault("SDL_JOYSTICK_DISABLE_UDEV", "1")  # see pad_hotplug_test.py
-        proc = subprocess.Popen([sys.argv[1], cart], env=env, stdout=subprocess.DEVNULL,
+        proc = subprocess.Popen([args[0], cart], env=env, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, text=True)
         err = []
         connected = threading.Event()
@@ -335,6 +344,8 @@ def main():
         check_hold("A", pad.log, a_down, a_up, (65535, 65535), (0.06, 0.25), failures)
         # B: wc_pad_rumble_stop, at once.
         check_hold("B", pad.log, b_down, b_up, (32768, 16384), (0.0, 0.1), failures)
+    if switch and any("rumbles through" in line for line in err):
+        failures.append("the player found a hidraw node for a uinput pad")
     if failures:
         for f in failures:
             print(f"  FAIL  {f}")
