@@ -739,6 +739,10 @@ static GLuint _redirect_rbo = 0;
 // turns it on only when the surface is exactly the cart's render size (no
 // scaling or letterbox to do) -- wc_gl_set_direct, between frames.
 static int _direct = 0;
+// The real "framebuffer 0" in direct mode: 0 for a window surface, or a
+// frontend's framebuffer (libretro: RetroArch's hw_render FBO, which can
+// change from frame to frame; wc_gl_set_direct_target).
+static GLuint _direct_target = 0;
 
 static void _ensure_redirect_fbo(uint32_t w, uint32_t h) {
     if (_redirect_fbo && _redirect_w == w && _redirect_h == h) return;
@@ -783,8 +787,8 @@ GL_REG(glBindFramebuffer, 2, 0, {
     uint32_t target = A_U32(0);
     uint32_t fb = A_U32(1);
     GLuint actual = fb;
-    if (fb == 0 && _redirect_fbo && !_direct) {
-        actual = _redirect_fbo;
+    if (fb == 0 && _redirect_fbo) {
+        actual = _direct ? _direct_target : _redirect_fbo;
     }
     if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
         _last_draw_fbo = actual;
@@ -797,7 +801,7 @@ GL_REG(glFramebufferRenderbuffer, 4, 0, glFramebufferRenderbuffer(A_U32(0), A_U3
 GL_REG(glBlitFramebuffer, 10, 0, {
     /* the cart blitting its picture into "framebuffer 0": the redirect, or
      * in direct mode the surface itself (its size still decides the mode) */
-    if ((_last_draw_fbo == _redirect_fbo || (_direct && _last_draw_fbo == 0)) && (A_U32(8) & GL_COLOR_BUFFER_BIT)) {
+    if ((_direct ? _last_draw_fbo == _direct_target : _last_draw_fbo == _redirect_fbo) && (A_U32(8) & GL_COLOR_BUFFER_BIT)) {
         _cart_blitted_to_redirect = 1;
         // Track the cart's actual render size from the source rect
         // Use signed math — Ganesh may blit with Y-inverted coords
@@ -1085,6 +1089,12 @@ extern "C" int wc_gl_has_redirect(void) { return _redirect_fbo != 0; }
 // flip_y: when true, flips the image vertically during blit (needed for RetroArch GLES contexts)
 extern "C" void wc_gl_blit_to_fbo(uint32_t target_fbo, uint32_t cart_w, uint32_t cart_h, uint32_t dst_w, uint32_t dst_h, int flip_y) {
     if (!_redirect_fbo) return;
+    if (_direct && !flip_y && target_fbo == _direct_target) {
+        /* the cart drew into target_fbo itself: nothing to copy */
+        _cart_blitted_to_redirect = 0;
+        _draw_call_count = 0;
+        return;
+    }
     uint32_t src_w = _cart_blit_w ? _cart_blit_w : cart_w;
     uint32_t src_h = _cart_blit_h ? _cart_blit_h : cart_h;
 
@@ -1113,16 +1123,26 @@ extern "C" void wc_gl_blit_to_fbo(uint32_t target_fbo, uint32_t cart_w, uint32_t
 
 extern "C" void wc_gl_rebind_redirect(void) {
     if (!_redirect_fbo) return;
-    glBindFramebuffer(GL_FRAMEBUFFER, _direct ? 0 : _redirect_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, _direct ? _direct_target : _redirect_fbo);
     glViewport(0, 0, _redirect_w, _redirect_h);
     // Put back the VAO the cart last bound (its element buffer lives there).
     // Carts that never bind a VAO (gl4es) get _cart_vao: Core 3.3 requires a
     // non-zero VAO for draw calls, else GL_INVALID_OPERATION.
     GLuint vao = _cart_bound_vao ? _cart_bound_vao : _cart_vao;
     if (vao) glBindVertexArray(vao);
-    _last_draw_fbo = _direct ? 0 : _redirect_fbo;
+    _last_draw_fbo = _direct ? _direct_target : _redirect_fbo;
     _cart_blitted_to_redirect = 0;
     _draw_call_count = 0;
+}
+
+/* The framebuffer direct mode draws into (0 = the window surface). Set
+ * before wc_gl_set_direct, and again whenever the frontend's changes. */
+extern "C" void wc_gl_set_direct_target(uint32_t fbo) {
+    _direct_target = fbo;
+    if (_direct) {
+        glBindFramebuffer(GL_FRAMEBUFFER, _direct_target);
+        _last_draw_fbo = _direct_target;
+    }
 }
 
 /* Switch direct present on or off, between frames. Leaves the cart's
@@ -1132,8 +1152,8 @@ extern "C" void wc_gl_set_direct(int on) {
     on = on ? 1 : 0;
     if (on == _direct || !_redirect_fbo) return;
     _direct = on;
-    glBindFramebuffer(GL_FRAMEBUFFER, _direct ? 0 : _redirect_fbo);
-    _last_draw_fbo = _direct ? 0 : _redirect_fbo;
+    glBindFramebuffer(GL_FRAMEBUFFER, _direct ? _direct_target : _redirect_fbo);
+    _last_draw_fbo = _direct ? _direct_target : _redirect_fbo;
     _cart_blitted_to_redirect = 0;
 }
 extern "C" int wc_gl_is_direct(void) { return _direct; }
@@ -1143,9 +1163,9 @@ extern "C" int wc_gl_is_direct(void) { return _direct; }
  * the redirect FBO. For tests (--shot). Leaves the cart's binding in place. */
 extern "C" int wc_gl_read_frame(uint8_t* out, uint32_t w, uint32_t h) {
     if (!_redirect_fbo && !_direct) return 0;
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, _direct ? 0 : _redirect_fbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, _direct ? _direct_target : _redirect_fbo);
     glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, out);
-    glBindFramebuffer(GL_FRAMEBUFFER, _direct ? 0 : _redirect_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, _direct ? _direct_target : _redirect_fbo);
     return 1;
 }
 
