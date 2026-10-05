@@ -21,6 +21,10 @@ Options:
   --msaa N        Multisampled window surface (N samples) for GL carts, a browser's antialias: true
   --no-direct     Always present GL carts through the redirect FBO (by default a cart
                   draws straight onto the window when it is exactly the cart's size)
+  --fixed-step MS The host clock advances exactly MS milliseconds per frame
+                  (time_ms = frame * MS) instead of wall time (tests)
+  --shot N FILE   Save frame N of a GL cart as a PPM (tests); with --fixed-step
+                  the capture is reproducible
 ```
 
 ## What It Runs

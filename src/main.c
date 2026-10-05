@@ -36,6 +36,8 @@ static void print_usage(const char* argv0) {
     fprintf(stderr, "  --fullscreen    Start in fullscreen mode\n");
     fprintf(stderr, "  --fps           Show FPS counter\n");
     fprintf(stderr, "  --uncapped      Disable vsync and frame cap\n");
+    fprintf(stderr, "  --fixed-step MS Host clock advances exactly MS per frame (deterministic tests)\n");
+    fprintf(stderr, "  --shot N FILE   Save frame N of a GL cart as a PPM (tests)\n");
 }
 
 // ─── Controller management ─────────────────────────────────────────────────
@@ -216,6 +218,7 @@ int main(int argc, char* argv[]) {
     bool no_direct = false; /* --no-direct: always present through the redirect */
     long shot_frame = -1;   /* --shot N file.ppm: save frame N as the cart drew it (tests) */
     const char* shot_path = NULL;
+    double fixed_step = 0.0; /* --fixed-step MS: time_ms = frame * MS (tests) */
     uint32_t pref_width = 0;
     uint32_t pref_height = 0;
 
@@ -241,6 +244,13 @@ int main(int argc, char* argv[]) {
             egl_set_samples(atoi(argv[++i]));
         else if (strcmp(argv[i], "--no-direct") == 0)
             no_direct = true;
+        else if (strcmp(argv[i], "--fixed-step") == 0 && i + 1 < argc) {
+            fixed_step = atof(argv[++i]);
+            if (!(fixed_step > 0.0)) {
+                fprintf(stderr, "wasmcart: --fixed-step needs a positive number of milliseconds\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--shot") == 0 && i + 2 < argc) {
             shot_frame = atol(argv[++i]);
             shot_path = argv[++i];
@@ -585,10 +595,18 @@ int main(int argc, char* argv[]) {
         }
         wc_host_set_pads(host, pads);
 
-        // Time
-        double time_ms = (double)(now - start_ticks);
-        double delta_ms = (double)(now - last_frame_ticks);
-        if (delta_ms <= 0.0) delta_ms = 0.001;  // avoid zero delta
+        // Time. --fixed-step replaces the wall clock with frame * step, so a
+        // given frame always sees the same time no matter how fast frames ran
+        // (a --shot of frame N is then reproducible).
+        double time_ms, delta_ms;
+        if (fixed_step > 0.0) {
+            time_ms = (double)frame_count * fixed_step;
+            delta_ms = fixed_step;
+        } else {
+            time_ms = (double)(now - start_ticks);
+            delta_ms = (double)(now - last_frame_ticks);
+            if (delta_ms <= 0.0) delta_ms = 0.001;  // avoid zero delta
+        }
         last_frame_ticks = now;
         wc_host_set_time(host, time_ms, delta_ms, frame_count);
 
