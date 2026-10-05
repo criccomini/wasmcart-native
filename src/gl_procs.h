@@ -108,6 +108,7 @@ extern PFNGLGETERRORPROC p_glGetError;
 extern PFNGLGETFLOATVPROC p_glGetFloatv;
 extern PFNGLGETINTEGER64VPROC p_glGetInteger64v;
 extern PFNGLGETINTEGERVPROC p_glGetIntegerv;
+extern PFNGLGETFRAMEBUFFERATTACHMENTPARAMETERIVPROC p_glGetFramebufferAttachmentParameteriv;
 extern PFNGLGETINTERNALFORMATIVPROC p_glGetInternalformativ;
 extern PFNGLGETMULTISAMPLEFVPROC p_glGetMultisamplefv;
 extern PFNGLGETPROGRAMINFOLOGPROC p_glGetProgramInfoLog;
@@ -283,6 +284,7 @@ extern PFNGLVIEWPORTPROC p_glViewport;
 #define glGetFloatv p_glGetFloatv
 #define glGetInteger64v p_glGetInteger64v
 #define glGetIntegerv p_glGetIntegerv
+#define glGetFramebufferAttachmentParameteriv p_glGetFramebufferAttachmentParameteriv
 #define glGetInternalformativ p_glGetInternalformativ
 #define glGetMultisamplefv p_glGetMultisamplefv
 #define glGetProgramInfoLog p_glGetProgramInfoLog

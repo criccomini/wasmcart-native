@@ -95,6 +95,7 @@ PFNGLGETERRORPROC p_glGetError = NULL;
 PFNGLGETFLOATVPROC p_glGetFloatv = NULL;
 PFNGLGETINTEGER64VPROC p_glGetInteger64v = NULL;
 PFNGLGETINTEGERVPROC p_glGetIntegerv = NULL;
+PFNGLGETFRAMEBUFFERATTACHMENTPARAMETERIVPROC p_glGetFramebufferAttachmentParameteriv = NULL;
 PFNGLGETINTERNALFORMATIVPROC p_glGetInternalformativ = NULL;
 PFNGLGETMULTISAMPLEFVPROC p_glGetMultisamplefv = NULL;
 PFNGLGETPROGRAMINFOLOGPROC p_glGetProgramInfoLog = NULL;
@@ -272,6 +273,7 @@ int wc_gl_procs_load(void* get_proc) {
     p_glGetFloatv = (PFNGLGETFLOATVPROC)L("glGetFloatv");
     p_glGetInteger64v = (PFNGLGETINTEGER64VPROC)L("glGetInteger64v");
     p_glGetIntegerv = (PFNGLGETINTEGERVPROC)L("glGetIntegerv");
+    p_glGetFramebufferAttachmentParameteriv = (PFNGLGETFRAMEBUFFERATTACHMENTPARAMETERIVPROC)L("glGetFramebufferAttachmentParameteriv");
     p_glGetInternalformativ = (PFNGLGETINTERNALFORMATIVPROC)L("glGetInternalformativ");
     p_glGetMultisamplefv = (PFNGLGETMULTISAMPLEFVPROC)L("glGetMultisamplefv");
     p_glGetProgramInfoLog = (PFNGLGETPROGRAMINFOLOGPROC)L("glGetProgramInfoLog");

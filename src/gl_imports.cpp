@@ -1098,6 +1098,13 @@ extern "C" void wc_gl_blit_to_fbo(uint32_t target_fbo, uint32_t cart_w, uint32_t
     uint32_t src_w = _cart_blit_w ? _cart_blit_w : cart_w;
     uint32_t src_h = _cart_blit_h ? _cart_blit_h : cart_h;
 
+    /* Like wc_gl_blit_to_screen, this must be invisible to the cart: the
+     * frontend saves the cart's GL state AFTER this runs (libretro), and an
+     * engine that caches its clear colour or scissor enable (three.c does)
+     * would otherwise clear with our black on every later frame. */
+    GLfloat cart_clear[4];
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, cart_clear);
+    GLboolean cart_scissor = glIsEnabled(GL_SCISSOR_TEST);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, _redirect_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target_fbo);
     glDisable(GL_SCISSOR_TEST);
@@ -1112,6 +1119,9 @@ extern "C" void wc_gl_blit_to_fbo(uint32_t target_fbo, uint32_t cart_w, uint32_t
         glBlitFramebuffer(0, 0, src_w, src_h, 0, 0, src_w, src_h,
             GL_COLOR_BUFFER_BIT, GL_LINEAR);
     }
+
+    glClearColor(cart_clear[0], cart_clear[1], cart_clear[2], cart_clear[3]);
+    if (cart_scissor) glEnable(GL_SCISSOR_TEST);
 
     // Restore redirect FBO for next frame
     glBindFramebuffer(GL_FRAMEBUFFER, _redirect_fbo);
@@ -1238,6 +1248,7 @@ extern "C" void wc_gl_blit_to_screen(uint32_t cart_w, uint32_t cart_h, uint32_t 
     }
 
     // Use RAW GL calls — not our intercepted versions
+    GLboolean cart_scissor = glIsEnabled(GL_SCISSOR_TEST); /* restored below, like the clear colour */
     glBindFramebuffer(GL_READ_FRAMEBUFFER, _redirect_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);  // real FBO 0 = EGL surface
     glDisable(GL_SCISSOR_TEST);
@@ -1254,6 +1265,7 @@ extern "C" void wc_gl_blit_to_screen(uint32_t cart_w, uint32_t cart_h, uint32_t 
         dst_x, dst_y, dst_x + dst_w, dst_y + dst_h,
         GL_COLOR_BUFFER_BIT, GL_LINEAR);
     glClearColor(cart_clear[0], cart_clear[1], cart_clear[2], cart_clear[3]);
+    if (cart_scissor) glEnable(GL_SCISSOR_TEST);
 
     // Restore redirect FBO + viewport for next frame
     glBindFramebuffer(GL_FRAMEBUFFER, _redirect_fbo);
