@@ -1105,6 +1105,8 @@ extern "C" void wc_gl_blit_to_fbo(uint32_t target_fbo, uint32_t cart_w, uint32_t
     GLfloat cart_clear[4];
     glGetFloatv(GL_COLOR_CLEAR_VALUE, cart_clear);
     GLboolean cart_scissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLint cart_vp[4];
+    glGetIntegerv(GL_VIEWPORT, cart_vp);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, _redirect_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target_fbo);
     glDisable(GL_SCISSOR_TEST);
@@ -1123,9 +1125,11 @@ extern "C" void wc_gl_blit_to_fbo(uint32_t target_fbo, uint32_t cart_w, uint32_t
     glClearColor(cart_clear[0], cart_clear[1], cart_clear[2], cart_clear[3]);
     if (cart_scissor) glEnable(GL_SCISSOR_TEST);
 
-    // Restore redirect FBO for next frame
+    // Restore redirect FBO for next frame, and the CART's viewport (not the
+    // redirect's size: an engine caching its viewport would keep drawing
+    // across the whole redirect when that is larger than the cart)
     glBindFramebuffer(GL_FRAMEBUFFER, _redirect_fbo);
-    glViewport(0, 0, _redirect_w, _redirect_h);
+    glViewport(cart_vp[0], cart_vp[1], cart_vp[2], cart_vp[3]);
     _cart_blitted_to_redirect = 0;
     _last_draw_fbo = _redirect_fbo;
     _draw_call_count = 0;
@@ -1249,6 +1253,8 @@ extern "C" void wc_gl_blit_to_screen(uint32_t cart_w, uint32_t cart_h, uint32_t 
 
     // Use RAW GL calls — not our intercepted versions
     GLboolean cart_scissor = glIsEnabled(GL_SCISSOR_TEST); /* restored below, like the clear colour */
+    GLint cart_vp[4];
+    glGetIntegerv(GL_VIEWPORT, cart_vp);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, _redirect_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);  // real FBO 0 = EGL surface
     glDisable(GL_SCISSOR_TEST);
@@ -1267,9 +1273,9 @@ extern "C" void wc_gl_blit_to_screen(uint32_t cart_w, uint32_t cart_h, uint32_t 
     glClearColor(cart_clear[0], cart_clear[1], cart_clear[2], cart_clear[3]);
     if (cart_scissor) glEnable(GL_SCISSOR_TEST);
 
-    // Restore redirect FBO + viewport for next frame
+    // Restore redirect FBO + the cart's own viewport for next frame
     glBindFramebuffer(GL_FRAMEBUFFER, _redirect_fbo);
-    glViewport(0, 0, _redirect_w, _redirect_h);
+    glViewport(cart_vp[0], cart_vp[1], cart_vp[2], cart_vp[3]);
     _cart_blitted_to_redirect = 0;
     _last_draw_fbo = _redirect_fbo;
     _draw_call_count = 0;
