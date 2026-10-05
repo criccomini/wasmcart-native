@@ -213,6 +213,9 @@ int main(int argc, char* argv[]) {
     bool fullscreen = false;
     bool show_fps = false;
     bool uncapped = false;
+    bool no_direct = false; /* --no-direct: always present through the redirect */
+    long shot_frame = -1;   /* --shot N file.ppm: save frame N as the cart drew it (tests) */
+    const char* shot_path = NULL;
     uint32_t pref_width = 0;
     uint32_t pref_height = 0;
 
@@ -234,6 +237,14 @@ int main(int argc, char* argv[]) {
             show_fps = true;
         else if (strcmp(argv[i], "--uncapped") == 0)
             uncapped = true;
+        else if (strcmp(argv[i], "--msaa") == 0 && i + 1 < argc)
+            egl_set_samples(atoi(argv[++i]));
+        else if (strcmp(argv[i], "--no-direct") == 0)
+            no_direct = true;
+        else if (strcmp(argv[i], "--shot") == 0 && i + 2 < argc) {
+            shot_frame = atol(argv[++i]);
+            shot_path = argv[++i];
+        }
     }
 
     // 1. Create host
@@ -581,6 +592,35 @@ int main(int argc, char* argv[]) {
         last_frame_ticks = now;
         wc_host_set_time(host, time_ms, delta_ms, frame_count);
 
+        // DIRECT PRESENT: when the surface is exactly the cart's render size,
+        // with nothing to scale or letterbox, the cart draws straight onto it
+        // and the per-frame redirect blit is skipped. Decided between frames;
+        // a resized window (or a cart that blits a smaller picture into
+        // "framebuffer 0") goes back to the redirect and the letterbox blit.
+        if (egl_is_initialized() && is_gl) {
+            extern void wc_gl_set_direct(int on);
+            extern void wc_gl_get_blit_size(uint32_t* w, uint32_t* h);
+            int sw, sh;
+            if (!egl_get_drawable_size(&sw, &sh))
+                SDL_GetWindowSize(window, &sw, &sh);
+            uint32_t rw = pref_width ? pref_width : cart_w;
+            uint32_t rh = pref_height ? pref_height : cart_h;
+            uint32_t bw = 0, bh = 0;
+            wc_gl_get_blit_size(&bw, &bh);
+            bool blit_ok = (!bw && !bh) || (bw == rw && bh == rh);
+            /* Decided from the first frame on, so a cart sees the real
+             * surface from the start. With --msaa a cart that started on
+             * the (single-sampled) redirect stays there: it may have chosen
+             * to do its own antialiasing then, and a multisampled surface
+             * swapped in later would break that (three.c resolves into
+             * "framebuffer 0", which a multisampled target refuses). */
+            static int started_redirect = -1;
+            bool want = !no_direct && blit_ok && (uint32_t)sw == rw && (uint32_t)sh == rh;
+            if (started_redirect < 0) started_redirect = !want;
+            if (want && started_redirect && egl_get_samples() > 0) want = false;
+            wc_gl_set_direct(want);
+        }
+
         // Run frame
         wc_host_run_frame(host);
 
@@ -609,6 +649,22 @@ int main(int argc, char* argv[]) {
         if (g_should_quit) {
             running = false;
             break;
+        }
+
+        if (shot_path && (long)frame_count == shot_frame && egl_is_initialized()) {
+            extern int wc_gl_read_frame(uint8_t* out, uint32_t w, uint32_t h);
+            extern int wc_gl_is_direct(void);
+            uint32_t rw = pref_width ? pref_width : cart_w, rh = pref_height ? pref_height : cart_h;
+            uint8_t* px = (uint8_t*)malloc((size_t)rw * rh * 4);
+            FILE* f = px && wc_gl_read_frame(px, rw, rh) ? fopen(shot_path, "wb") : NULL;
+            if (f) {
+                fprintf(f, "P6\n%u %u\n255\n", rw, rh);
+                for (uint32_t y = 0; y < rh; y++)
+                    for (uint32_t x = 0; x < rw; x++) fwrite(px + ((size_t)(rh - 1 - y) * rw + x) * 4, 1, 3, f);
+                fclose(f);
+                fprintf(stderr, "wasmcart: frame %ld -> %s (%s)\n", shot_frame, shot_path, wc_gl_is_direct() ? "direct" : "redirect");
+            }
+            free(px);
         }
 
         // Present

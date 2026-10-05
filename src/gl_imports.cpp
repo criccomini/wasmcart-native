@@ -733,6 +733,13 @@ GL_REG(glDeleteFramebuffers, 2, 0, glDeleteFramebuffers(A_I32(0), (const GLuint*
 
 static GLuint _redirect_rbo = 0;
 
+// DIRECT PRESENT: while set, the cart's framebuffer 0 is the real default
+// framebuffer (the window surface) instead of the redirect FBO, and the
+// present blit is skipped: the frame is already where it is shown. The host
+// turns it on only when the surface is exactly the cart's render size (no
+// scaling or letterbox to do) -- wc_gl_set_direct, between frames.
+static int _direct = 0;
+
 static void _ensure_redirect_fbo(uint32_t w, uint32_t h) {
     if (_redirect_fbo && _redirect_w == w && _redirect_h == h) return;
     // NEVER delete + re-gen these on resize. The cart allocates GL names
@@ -776,7 +783,7 @@ GL_REG(glBindFramebuffer, 2, 0, {
     uint32_t target = A_U32(0);
     uint32_t fb = A_U32(1);
     GLuint actual = fb;
-    if (fb == 0 && _redirect_fbo) {
+    if (fb == 0 && _redirect_fbo && !_direct) {
         actual = _redirect_fbo;
     }
     if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
@@ -788,7 +795,9 @@ GL_REG(glCheckFramebufferStatus, 1, 1, R_I32(glCheckFramebufferStatus(A_U32(0)))
 GL_REG(glFramebufferTexture2D, 5, 0, glFramebufferTexture2D(A_U32(0), A_U32(1), A_U32(2), A_U32(3), A_I32(4)))
 GL_REG(glFramebufferRenderbuffer, 4, 0, glFramebufferRenderbuffer(A_U32(0), A_U32(1), A_U32(2), A_U32(3)))
 GL_REG(glBlitFramebuffer, 10, 0, {
-    if (_last_draw_fbo == _redirect_fbo && (A_U32(8) & GL_COLOR_BUFFER_BIT)) {
+    /* the cart blitting its picture into "framebuffer 0": the redirect, or
+     * in direct mode the surface itself (its size still decides the mode) */
+    if ((_last_draw_fbo == _redirect_fbo || (_direct && _last_draw_fbo == 0)) && (A_U32(8) & GL_COLOR_BUFFER_BIT)) {
         _cart_blitted_to_redirect = 1;
         // Track the cart's actual render size from the source rect
         // Use signed math — Ganesh may blit with Y-inverted coords
@@ -1104,16 +1113,40 @@ extern "C" void wc_gl_blit_to_fbo(uint32_t target_fbo, uint32_t cart_w, uint32_t
 
 extern "C" void wc_gl_rebind_redirect(void) {
     if (!_redirect_fbo) return;
-    glBindFramebuffer(GL_FRAMEBUFFER, _redirect_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, _direct ? 0 : _redirect_fbo);
     glViewport(0, 0, _redirect_w, _redirect_h);
     // Put back the VAO the cart last bound (its element buffer lives there).
     // Carts that never bind a VAO (gl4es) get _cart_vao: Core 3.3 requires a
     // non-zero VAO for draw calls, else GL_INVALID_OPERATION.
     GLuint vao = _cart_bound_vao ? _cart_bound_vao : _cart_vao;
     if (vao) glBindVertexArray(vao);
-    _last_draw_fbo = _redirect_fbo;
+    _last_draw_fbo = _direct ? 0 : _redirect_fbo;
     _cart_blitted_to_redirect = 0;
     _draw_call_count = 0;
+}
+
+/* Switch direct present on or off, between frames. Leaves the cart's
+ * "framebuffer 0" bound (the surface or the redirect), so a cart that never
+ * rebinds still draws into the right one. */
+extern "C" void wc_gl_set_direct(int on) {
+    on = on ? 1 : 0;
+    if (on == _direct || !_redirect_fbo) return;
+    _direct = on;
+    glBindFramebuffer(GL_FRAMEBUFFER, _direct ? 0 : _redirect_fbo);
+    _last_draw_fbo = _direct ? 0 : _redirect_fbo;
+    _cart_blitted_to_redirect = 0;
+}
+extern "C" int wc_gl_is_direct(void) { return _direct; }
+
+/* Read the frame the cart just drew, w x h RGBA bottom-up, from where it drew
+ * it: the surface in direct mode (before the swap, while it is defined), else
+ * the redirect FBO. For tests (--shot). Leaves the cart's binding in place. */
+extern "C" int wc_gl_read_frame(uint8_t* out, uint32_t w, uint32_t h) {
+    if (!_redirect_fbo && !_direct) return 0;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, _direct ? 0 : _redirect_fbo);
+    glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, out);
+    glBindFramebuffer(GL_FRAMEBUFFER, _direct ? 0 : _redirect_fbo);
+    return 1;
 }
 
 extern "C" void wc_gl_get_blit_size(uint32_t* w, uint32_t* h) {
@@ -1156,6 +1189,12 @@ extern "C" void wc_gl_setup_redirect(uint32_t width, uint32_t height) {
 
 extern "C" void wc_gl_blit_to_screen(uint32_t cart_w, uint32_t cart_h, uint32_t win_w, uint32_t win_h) {
     if (!_redirect_fbo) return;
+    if (_direct) {
+        /* the cart drew straight onto the surface: nothing to copy */
+        _cart_blitted_to_redirect = 0;
+        _draw_call_count = 0;
+        return;
+    }
     // Use the cart's actual blit size if available (e.g. Godot renders 640x360 into 640x480 FBO)
     uint32_t src_w = _cart_blit_w ? _cart_blit_w : cart_w;
     uint32_t src_h = _cart_blit_h ? _cart_blit_h : cart_h;

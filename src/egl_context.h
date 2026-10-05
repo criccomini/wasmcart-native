@@ -9,6 +9,9 @@
 // Create an EGL context with a pbuffer surface (headless, for GL carts).
 // Must be called BEFORE SDL window creation.
 // Returns 0 on success.
+/* Before egl_create_context: ask for a multisampled surface (0 = none). */
+void egl_set_samples(int samples);
+int egl_get_samples(void);
 int egl_create_context(uint32_t width, uint32_t height);
 
 // Create a window surface from an SDL window's native handle.

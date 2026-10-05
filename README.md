@@ -18,6 +18,9 @@ Options:
   --fullscreen    Start in fullscreen mode
   --fps           Show FPS counter
   --uncapped      Disable vsync and frame cap
+  --msaa N        Multisampled window surface (N samples) for GL carts, a browser's antialias: true
+  --no-direct     Always present GL carts through the redirect FBO (by default a cart
+                  draws straight onto the window when it is exactly the cart's size)
 ```
 
 ## What It Runs

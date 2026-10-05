@@ -23,6 +23,10 @@ static EGLSurface egl_surface = EGL_NO_SURFACE;
 static EGLConfig egl_config;
 static bool initialized = false;
 static bool window_surface = false;
+static int egl_samples = 0; /* egl_set_samples: a multisampled surface (--msaa) */
+
+void egl_set_samples(int samples) { egl_samples = samples > 0 ? samples : 0; }
+int egl_get_samples(void) { return egl_samples; }
 
 #ifdef __APPLE__
 /* The original SDL handle and its resolved CALayer, plus deferred vsync:
@@ -69,7 +73,8 @@ int egl_create_context(uint32_t width, uint32_t height) {
     }
     fprintf(stderr, "wasmcart: EGL %d.%d\n", major, minor);
 
-    // Request GLES3 context
+    // Request GLES3 context (multisampled when egl_set_samples asked for it,
+    // falling back to the plain config if the display has none)
     EGLint config_attribs[] = {
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT | EGL_WINDOW_BIT,
@@ -79,13 +84,22 @@ int egl_create_context(uint32_t width, uint32_t height) {
         EGL_ALPHA_SIZE, 8,
         EGL_DEPTH_SIZE, 24,
         EGL_STENCIL_SIZE, 8,
+        EGL_SAMPLE_BUFFERS, egl_samples > 0 ? 1 : 0,
+        EGL_SAMPLES, egl_samples > 0 ? egl_samples : 0,
         EGL_NONE
     };
 
     EGLint num_configs;
     if (!eglChooseConfig(egl_display, config_attribs, &egl_config, 1, &num_configs) || num_configs == 0) {
-        fprintf(stderr, "wasmcart: eglChooseConfig failed\n");
-        return -1;
+        if (egl_samples > 0) {
+            fprintf(stderr, "wasmcart: no %d-sample EGL config, using a plain one\n", egl_samples);
+            config_attribs[17] = 0;
+            config_attribs[19] = 0;
+        }
+        if (!eglChooseConfig(egl_display, config_attribs, &egl_config, 1, &num_configs) || num_configs == 0) {
+            fprintf(stderr, "wasmcart: eglChooseConfig failed\n");
+            return -1;
+        }
     }
 
     EGLint ctx_attribs[] = {
