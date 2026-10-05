@@ -27,7 +27,13 @@ extern "C" {
 #include <string.h>
 #include <stdio.h>
 #include <random>
+#include <thread>
+#include <chrono>
+#include <string>
+#include <vector>
 #include "wc_log.h"
+#include "thread_worker_js.h"
+#include "../deps/miniz.h"
 extern "C" FILE* _wc_log_file = NULL;
 extern "C" long _wc_log_bytes = 0;
 #ifdef _WIN32
@@ -53,6 +59,10 @@ struct v8_host_state {
     v8::Global<v8::Function> fn_malloc;
     v8::Global<v8::Function> fn_wc_set_seed;
     v8::Global<v8::Object> memory_obj;   // WebAssembly.Memory
+
+    // WASI threads (wasi.thread-spawn). Empty for a cart that does not spawn.
+    v8::Global<v8::Object> threads;      // { spawn, shutdown, count } from WC_THREADS_SPAWNER_JS
+    v8::Global<v8::Function> thread_spawn_fn;
 };
 
 // ─── V8 helpers ──────────────────────────────────────────────────────────
@@ -151,6 +161,8 @@ static int v8_init() {
     return 0;
 }
 
+static void threads_shutdown(wc_host_t* host);
+
 // ─── Lifecycle ─────────────────────────────────────────────────────────
 
 extern "C" wc_host_t* wc_host_create(void) {
@@ -168,6 +180,7 @@ extern "C" wc_host_t* wc_host_create(void) {
 
 extern "C" void wc_host_destroy(wc_host_t* host) {
     if (!host) return;
+    if (host->v8_state) threads_shutdown(host);
     wc_archive_close(host);
     if (host->v8_state) {
         delete (v8_host_state*)host->v8_state;
@@ -764,6 +777,26 @@ static void v8_fd_write(const v8::FunctionCallbackInfo<v8::Value>& args) {
     args.GetReturnValue().Set(0); // success
 }
 
+// WASI errno values used below.
+#define WC_WASI_EBADF   8
+#define WC_WASI_EINVAL  28
+#define WC_WASI_ENOTSUP 58
+
+// True when [ptr, ptr+len) lies inside the cart's memory. Cart pointers are
+// untrusted; an out-of-range one must not become a host write.
+static bool cart_range_ok(uint32_t ptr, uint64_t len) {
+    return _current_host && _current_host->memory &&
+           (uint64_t)ptr + len <= _current_host->memory_size;
+}
+
+static void v8_fd_read(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    // No stdin: report end of file (nread = 0) rather than leave nread unset.
+    refresh_memory(_current_host);
+    uint32_t nread_ptr = args[3]->Uint32Value(ctx()).FromMaybe(0);
+    if (cart_range_ok(nread_ptr, 4)) wc_write_u32(_current_host->memory, nread_ptr, 0);
+    args.GetReturnValue().Set(0);
+}
+
 static void v8_fd_close(const v8::FunctionCallbackInfo<v8::Value>& args) {
     args.GetReturnValue().Set(0);
 }
@@ -772,26 +805,139 @@ static void v8_fd_seek(const v8::FunctionCallbackInfo<v8::Value>& args) {
     args.GetReturnValue().Set(0);
 }
 
+// stdin/stdout/stderr are character devices; there are no other descriptors.
+static void v8_fd_fdstat_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    refresh_memory(_current_host);
+    uint32_t fd = args[0]->Uint32Value(ctx()).FromMaybe(0);
+    uint32_t ptr = args[1]->Uint32Value(ctx()).FromMaybe(0);
+    if (fd > 2) { args.GetReturnValue().Set(WC_WASI_EBADF); return; }
+    if (!cart_range_ok(ptr, 24)) { args.GetReturnValue().Set(WC_WASI_EINVAL); return; }
+    uint8_t* m = _current_host->memory + ptr;
+    memset(m, 0, 24);
+    m[0] = 2;                               // filetype: character device
+    m[2] = fd == 0 ? 0 : 1;                 // fdflags: append for stdout/stderr
+    memset(m + 8, 0xff, 16);                // rights base + inheriting
+    args.GetReturnValue().Set(0);
+}
+
+static void v8_fd_fdstat_set_flags(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    uint32_t fd = args[0]->Uint32Value(ctx()).FromMaybe(0);
+    args.GetReturnValue().Set(fd > 2 ? WC_WASI_EBADF : 0);
+}
+
+static void v8_fd_filestat_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    refresh_memory(_current_host);
+    uint32_t fd = args[0]->Uint32Value(ctx()).FromMaybe(0);
+    uint32_t ptr = args[1]->Uint32Value(ctx()).FromMaybe(0);
+    if (fd > 2) { args.GetReturnValue().Set(WC_WASI_EBADF); return; }
+    if (!cart_range_ok(ptr, 64)) { args.GetReturnValue().Set(WC_WASI_EINVAL); return; }
+    memset(_current_host->memory + ptr, 0, 64);
+    _current_host->memory[ptr + 16] = 2;    // filetype: character device
+    args.GetReturnValue().Set(0);
+}
+
+// No preopened directories, so no filesystem: the preopen scan in wasi-libc
+// stops at the first EBADF. Returning success here (the old stub) made that
+// scan walk every descriptor number with an uninitialised prestat.
+static void v8_return_ebadf(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    args.GetReturnValue().Set(WC_WASI_EBADF);
+}
+
+// environ_sizes_get / args_sizes_get: both counts are zero, and are WRITTEN --
+// libc reads them straight back to size its arrays.
+static void v8_sizes_get_zero(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    refresh_memory(_current_host);
+    uint32_t count_ptr = args[0]->Uint32Value(ctx()).FromMaybe(0);
+    uint32_t size_ptr = args[1]->Uint32Value(ctx()).FromMaybe(0);
+    if (cart_range_ok(count_ptr, 4)) wc_write_u32(_current_host->memory, count_ptr, 0);
+    if (cart_range_ok(size_ptr, 4)) wc_write_u32(_current_host->memory, size_ptr, 0);
+    args.GetReturnValue().Set(0);
+}
+
 static void v8_proc_exit(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    // Do nothing — cart tried to exit
+    // proc_exit never returns. Returning into the cart lands on the
+    // unreachable libc places after it, so stop the call here instead, with a
+    // message that says what actually happened.
+    int32_t code = args[0]->Int32Value(ctx()).FromMaybe(0);
+    char msg[64];
+    snprintf(msg, sizeof msg, "cart called proc_exit(%d)", code);
+    g_isolate->ThrowException(v8::Exception::Error(v8str(msg)));
+}
+
+// One clock for every thread: uv_hrtime is what a worker's
+// process.hrtime.bigint() reads, so a deadline computed on one thread means
+// the same instant on another (pthread_cond_timedwait depends on that).
+static uint64_t wasi_now_ns(void) {
+    return uv_hrtime();
 }
 
 static void v8_clock_time_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
     // clock_time_get(id, precision, timestamp_ptr) -> errno
     refresh_memory(_current_host);
     uint32_t ts_ptr = args[2]->Uint32Value(ctx()).FromJust();
-    uint64_t nanos;
-#ifdef _WIN32
-    LARGE_INTEGER freq, count;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&count);
-    nanos = (uint64_t)((double)count.QuadPart / freq.QuadPart * 1000000000.0);
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    nanos = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-#endif
-    *(uint64_t*)(_current_host->memory + ts_ptr) = nanos;
+    uint64_t nanos = wasi_now_ns();
+    if (!cart_range_ok(ts_ptr, 8)) { args.GetReturnValue().Set(WC_WASI_EINVAL); return; }
+    memcpy(_current_host->memory + ts_ptr, &nanos, 8);
+    args.GetReturnValue().Set(0);
+}
+
+static void v8_clock_res_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    refresh_memory(_current_host);
+    uint32_t ptr = args[1]->Uint32Value(ctx()).FromMaybe(0);
+    uint64_t res = 1000;  // 1us
+    if (!cart_range_ok(ptr, 8)) { args.GetReturnValue().Set(WC_WASI_EINVAL); return; }
+    memcpy(_current_host->memory + ptr, &res, 8);
+    args.GetReturnValue().Set(0);
+}
+
+static void v8_sched_yield(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    std::this_thread::yield();
+    args.GetReturnValue().Set(0);
+}
+
+// poll_oneoff(in, out, nsubscriptions, nevents_ptr) -> errno
+// Clock subscriptions sleep until the earliest one is due (this is how
+// wasi-libc implements nanosleep/usleep). fd subscriptions are reported at once
+// with ENOTSUP: there is nothing to wait on.
+static void v8_poll_oneoff(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    refresh_memory(_current_host);
+    uint32_t in_ptr = args[0]->Uint32Value(ctx()).FromMaybe(0);
+    uint32_t out_ptr = args[1]->Uint32Value(ctx()).FromMaybe(0);
+    uint32_t nsubs = args[2]->Uint32Value(ctx()).FromMaybe(0);
+    uint32_t nevents_ptr = args[3]->Uint32Value(ctx()).FromMaybe(0);
+    if (nsubs == 0) { args.GetReturnValue().Set(WC_WASI_EINVAL); return; }
+    if (!cart_range_ok(in_ptr, (uint64_t)nsubs * 48) || !cart_range_ok(out_ptr, (uint64_t)nsubs * 32) ||
+        !cart_range_ok(nevents_ptr, 4)) {
+        args.GetReturnValue().Set(WC_WASI_EINVAL);
+        return;
+    }
+    uint64_t now = wasi_now_ns();
+    bool have_clock = false;
+    uint64_t wait_ns = 0;
+    for (uint32_t i = 0; i < nsubs; i++) {
+        const uint8_t* sub = _current_host->memory + in_ptr + i * 48;
+        if (sub[8] != 0) continue;           // not a clock subscription
+        uint64_t timeout; uint16_t flags;
+        memcpy(&timeout, sub + 24, 8);
+        memcpy(&flags, sub + 40, 2);
+        if (flags & 1) timeout = timeout > now ? timeout - now : 0;   // absolute
+        if (!have_clock || timeout < wait_ns) wait_ns = timeout;
+        have_clock = true;
+    }
+    if (have_clock && wait_ns > 0)
+        std::this_thread::sleep_for(std::chrono::nanoseconds(wait_ns));
+    refresh_memory(_current_host);           // another thread may have grown memory
+    for (uint32_t i = 0; i < nsubs; i++) {
+        const uint8_t* sub = _current_host->memory + in_ptr + i * 48;
+        uint8_t* ev = _current_host->memory + out_ptr + i * 32;
+        uint8_t type = sub[8];
+        memset(ev, 0, 32);
+        memcpy(ev, sub, 8);                   // userdata
+        uint16_t err = type == 0 ? 0 : WC_WASI_ENOTSUP;
+        memcpy(ev + 8, &err, 2);
+        ev[10] = type;
+    }
+    wc_write_u32(_current_host->memory, nevents_ptr, nsubs);
     args.GetReturnValue().Set(0);
 }
 
@@ -809,18 +955,207 @@ static v8::Local<v8::Object> build_wasi_imports() {
     wasi->Set(ctx(), v8str("fd_write"), make_fn(v8_fd_write)).Check();
     wasi->Set(ctx(), v8str("fd_close"), make_fn(v8_fd_close)).Check();
     wasi->Set(ctx(), v8str("fd_seek"), make_fn(v8_fd_seek)).Check();
+    wasi->Set(ctx(), v8str("fd_read"), make_fn(v8_fd_read)).Check();
+    wasi->Set(ctx(), v8str("fd_fdstat_get"), make_fn(v8_fd_fdstat_get)).Check();
+    wasi->Set(ctx(), v8str("fd_fdstat_set_flags"), make_fn(v8_fd_fdstat_set_flags)).Check();
+    wasi->Set(ctx(), v8str("fd_filestat_get"), make_fn(v8_fd_filestat_get)).Check();
+    wasi->Set(ctx(), v8str("fd_prestat_get"), make_fn(v8_return_ebadf)).Check();
+    wasi->Set(ctx(), v8str("fd_prestat_dir_name"), make_fn(v8_return_ebadf)).Check();
+    wasi->Set(ctx(), v8str("path_open"), make_fn(v8_return_ebadf)).Check();
+    wasi->Set(ctx(), v8str("path_filestat_get"), make_fn(v8_return_ebadf)).Check();
     wasi->Set(ctx(), v8str("proc_exit"), make_fn(v8_proc_exit)).Check();
     wasi->Set(ctx(), v8str("clock_time_get"), make_fn(v8_clock_time_get)).Check();
+    wasi->Set(ctx(), v8str("clock_res_get"), make_fn(v8_clock_res_get)).Check();
     wasi->Set(ctx(), v8str("random_get"), make_fn(v8_random_get)).Check();
-    // fd_read, fd_prestat_get, fd_prestat_dir_name, environ_get, etc. — return error
-    wasi->Set(ctx(), v8str("fd_read"), make_fn(v8_noop_return_0)).Check();
-    wasi->Set(ctx(), v8str("fd_prestat_get"), make_fn(v8_noop_return_0)).Check();
-    wasi->Set(ctx(), v8str("fd_prestat_dir_name"), make_fn(v8_noop_return_0)).Check();
+    wasi->Set(ctx(), v8str("sched_yield"), make_fn(v8_sched_yield)).Check();
+    wasi->Set(ctx(), v8str("poll_oneoff"), make_fn(v8_poll_oneoff)).Check();
     wasi->Set(ctx(), v8str("environ_get"), make_fn(v8_noop_return_0)).Check();
-    wasi->Set(ctx(), v8str("environ_sizes_get"), make_fn(v8_noop_return_0)).Check();
+    wasi->Set(ctx(), v8str("environ_sizes_get"), make_fn(v8_sizes_get_zero)).Check();
     wasi->Set(ctx(), v8str("args_get"), make_fn(v8_noop_return_0)).Check();
-    wasi->Set(ctx(), v8str("args_sizes_get"), make_fn(v8_noop_return_0)).Check();
+    wasi->Set(ctx(), v8str("args_sizes_get"), make_fn(v8_sizes_get_zero)).Check();
     return wasi;
+}
+
+// ─── WASI threads ───────────────────────────────────────────────────────
+
+// Limits of the module's imported memory, read from the import section. The
+// JS API cannot tell us these (WebAssembly.Module.imports gives no type), and
+// a shared memory import only links against a memory with the same initial,
+// maximum and shared flag -- the old 1-page stub was a LinkError.
+struct wasm_memory_import {
+    std::string module, name;
+    uint64_t initial = 0, maximum = 0;
+    bool has_max = false, shared = false, is64 = false;
+};
+
+static bool read_leb_u64(const uint8_t* b, size_t len, size_t* pos, uint64_t* out) {
+    uint64_t result = 0;
+    unsigned shift = 0;
+    while (*pos < len && shift < 64) {
+        uint8_t byte = b[(*pos)++];
+        result |= (uint64_t)(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) { *out = result; return true; }
+        shift += 7;
+    }
+    return false;
+}
+
+static bool parse_memory_import(const uint8_t* b, size_t len, wasm_memory_import* out) {
+    size_t pos = 8;  // magic + version
+    while (pos < len) {
+        uint8_t id = b[pos++];
+        uint64_t size;
+        if (!read_leb_u64(b, len, &pos, &size) || pos + size > len) return false;
+        size_t end = pos + (size_t)size;
+        if (id != 2) { pos = end; continue; }        // only the import section
+        uint64_t count;
+        if (!read_leb_u64(b, len, &pos, &count)) return false;
+        for (uint64_t i = 0; i < count && pos < end; i++) {
+            uint64_t n;
+            if (!read_leb_u64(b, len, &pos, &n) || pos + n > end) return false;
+            std::string mod((const char*)b + pos, (size_t)n); pos += (size_t)n;
+            if (!read_leb_u64(b, len, &pos, &n) || pos + n > end) return false;
+            std::string name((const char*)b + pos, (size_t)n); pos += (size_t)n;
+            if (pos >= end) return false;
+            uint8_t kind = b[pos++];
+            uint64_t tmp;
+            switch (kind) {
+            case 0x00:  // function: type index
+                if (!read_leb_u64(b, len, &pos, &tmp)) return false;
+                break;
+            case 0x01: {  // table: reftype, limits
+                pos++;
+                if (pos >= end) return false;
+                uint8_t f = b[pos++];
+                if (!read_leb_u64(b, len, &pos, &tmp)) return false;
+                if ((f & 1) && !read_leb_u64(b, len, &pos, &tmp)) return false;
+                break;
+            }
+            case 0x02: {  // memory: limits
+                if (pos >= end) return false;
+                uint8_t f = b[pos++];
+                out->module = mod;
+                out->name = name;
+                out->has_max = f & 1;
+                out->shared = (f & 2) != 0;
+                out->is64 = (f & 4) != 0;
+                if (!read_leb_u64(b, len, &pos, &out->initial)) return false;
+                if (out->has_max && !read_leb_u64(b, len, &pos, &out->maximum)) return false;
+                return true;
+            }
+            case 0x03:  // global: valtype, mutability
+                pos += 2;
+                break;
+            case 0x04:  // tag: attribute, type index
+                pos++;
+                if (!read_leb_u64(b, len, &pos, &tmp)) return false;
+                break;
+            default:
+                return false;
+            }
+        }
+        return false;  // import section without a memory import
+    }
+    return false;
+}
+
+static void v8_thread_spawn(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    args.GetReturnValue().Set(-1);
+    if (!_current_host) return;
+    auto state = (v8_host_state*)_current_host->v8_state;
+    if (state->thread_spawn_fn.IsEmpty()) return;
+    v8::Local<v8::Value> argv[1] = { args[0] };
+    v8::TryCatch tc(g_isolate);
+    v8::Local<v8::Value> r;
+    if (!state->thread_spawn_fn.Get(g_isolate)->Call(ctx(), ctx()->Global(), 1, argv).ToLocal(&r)) {
+        if (tc.HasCaught()) {
+            v8::String::Utf8Value e(g_isolate, tc.Exception());
+            wc_log("wasmcart: thread-spawn failed: %s\n", *e);
+        }
+        return;
+    }
+    args.GetReturnValue().Set(r->Int32Value(ctx()).FromMaybe(-1));
+}
+
+// What a worker needs to read assets on its own: the .wasc path and where each
+// entry sits in it. Workers cannot call into this C code (they are separate
+// isolates), and the main thread may be parked in a futex wait, so they read
+// the archive themselves with the same lookup rules as asset_loader.c.
+static v8::Local<v8::Object> build_thread_cfg(wc_host_t* host, const char* wasc_path) {
+    auto cfg = v8::Object::New(g_isolate);
+    auto index = v8::Object::New(g_isolate);
+    mz_zip_archive* zip = (mz_zip_archive*)host->archive;
+    if (zip) {
+        mz_uint n = mz_zip_reader_get_num_files(zip);
+        for (mz_uint i = 0; i < n; i++) {
+            mz_zip_archive_file_stat st;
+            if (!mz_zip_reader_file_stat(zip, i, &st) || st.m_is_directory) continue;
+            auto e = v8::Object::New(g_isolate);
+            e->Set(ctx(), v8str("ofs"), v8::Number::New(g_isolate, (double)st.m_local_header_ofs)).Check();
+            e->Set(ctx(), v8str("csize"), v8::Number::New(g_isolate, (double)st.m_comp_size)).Check();
+            e->Set(ctx(), v8str("usize"), v8::Number::New(g_isolate, (double)st.m_uncomp_size)).Check();
+            e->Set(ctx(), v8str("method"), v8::Integer::New(g_isolate, st.m_method)).Check();
+            index->Set(ctx(), v8str(st.m_filename), e).Check();
+        }
+    }
+    char path_buf[4096];
+    const char* abs_path = wasc_path;
+#ifndef _WIN32
+    if (realpath(wasc_path, path_buf)) abs_path = path_buf;
+#else
+    if (_fullpath(path_buf, wasc_path, sizeof path_buf)) abs_path = path_buf;
+#endif
+    cfg->Set(ctx(), v8str("wascPath"), v8str(abs_path)).Check();
+    cfg->Set(ctx(), v8str("zipIndex"), zip ? index.As<v8::Value>() : v8::Null(g_isolate).As<v8::Value>()).Check();
+    cfg->Set(ctx(), v8str("assetsRoot"), v8str(host->manifest.assets)).Check();
+    // _filelist.txt: same body the main thread serves.
+    int32_t flen = wc_archive_asset_size(host, "_filelist.txt");
+    if (flen >= 0) {
+        std::vector<uint8_t> buf((size_t)flen + 1);
+        int32_t got = wc_archive_load_asset(host, "_filelist.txt", buf.data(), (uint32_t)flen);
+        cfg->Set(ctx(), v8str("fileList"),
+            v8::String::NewFromUtf8(g_isolate, (const char*)buf.data(), v8::NewStringType::kNormal,
+                got > 0 ? got : 0).ToLocalChecked()).Check();
+    } else {
+        cfg->Set(ctx(), v8str("fileList"), v8::Null(g_isolate)).Check();
+    }
+    return cfg;
+}
+
+// Stop every cart thread. Called from wc_host_destroy, outside the frame loop's
+// persistent V8 scopes. A thread parked in memory.atomic.wait wakes for
+// terminate() (V8 interrupts futex waits); the loop is pumped so the exits are
+// observed before the environment goes away.
+static void threads_shutdown(wc_host_t* host) {
+    auto state = (v8_host_state*)host->v8_state;
+    if (!state || state->threads.IsEmpty()) return;
+    v8::Locker locker(g_isolate);
+    v8::Isolate::Scope isolate_scope(g_isolate);
+    v8::HandleScope handle_scope(g_isolate);
+    v8::Context::Scope context_scope(ctx());
+    auto threads = state->threads.Get(g_isolate);
+    auto call = [&](const char* name) -> int32_t {
+        v8::Local<v8::Value> fn;
+        if (!threads->Get(ctx(), v8str(name)).ToLocal(&fn) || !fn->IsFunction()) return 0;
+        v8::TryCatch tc(g_isolate);
+        v8::Local<v8::Value> r;
+        if (!fn.As<v8::Function>()->Call(ctx(), threads, 0, nullptr).ToLocal(&r)) return 0;
+        return r->Int32Value(ctx()).FromMaybe(0);
+    };
+    call("shutdown");
+    uint64_t deadline = uv_hrtime() + 2000000000ULL;  // 2s
+    while (call("count") > 0 && uv_hrtime() < deadline) {
+        {
+            node::CallbackScope scope(g_env, v8::Object::New(g_isolate), {0, 0});
+        }
+        uv_run(g_setup->event_loop(), UV_RUN_NOWAIT);
+        g_isolate->PerformMicrotaskCheckpoint();
+        uv_sleep(5);
+    }
+    int32_t left = call("count");
+    if (left > 0) wc_log("wasmcart: %d cart thread(s) did not stop within 2s\n", left);
+    state->thread_spawn_fn.Reset();
+    state->threads.Reset();
 }
 
 // ─── Load cart ─────────────────────────────────────────────────────────
@@ -874,6 +1209,116 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
     auto gl_imports_obj = v8::Object::New(g_isolate);
     wc_gl_build_v8_imports(g_isolate, ctx(), gl_imports_obj, env_imports, host);
     imports->Set(ctx(), v8str("gl"), gl_imports_obj).Check();
+
+    // 3b. Imported memory and WASI threads.
+    //
+    // A module that IMPORTS its memory (every wasm32-wasip1-threads cart does,
+    // shared) needs one built to its own declared limits; the generic stub
+    // below made a 1-page memory, which fails to link. Threads need that
+    // memory shared, plus a real wasi.thread-spawn. Mirrors CartHost.js.
+    v8::Local<v8::Object> imported_memory;
+    {
+        auto wasm_module_ns = wasm_ns->Get(ctx(), v8str("Module")).ToLocalChecked().As<v8::Object>();
+        auto list = [&](const char* which) {
+            auto fn = wasm_module_ns->Get(ctx(), v8str(which)).ToLocalChecked().As<v8::Function>();
+            v8::Local<v8::Value> a[] = { wasm_module };
+            return fn->Call(ctx(), wasm_ns, 1, a).ToLocalChecked().As<v8::Array>();
+        };
+        auto has = [&](v8::Local<v8::Array> arr, const char* mod, const char* name, const char* kind) {
+            for (uint32_t i = 0; i < arr->Length(); i++) {
+                auto e = arr->Get(ctx(), i).ToLocalChecked().As<v8::Object>();
+                if (mod) {
+                    v8::String::Utf8Value m(g_isolate, e->Get(ctx(), v8str("module")).ToLocalChecked());
+                    if (strcmp(*m, mod) != 0) continue;
+                }
+                v8::String::Utf8Value n(g_isolate, e->Get(ctx(), v8str("name")).ToLocalChecked());
+                v8::String::Utf8Value k(g_isolate, e->Get(ctx(), v8str("kind")).ToLocalChecked());
+                if (strcmp(*n, name) == 0 && strcmp(*k, kind) == 0) return true;
+            }
+            return false;
+        };
+        bool spawn_import = has(list("imports"), "wasi", "thread-spawn", "function");
+        bool start_export = has(list("exports"), nullptr, "wasi_thread_start", "function");
+        if (spawn_import != start_export) {
+            wc_log("wasmcart: cart %s but does not %s. Both are required for WASI threads.\n",
+                spawn_import ? "imports wasi.thread-spawn" : "exports wasi_thread_start",
+                spawn_import ? "export wasi_thread_start" : "import wasi.thread-spawn");
+            return -1;
+        }
+        host->threaded = spawn_import;
+
+        wasm_memory_import mi;
+        if (parse_memory_import(host->wasm_bytes, host->wasm_bytes_len, &mi)) {
+            if (mi.is64) {
+                wc_log("wasmcart: cart imports a memory64 memory, which is not supported\n");
+                return -1;
+            }
+            if (host->threaded && !mi.shared) {
+                wc_log("wasmcart: threaded cart must import a SHARED memory (link with --shared-memory)\n");
+                return -1;
+            }
+            auto mem_ctor = wasm_ns->Get(ctx(), v8str("Memory")).ToLocalChecked().As<v8::Function>();
+            auto desc = v8::Object::New(g_isolate);
+            desc->Set(ctx(), v8str("initial"), v8::Number::New(g_isolate, (double)mi.initial)).Check();
+            if (mi.has_max)
+                desc->Set(ctx(), v8str("maximum"), v8::Number::New(g_isolate, (double)mi.maximum)).Check();
+            if (mi.shared)
+                desc->Set(ctx(), v8str("shared"), v8::True(g_isolate)).Check();
+            v8::Local<v8::Value> m_args[] = { desc };
+            v8::Local<v8::Object> mem;
+            if (!mem_ctor->NewInstance(ctx(), 1, m_args).ToLocal(&mem)) {
+                if (try_catch.HasCaught()) {
+                    v8::String::Utf8Value err(g_isolate, try_catch.Exception());
+                    wc_log("wasmcart: cannot create the cart's imported memory: %s\n", *err);
+                }
+                return -1;
+            }
+            auto mod_str = v8str(mi.module.c_str());
+            auto mod_val = imports->Get(ctx(), mod_str).ToLocalChecked();
+            v8::Local<v8::Object> mod_obj;
+            if (mod_val->IsObject()) mod_obj = mod_val.As<v8::Object>();
+            else { mod_obj = v8::Object::New(g_isolate); imports->Set(ctx(), mod_str, mod_obj).Check(); }
+            mod_obj->Set(ctx(), v8str(mi.name.c_str()), mem).Check();
+            imported_memory = mem;
+            wc_log("wasmcart: imported memory %s.%s: %llu pages%s%s%s\n",
+                mi.module.c_str(), mi.name.c_str(), (unsigned long long)mi.initial,
+                mi.has_max ? ", max " : "",
+                mi.has_max ? std::to_string(mi.maximum).c_str() : "",
+                mi.shared ? ", shared" : "");
+        } else if (host->threaded) {
+            wc_log("wasmcart: threaded cart must import a shared memory (link with --import-memory --shared-memory)\n");
+            return -1;
+        }
+
+        if (host->threaded) {
+            v8::Local<v8::Script> sc;
+            v8::Local<v8::Value> factory;
+            if (!v8::Script::Compile(ctx(), v8str(WC_THREADS_SPAWNER_JS)).ToLocal(&sc) ||
+                !sc->Run(ctx()).ToLocal(&factory) || !factory->IsFunction()) {
+                wc_log("wasmcart: failed to set up WASI threads\n");
+                return -1;
+            }
+            v8::Local<v8::Value> f_args[] = {
+                wasm_module, imported_memory, build_thread_cfg(host, wasc_path), v8str(WC_THREAD_WORKER_JS),
+            };
+            v8::Local<v8::Value> threads;
+            if (!factory.As<v8::Function>()->Call(ctx(), ctx()->Global(), 4, f_args).ToLocal(&threads) ||
+                !threads->IsObject()) {
+                if (try_catch.HasCaught()) {
+                    v8::String::Utf8Value err(g_isolate, try_catch.Exception());
+                    wc_log("wasmcart: failed to set up WASI threads: %s\n", *err);
+                }
+                return -1;
+            }
+            auto spawn = threads.As<v8::Object>()->Get(ctx(), v8str("spawn")).ToLocalChecked().As<v8::Function>();
+            state->threads.Reset(g_isolate, threads.As<v8::Object>());
+            state->thread_spawn_fn.Reset(g_isolate, spawn);
+            auto wasi_ns = v8::Object::New(g_isolate);
+            wasi_ns->Set(ctx(), v8str("thread-spawn"), make_fn(v8_thread_spawn)).Check();
+            imports->Set(ctx(), v8str("wasi"), wasi_ns).Check();
+            wc_log("wasmcart: threaded cart (wasi.thread-spawn); threads run as node workers\n");
+        }
+    }
 
     // 4. Auto-stub missing imports
     // V8 doesn't have wasmtime's "define_unknown_imports_as_default_values" — we must provide every import.
@@ -963,8 +1408,10 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
     auto exports = instance->Get(ctx(), v8str("exports")).ToLocalChecked().As<v8::Object>();
     state->exports_obj.Reset(g_isolate, exports);
 
-    // Memory
+    // Memory: the exported one, else the one we built for the import (a
+    // threaded cart need not re-export the memory it imports).
     auto mem_val = exports->Get(ctx(), v8str("memory")).ToLocalChecked();
+    if (mem_val->IsUndefined() && !imported_memory.IsEmpty()) mem_val = imported_memory;
     if (!mem_val->IsUndefined()) {
         state->memory_obj.Reset(g_isolate, mem_val.As<v8::Object>());
         refresh_memory(host);

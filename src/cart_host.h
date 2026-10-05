@@ -64,6 +64,9 @@ struct wc_host {
 
     // GL state
     bool uses_gl;
+
+    // WASI threads: imports wasi.thread-spawn + exports wasi_thread_start
+    bool threaded;
     wc_gl_get_proc_fn gl_loader;
 
     // Audio ring buffer state

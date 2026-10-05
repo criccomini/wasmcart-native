@@ -155,6 +155,23 @@ This mirrors the JS hosts' `deterministic:{seed}` exactly: unpinned differs
 every run, pinned reproduces bit-for-bit. `test/seed_test.c` asserts both
 directions against the `detrng` fixture.
 
+## Threads
+
+Threaded carts (`wasm32-wasip1-threads`: `wasi.thread-spawn` plus a shared,
+imported `WebAssembly.Memory`) run as the spec requires. The host builds the
+imported memory from the limits the module declares, and each spawned thread is a
+node `worker_thread` (its own V8 isolate on its own native thread) that
+instantiates the same compiled module against the same shared memory and calls
+`wasi_thread_start(tid, start_arg)`. Threads may spawn threads. This is the same
+model as the JS host (`CartHost.js` + `cartWorker.js`).
+
+A thread has the main thread's import table: WASI (`fd_write` to stdout/stderr,
+clocks, `poll_oneoff` sleeps, `sched_yield`, ...), `wc_log` and asset loading
+work everywhere; GL and the other `wc_*` imports are main-thread only and throw if
+a thread calls them. A cart that imports `thread-spawn` without exporting
+`wasi_thread_start` (or the reverse) is refused. Threads are terminated when the
+host is destroyed.
+
 ## Resolution
 
 The host passes preferred resolution to the cart via `--res`. The cart decides its actual rendering resolution. The host scales the output to fit the window, preserving aspect ratio with letterboxing. Without `--res`, the window matches the cart's native resolution.
