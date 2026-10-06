@@ -23,8 +23,14 @@ Options:
                   draws straight onto the window when it is exactly the cart's size)
   --fixed-step MS The host clock advances exactly MS milliseconds per frame
                   (time_ms = frame * MS) instead of wall time (tests)
-  --shot N FILE   Save frame N of a GL cart as a PPM (tests); with --fixed-step
-                  the capture is reproducible
+  --shot N FILE   Save frame N of a GL or WebGPU cart as a PPM (tests); with
+                  --fixed-step the capture is reproducible
+
+Environment:
+  WASMCART_NO_WGPU=1     Act as a host without WebGPU (refuse WebGPU-only carts,
+                         run dual carts on GL)
+  WASMCART_WGPU_DIR=DIR  Where the WebGPU support files are (default: wgpu/
+                         beside the executable)
 ```
 
 ## What It Runs
@@ -36,6 +42,7 @@ Every `.wasc` cart that runs in the browser or Node.js also runs here. Same WASM
 | 2D framebuffer | SDL2 accelerated renderer, letterboxed | Snake, Doom, ccleste, pygame carts |
 | GL (GLES3) | EGL + direct GL, FBO redirect, letterboxed | OpenArena, [GZDoom](https://zdoom.org), [Neverball](https://neverball.org), ETR |
 | [Godot](https://godotengine.org) 4.x | GL + GLES3 Compatibility renderer | Warlords, RoboBlast, Kenney Platformer |
+| WebGPU (`gpu_api` 2) | Dawn (Vulkan) through native-dawn, letterboxed into a WebGPU window surface. Linux; needs a build with WebGPU (below) | [Defold](https://defold.com) WebGPU carts, three.js WebGPURenderer carts |
 
 ## Performance
 
@@ -74,6 +81,32 @@ make -j$(nproc)
 # Run
 ./wasmcart-run /path/to/game.wasc
 ```
+
+### WebGPU support
+
+WebGPU carts (wasmcart SPEC.md, "WebGPU") run on the reference host's own
+JavaScript, inside this player's embedded Node, with Dawn from
+[native-dawn](https://github.com/monteslu/native-dawn). Point CMake at both:
+
+```bash
+cmake .. -DWASMCART_WGPU_JS_DIR=<wasmcart checkout>/src/wgpu \
+         -DNATIVE_DAWN_DIR=<native-dawn>/dist/linux-x64
+```
+
+Every build then refreshes a `wgpu/` directory beside `wasmcart-run`: the
+bridge (`src/wgpu_bridge.cjs`), wasmcart's `host.js` and generated glue, and
+`dawn.node` + `libwebgpu_dawn.so`. Ship that directory with the binary.
+Without it the player has no WebGPU: a WebGPU-only cart is refused at load
+with that reason, and a cart that also imports GL runs on GL (which is how
+the libretro and Android builds behave today).
+
+The executable exports Node-API and libuv symbols (`-Wl,--dynamic-list`) so
+`dawn.node` can load at all; libnode is linked statically and its symbols are
+otherwise hidden. Linux only so far: macOS and Windows need their own export
+and window-surface code.
+
+`test/wgpu_test.sh` runs the WebGPU fixtures headless (render, compute
+readback, dual carts, refusals, repeated clean exits).
 
 ### Pre-built binaries
 
@@ -230,6 +263,9 @@ Determined by the cart's `gpu_api` field:
 |---------|------|-------------|
 | 0 | 2D framebuffer | SDL2 accelerated renderer + letterboxing |
 | 1 | WebGL2 / GLES3 | EGL window surface + FBO redirect + letterboxing |
+| 2 | WebGPU | WebGPU surface on the window (Wayland, X11, Win32), the cart's frame drawn letterboxed. Selected by the cart's WebGPU imports; a cart importing both GPU APIs gets WebGPU when this build has it, else GL |
+
+Any other `gpu_api`, and 2 with no WebGPU imports, is refused at load.
 
 ## Development Notes
 
@@ -251,6 +287,7 @@ node ../wasmcart/test/wsserver.mjs --port 8796 &   # from the wasmcart repo
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 ./peer_test 8796 <granted.wasc> <ungranted.wasc>   # wc_peer_* end to end
 ./seed_test ../wasmcart/test/fixtures/detrng.wasc  # entropy differs, pinned reproduces
+sh test/wgpu_test.sh          # WebGPU carts (needs a build with WebGPU support)
 ```
 
 `text_test` takes the cart's debug-field offsets as arguments because they move
