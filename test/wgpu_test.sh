@@ -14,6 +14,7 @@
 #   dualgpu_bad  calls glClear whatever the host selected; must trap
 #   gpuapi2/3    gpu_api values the cart does not back; refused
 #   wgpufake     imports a WebGPU function the glue lacks; refused
+#   wasicart     wgpucart built with wasi-sdk (wasip1-threads, two workers)
 #
 # Every run must also EXIT cleanly: teardown with GPU work in flight used to
 # abort or segfault in node::FreeEnvironment.
@@ -73,6 +74,12 @@ check "webgpu cart: clean exit"                        "$(cat "$OUT/wgpucart.sta
 run dualgpu 3 dual
 check "dual cart: WebGPU selected, green"              "$(pixel dual 64 48 2>/dev/null)" "0,255,0"
 check "dual cart: clean exit"                          "$(cat "$OUT/dual.status")" "0"
+
+run wasicart 30 wasi
+check "wasi-sdk threaded cart: triangle"                 "$(pixel wasi 128 110 2>/dev/null)" "255,128,64"
+check "wasi-sdk threaded cart: compute result"           "$(pixel wasi 2 2 2>/dev/null)" "42,0,255"
+has   "wasi-sdk threaded cart: its workers run as threads" wasi "threads run as node workers"
+check "wasi-sdk threaded cart: clean exit"               "$(cat "$OUT/wasi.status")" "0"
 
 run dualgpu_bad 3 bad
 has   "dual cart calling GL on WebGPU traps, naming the call" bad "called glClear, but this host selected WebGPU"
