@@ -42,7 +42,7 @@ Every `.wasc` cart that runs in the browser or Node.js also runs here. Same WASM
 | 2D framebuffer | SDL2 accelerated renderer, letterboxed | Snake, Doom, ccleste, pygame carts |
 | GL (GLES3) | EGL + direct GL, FBO redirect, letterboxed | OpenArena, [GZDoom](https://zdoom.org), [Neverball](https://neverball.org), ETR |
 | [Godot](https://godotengine.org) 4.x | GL + GLES3 Compatibility renderer | Warlords, RoboBlast, Kenney Platformer |
-| WebGPU (`gpu_api` 2) | Dawn (Vulkan) through native-dawn, letterboxed into a WebGPU window surface. Linux; needs a build with WebGPU (below) | [Defold](https://defold.com) WebGPU carts, three.js WebGPURenderer carts |
+| WebGPU (`gpu_api` 2) | Dawn (Vulkan) through native-dawn, letterboxed into a WebGPU window surface. Linux; needs a build with WebGPU (below) | [Defold](https://defold.com) WebGPU carts, three.js WebGPURenderer carts, wasi-sdk carts built with wasmcart's `wgpu-wasi/` (threads included) |
 
 ## Performance
 
@@ -89,7 +89,7 @@ JavaScript, inside this player's embedded Node, with Dawn from
 [native-dawn](https://github.com/monteslu/native-dawn). Point CMake at both:
 
 ```bash
-cmake .. -DWASMCART_WGPU_JS_DIR=<wasmcart checkout>/src/wgpu \
+cmake .. -DWASMCART_WGPU_JS_DIR=<wasmcart 0.32.0 or later>/src/wgpu \
          -DNATIVE_DAWN_DIR=<native-dawn>/dist/linux-x64
 ```
 
@@ -204,7 +204,7 @@ model as the JS host (`CartHost.js` + `cartWorker.js`).
 
 A thread has the main thread's import table: WASI (`fd_write` to stdout/stderr,
 clocks, `poll_oneoff` sleeps, `sched_yield`, ...), `wc_log` and asset loading
-work everywhere; GL and the other `wc_*` imports are main-thread only and throw if
+work everywhere; GL, WebGPU and the other `wc_*` imports are main-thread only and throw if
 a thread calls them. A cart that imports `thread-spawn` without exporting
 `wasi_thread_start` (or the reverse) is refused. Threads are terminated when the
 host is destroyed.
@@ -263,7 +263,7 @@ Determined by the cart's `gpu_api` field:
 |---------|------|-------------|
 | 0 | 2D framebuffer | SDL2 accelerated renderer + letterboxing |
 | 1 | WebGL2 / GLES3 | EGL window surface + FBO redirect + letterboxing |
-| 2 | WebGPU | WebGPU surface on the window (Wayland, X11, Win32), the cart's frame drawn letterboxed. Selected by the cart's WebGPU imports; a cart importing both GPU APIs gets WebGPU when this build has it, else GL |
+| 2 | WebGPU | WebGPU surface on the window (Wayland, X11; Linux only so far), the cart's frame drawn letterboxed. Selected by the cart's WebGPU imports; a cart importing both GPU APIs gets WebGPU when this build has it, else GL |
 
 Any other `gpu_api`, and 2 with no WebGPU imports, is refused at load.
 
