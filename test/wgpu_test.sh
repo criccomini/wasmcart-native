@@ -71,6 +71,11 @@ check "webgpu cart: triangle"                           "$(pixel wgpucart 128 11
 check "webgpu cart: compute result reached the cart"   "$(pixel wgpucart 2 2 2>/dev/null)" "42,0,255"
 check "webgpu cart: clean exit"                        "$(cat "$OUT/wgpucart.status")" "0"
 
+has   "webgpu cart: the adapter it got is logged"         wgpucart "wasmcart-run: WebGPU on "
+
+run wgpucart 3 lowpower WASMCART_WGPU_POWER=low-power
+has   "WASMCART_WGPU_POWER reaches the adapter request"     lowpower "compatibility, low-power)"
+
 run dualgpu 3 dual
 check "dual cart: WebGPU selected, green"              "$(pixel dual 64 48 2>/dev/null)" "0,255,0"
 check "dual cart: clean exit"                          "$(cat "$OUT/dual.status")" "0"

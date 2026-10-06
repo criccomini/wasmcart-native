@@ -31,6 +31,9 @@ Environment:
                          run dual carts on GL)
   WASMCART_WGPU_DIR=DIR  Where the WebGPU support files are (default: wgpu/
                          beside the executable)
+  WASMCART_WGPU_POWER=low-power|high-performance
+                         Which GPU WebGPU carts get on a two-GPU machine
+                         (low-power = integrated); the choice is logged
 ```
 
 ## What It Runs

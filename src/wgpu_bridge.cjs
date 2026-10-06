@@ -41,8 +41,14 @@ module.exports = function createBridge(dir) {
       return job(async () => {
         if (process.env.WASMCART_NO_WGPU === '1') throw new Error('WebGPU is disabled (WASMCART_NO_WGPU=1)');
         gpu ??= dawn.create([]);
-        const adapter = await gpu.requestAdapter(host.WGPU_ADAPTER_OPTIONS);
+        // WASMCART_WGPU_POWER=low-power|high-performance picks the GPU on a
+        // two-GPU machine (wasmcart docs/webgpu.md); the choice is logged so a
+        // caller can assert it.
+        const adapterOptions = host.wgpuAdapterOptions();
+        const adapter = await gpu.requestAdapter(adapterOptions);
         if (!adapter) throw new Error('no WebGPU adapter is available (check the GPU driver)');
+        const a = host.describeAdapter(adapter, adapterOptions);
+        process.stderr.write(`wasmcart-run: WebGPU on ${a.device || a.description} (${a.vendor}, ${a.featureLevel}${a.powerPreference ? ', ' + a.powerPreference : ''})\n`);
         const session = await host.createWgpuSession({
           moduleImports: WebAssembly.Module.imports(module), gpu, adapter, width, height,
           globals: dawn.globals,
