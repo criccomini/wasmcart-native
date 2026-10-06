@@ -39,6 +39,9 @@ extern "C" long _wc_log_bytes = 0;
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>  // _NSGetExecutablePath
+#endif
 
 // ─── V8 state (module-level, single isolate) ──────────────────────────────
 
@@ -1236,7 +1239,6 @@ static std::string wgpu_dir() {
     exe[n] = 0;
 #elif defined(__APPLE__)
     uint32_t sz = sizeof(exe);
-    extern int _NSGetExecutablePath(char*, uint32_t*);
     if (_NSGetExecutablePath(exe, &sz) != 0) return "";
 #elif defined(_WIN32)
     if (!GetModuleFileNameA(NULL, exe, sizeof(exe))) return "";
