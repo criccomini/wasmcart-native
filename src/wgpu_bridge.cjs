@@ -41,7 +41,7 @@ module.exports = function createBridge(dir) {
       return job(async () => {
         if (process.env.WASMCART_NO_WGPU === '1') throw new Error('WebGPU is disabled (WASMCART_NO_WGPU=1)');
         gpu ??= dawn.create([]);
-        const adapter = await gpu.requestAdapter();
+        const adapter = await gpu.requestAdapter(host.WGPU_ADAPTER_OPTIONS);
         if (!adapter) throw new Error('no WebGPU adapter is available (check the GPU driver)');
         const session = await host.createWgpuSession({
           moduleImports: WebAssembly.Module.imports(module), gpu, adapter, width, height,
