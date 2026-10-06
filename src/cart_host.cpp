@@ -2062,6 +2062,15 @@ extern "C" int32_t wc_test_call_export(wc_host_t* host, const char* name,
     return r->Int32Value(ctx()).FromMaybe(-1);
 }
 
+extern "C" uint32_t wc_host_debug_state(wc_host_t* host) {
+    if (!host || !host->v8_state || host->trapped || !(host->info.flags & WC_FLAG_DEBUG)) return 0;
+    v8::HandleScope hs(g_isolate);
+    v8::Context::Scope cs(ctx());
+    int32_t r = wc_test_call_export(host, "wc_debug_state", 0, 0, 0, 0);
+    refresh_memory(host);
+    return r > 0 ? (uint32_t)r : 0;
+}
+
 /* Write bytes straight into cart memory at an absolute offset (test only). */
 extern "C" int wc_test_poke(wc_host_t* host, uint32_t off, const void* data, uint32_t len) {
     if (!host || !host->memory) return -1;

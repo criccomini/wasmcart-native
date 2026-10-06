@@ -38,6 +38,9 @@ static void print_usage(const char* argv0) {
     fprintf(stderr, "  --uncapped      Disable vsync and frame cap\n");
     fprintf(stderr, "  --fixed-step MS Host clock advances exactly MS per frame (deterministic tests)\n");
     fprintf(stderr, "  --shot N FILE   Save frame N of a GL cart as a PPM (tests)\n");
+    fprintf(stderr, "  --debug-dump N FILE  After frame N, write the cart's debug state as JSON (tests)\n");
+    fprintf(stderr, "  --debug-cmd N TEXT   Before frame N, post TEXT to a cartwheel-style dbg.cmd mailbox;\n");
+    fprintf(stderr, "                       replies (dbg.reply) print to stderr (repeatable)\n");
 }
 
 // ─── Controller management ─────────────────────────────────────────────────
@@ -153,6 +156,126 @@ static void poll_keyboard_as_pad(wc_pad_t* pad) {
 static volatile sig_atomic_t g_should_quit = 0;
 static void on_quit_signal(int sig) { (void)sig; g_should_quit = 1; }
 
+// ─── Debug state (tests) ─────────────────────────────────────────────────
+//
+// --debug-dump reads the cart's named debug fields (SPEC "Debug state") and
+// writes them as one JSON object: {"name": value | [values] | "hex"}, the
+// form cartwheel's run-cart.mjs writes for its other hosts. --debug-cmd posts
+// a request into a mailbox carried by three fields: dbg.cmd (bytes, the
+// NUL-terminated request), dbg.cmd_seq (u32, bumped per request) and the
+// reply fields dbg.reply / dbg.reply_seq / dbg.reply_len, which is how
+// cartwheel carts (and romdev's wasm({op:'command'})) speak. Host side only:
+// both read and write existing debug fields, no new ABI.
+typedef struct { uint32_t name, ptr, type, len; } dbg_field;
+
+static int dbg_fields(wc_host_t* host, dbg_field* out, int cap, uint8_t** mem_out, uint32_t* size_out) {
+    uint32_t base = wc_host_debug_state(host);
+    uint32_t size = 0;
+    uint8_t* mem = (uint8_t*)wc_host_get_memory(host, &size);
+    *mem_out = mem;
+    *size_out = size;
+    if (!base || !mem) return 0;
+    int n = 0;
+    for (uint32_t p = base; n < cap && p + 16 <= size; p += 16) {
+        uint32_t name; memcpy(&name, mem + p, 4);
+        if (!name) break;
+        dbg_field f = { name, 0, mem[p + 8], 0 };
+        memcpy(&f.ptr, mem + p + 4, 4);
+        memcpy(&f.len, mem + p + 12, 4);
+        out[n++] = f;
+    }
+    return n;
+}
+
+static const char* dbg_name(const uint8_t* mem, uint32_t size, uint32_t p) {
+    return p < size && memchr(mem + p, 0, size - p) ? (const char*)(mem + p) : "";
+}
+
+static const dbg_field* dbg_find(const dbg_field* f, int n, const uint8_t* mem, uint32_t size, const char* name) {
+    for (int i = 0; i < n; i++) if (!strcmp(dbg_name(mem, size, f[i].name), name)) return &f[i];
+    return NULL;
+}
+
+static void dbg_dump(wc_host_t* host, const char* path) {
+    static dbg_field f[1024];
+    uint8_t* mem; uint32_t size;
+    int n = dbg_fields(host, f, 1024, &mem, &size);
+    FILE* out = fopen(path, "wb");
+    if (!out) { fprintf(stderr, "wasmcart: cannot write %s\n", path); return; }
+    static const int sizes[] = { 1, 1, 2, 2, 4, 4, 4, 8 };
+    fputc('{', out);
+    for (int i = 0; i < n; i++) {
+        fprintf(out, "%s\"", i ? ", " : "");
+        for (const char* c = dbg_name(mem, size, f[i].name); *c; c++) {
+            if (*c == '"' || *c == '\\') fputc('\\', out);
+            fputc(*c, out);
+        }
+        fputs("\": ", out);
+        if (f[i].type == 8) { /* bytes: hex */
+            fputc('"', out);
+            for (uint32_t k = 0; k < f[i].len && f[i].ptr + k < size; k++) fprintf(out, "%02x", mem[f[i].ptr + k]);
+            fputc('"', out);
+            continue;
+        }
+        if (f[i].type > 7) { fputs("null", out); continue; }
+        if (f[i].len != 1) fputc('[', out);
+        for (uint32_t k = 0; k < f[i].len; k++) {
+            uint32_t at = f[i].ptr + k * sizes[f[i].type];
+            if (at + sizes[f[i].type] > size) break;
+            const uint8_t* q = mem + at;
+            if (k) fputs(", ", out);
+            switch (f[i].type) {
+                case 0: fprintf(out, "%u", q[0]); break;
+                case 1: fprintf(out, "%d", (int8_t)q[0]); break;
+                case 2: { uint16_t v; memcpy(&v, q, 2); fprintf(out, "%u", v); } break;
+                case 3: { int16_t v; memcpy(&v, q, 2); fprintf(out, "%d", v); } break;
+                case 4: { uint32_t v; memcpy(&v, q, 4); fprintf(out, "%u", v); } break;
+                case 5: { int32_t v; memcpy(&v, q, 4); fprintf(out, "%d", v); } break;
+                case 6: { float v; memcpy(&v, q, 4); fprintf(out, "%.9g", (double)v); } break;
+                case 7: { double v; memcpy(&v, q, 8); fprintf(out, "%.17g", v); } break;
+            }
+        }
+        if (f[i].len != 1) fputc(']', out);
+    }
+    fputs("}\n", out);
+    fclose(out);
+    fprintf(stderr, "wasmcart: debug state (%d fields) -> %s\n", n, path);
+}
+
+/* post a request; false when the cart has no mailbox */
+static bool dbg_post(wc_host_t* host, const char* text) {
+    static dbg_field f[1024];
+    uint8_t* mem; uint32_t size;
+    int n = dbg_fields(host, f, 1024, &mem, &size);
+    const dbg_field* cmd = dbg_find(f, n, mem, size, "dbg.cmd");
+    const dbg_field* seq = dbg_find(f, n, mem, size, "dbg.cmd_seq");
+    size_t len = strlen(text);
+    if (!cmd || !seq || cmd->type != 8 || len + 1 > cmd->len || cmd->ptr + cmd->len > size || seq->ptr + 4 > size) {
+        fprintf(stderr, "wasmcart: --debug-cmd: the cart has no dbg.cmd mailbox big enough (not a cartwheel debug cart?)\n");
+        return false;
+    }
+    memcpy(mem + cmd->ptr, text, len + 1);
+    uint32_t v; memcpy(&v, mem + seq->ptr, 4); v++; memcpy(mem + seq->ptr, &v, 4);
+    return true;
+}
+
+/* print a reply that arrived since the last call */
+static void dbg_poll_reply(wc_host_t* host, uint32_t* last_seq) {
+    static dbg_field f[1024];
+    uint8_t* mem; uint32_t size;
+    int n = dbg_fields(host, f, 1024, &mem, &size);
+    const dbg_field* seq = dbg_find(f, n, mem, size, "dbg.reply_seq");
+    const dbg_field* rep = dbg_find(f, n, mem, size, "dbg.reply");
+    const dbg_field* len = dbg_find(f, n, mem, size, "dbg.reply_len");
+    if (!seq || !rep || !len || seq->ptr + 4 > size || len->ptr + 4 > size) return;
+    uint32_t s, l; memcpy(&s, mem + seq->ptr, 4); memcpy(&l, mem + len->ptr, 4);
+    if (s == *last_seq) return;
+    *last_seq = s;
+    if (l > rep->len) l = rep->len;
+    if (rep->ptr + l > size) return;
+    fprintf(stderr, "wasmcart: debug reply %u: %.*s\n", s, (int)l, (const char*)(mem + rep->ptr));
+}
+
 // ─── Save data ──────────────────────────────────────────────────────────
 //
 // A cart's save block is a region of its own linear memory that the host is
@@ -221,6 +344,12 @@ int main(int argc, char* argv[]) {
     double fixed_step = 0.0; /* --fixed-step MS: time_ms = frame * MS (tests) */
     uint32_t pref_width = 0;
     uint32_t pref_height = 0;
+    long dump_frame = -1;    /* --debug-dump N FILE */
+    const char* dump_path = NULL;
+    enum { MAX_DBG_CMDS = 64 };
+    long dbg_cmd_frame[MAX_DBG_CMDS];
+    const char* dbg_cmd_text[MAX_DBG_CMDS];
+    int dbg_cmd_count = 0;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--res") == 0 && i + 1 < argc) {
@@ -250,6 +379,15 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "wasmcart: --fixed-step needs a positive number of milliseconds\n");
                 return 1;
             }
+        }
+        else if (strcmp(argv[i], "--debug-dump") == 0 && i + 2 < argc) {
+            dump_frame = atol(argv[++i]);
+            dump_path = argv[++i];
+        }
+        else if (strcmp(argv[i], "--debug-cmd") == 0 && i + 2 < argc) {
+            if (dbg_cmd_count == MAX_DBG_CMDS) { fprintf(stderr, "wasmcart: too many --debug-cmd\n"); return 1; }
+            dbg_cmd_frame[dbg_cmd_count] = atol(argv[++i]);
+            dbg_cmd_text[dbg_cmd_count++] = argv[++i];
         }
         else if (strcmp(argv[i], "--shot") == 0 && i + 2 < argc) {
             shot_frame = atol(argv[++i]);
@@ -639,8 +777,17 @@ int main(int argc, char* argv[]) {
             wc_gl_set_direct(want);
         }
 
+        // --debug-cmd: requests due before this frame (the cart answers at its start)
+        for (int k = 0; k < dbg_cmd_count; k++)
+            if (dbg_cmd_frame[k] == (long)frame_count) dbg_post(host, dbg_cmd_text[k]);
+
         // Run frame
         wc_host_run_frame(host);
+        if (dbg_cmd_count) {
+            static uint32_t reply_seq = 0;
+            dbg_poll_reply(host, &reply_seq);
+        }
+        if (dump_path && (long)frame_count == dump_frame) dbg_dump(host, dump_path);
 
         // After first frame: cart may have resized (Godot reads host_info and reconfigures)
         // Resize redirect FBO to match actual render dimensions

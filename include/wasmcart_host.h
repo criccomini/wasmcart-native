@@ -64,6 +64,7 @@ extern "C" {
 // ignore it; carts must not set it. WC_FLAG_NET_PEER governs all networking.
 #define WC_FLAG_POINTER   (1 << 3)
 #define WC_FLAG_KEYBOARD  (1 << 4)
+#define WC_FLAG_DEBUG     (1 << 5)  // cart exports wc_debug_state() (SPEC "Debug state")
 
 // ─── Structs ───────────────────────────────────────────────────────────────
 
@@ -377,6 +378,14 @@ const wc_manifest_t*  wc_host_get_manifest(wc_host_t* host);
 
 // Direct memory access (for save states, etc.)
 void*  wc_host_get_memory(wc_host_t* host, uint32_t* size);
+
+// Named debug state (SPEC "Debug state"): the cart-memory offset of the
+// cart's wc_debug_field_t array (16-byte entries: name_ptr, value_ptr, type
+// u8, len u32 at 12; ended by name_ptr == 0) from its wc_debug_state()
+// export; 0 when the cart does not opt in (no WC_FLAG_DEBUG or no export).
+// Pull-only: call between frames, then re-read wc_host_get_memory (the call
+// may grow memory).
+uint32_t wc_host_debug_state(wc_host_t* host);
 
 #ifdef __cplusplus
 }
