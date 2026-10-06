@@ -166,6 +166,47 @@ if(EGL_LIB)
     target_link_libraries(wasmcart-run PRIVATE ${EGL_LIB})
 endif()
 
+# ─── WebGPU (SPEC.md, "WebGPU") ─────────────────────────────────────────
+#
+# WebGPU carts run on the reference host's JavaScript (wasmcart's src/wgpu)
+# and Dawn's Node addon (native-dawn), loaded at runtime from a `wgpu/`
+# directory beside the executable. Without both paths the build has no
+# WebGPU: WebGPU-only carts are refused with that reason, carts that also
+# import GL run on GL.
+#
+#   -DWASMCART_WGPU_JS_DIR=<wasmcart checkout>/src/wgpu
+#   -DNATIVE_DAWN_DIR=<native-dawn>/dist/<platform>-<arch>
+set(WASMCART_WGPU_JS_DIR "" CACHE PATH "wasmcart's src/wgpu directory (host.js and the generated glue)")
+set(NATIVE_DAWN_DIR "" CACHE PATH "native-dawn install prefix for this platform")
+if(WASMCART_WGPU_JS_DIR AND NATIVE_DAWN_DIR)
+    set(WGPU_OUT "$<TARGET_FILE_DIR:wasmcart-run>/wgpu")
+    file(WRITE "${CMAKE_BINARY_DIR}/wgpu-package.json" "{ \"type\": \"module\" }\n")
+    # A target of its own, run on every build: as a POST_BUILD step it only ran
+    # when the executable relinked, so edited JS was silently left stale.
+    add_custom_target(wasmcart-wgpu ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${WGPU_OUT}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/wgpu_bridge.cjs"
+            "${WASMCART_WGPU_JS_DIR}/host.js"
+            "${WASMCART_WGPU_JS_DIR}/glue-loader.js"
+            "${WASMCART_WGPU_JS_DIR}/emdawnwebgpu-glue.mjs"
+            "${WASMCART_WGPU_JS_DIR}/emdawnwebgpu-glue-manifest.js"
+            "${NATIVE_DAWN_DIR}/lib/dawn.node"
+            "${NATIVE_DAWN_DIR}/lib/libwebgpu_dawn.so"
+            "${WGPU_OUT}/"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/wgpu-package.json" "${WGPU_OUT}/package.json"
+        COMMENT "WebGPU support -> wgpu/")
+    add_dependencies(wasmcart-wgpu wasmcart-run)
+endif()
+
+# Native addons (dawn.node above) resolve N-API and libuv from the process
+# that loads them. libnode is linked statically, so its symbols are inside
+# this executable but not exported until listed here.
+if(UNIX AND NOT APPLE)
+    file(WRITE "${CMAKE_BINARY_DIR}/node-api-exports.list" "{ napi_*; node_api_*; uv_*; };\n")
+    target_link_options(wasmcart-run PRIVATE "-Wl,--dynamic-list=${CMAKE_BINARY_DIR}/node-api-exports.list")
+endif()
+
 # ─── Status ─────────────────────────────────────────────────────────────
 
 message(STATUS "")

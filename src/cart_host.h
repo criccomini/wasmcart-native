@@ -65,6 +65,13 @@ struct wc_host {
     // GL state
     bool uses_gl;
 
+    // WebGPU (SPEC.md, "WebGPU"): what the cart imports, and what the host
+    // selected. A cart importing both GPU APIs runs on WebGPU when this host
+    // has it (built with WASMCART_WGPU and an adapter exists), else on GL.
+    bool cart_imports_gl;
+    bool cart_imports_wgpu;
+    bool uses_wgpu;
+
     // WASI threads: imports wasi.thread-spawn + exports wasi_thread_start
     bool threaded;
     wc_gl_get_proc_fn gl_loader;

@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <signal.h>
+#include <math.h>
 
 #define MAX_CONTROLLERS 4
 
@@ -435,6 +436,9 @@ int main(int argc, char* argv[]) {
     const wc_cart_info_t* info = wc_host_get_cart_info(host);
     const wc_manifest_t* manifest = wc_host_get_manifest(host);
     bool is_gl = wc_host_uses_gl(host);
+    // A WebGPU cart (SPEC.md, "WebGPU") has no GL context: the host draws its
+    // frame into a WebGPU surface on the window.
+    bool is_wgpu = wc_host_uses_wgpu(host);
 
     // A GL cart cannot run without a GL context, and its first GL call through
     // an unresolved proc is a NULL jump. Say why instead of segfaulting.
@@ -449,8 +453,8 @@ int main(int argc, char* argv[]) {
     uint32_t cart_w = info->width;
     uint32_t cart_h = info->height;
     uint32_t win_w, win_h;
-    if (is_gl) {
-        // GL carts: use preferred dimensions if specified, otherwise cart defaults
+    if (is_gl || is_wgpu) {
+        // GPU carts: use preferred dimensions if specified, otherwise cart defaults
         win_w = pref_width ? pref_width : cart_w;
         win_h = pref_height ? pref_height : cart_h;
     } else {
@@ -500,9 +504,38 @@ int main(int argc, char* argv[]) {
     SDL_Renderer* renderer = NULL;
     SDL_Texture* fb_tex = NULL;
 
+    // WebGPU carts: no EGL; a WebGPU surface on the window's native handles.
+    // A window without native handles (SDL's offscreen driver) still runs the
+    // cart, with nothing presented: --shot reads the cart's own frame.
+    if (is_wgpu) {
+        egl_destroy();
+        SDL_SysWMinfo wm_info;
+        SDL_VERSION(&wm_info.version);
+        int attached = -1;
+        if (SDL_GetWindowWMInfo(window, &wm_info)) {
+#ifdef SDL_VIDEO_DRIVER_WAYLAND
+            if (wm_info.subsystem == SDL_SYSWM_WAYLAND)
+                attached = wc_host_wgpu_attach_window(host, "wayland",
+                    (uint64_t)(uintptr_t)wm_info.info.wl.display, (uint64_t)(uintptr_t)wm_info.info.wl.surface);
+#endif
+#ifdef SDL_VIDEO_DRIVER_X11
+            if (wm_info.subsystem == SDL_SYSWM_X11)
+                attached = wc_host_wgpu_attach_window(host, "xlib",
+                    (uint64_t)(uintptr_t)wm_info.info.x11.display, (uint64_t)wm_info.info.x11.window);
+#endif
+#ifdef SDL_VIDEO_DRIVER_WINDOWS
+            if (wm_info.subsystem == SDL_SYSWM_WINDOWS)
+                attached = wc_host_wgpu_attach_window(host, "win32",
+                    (uint64_t)(uintptr_t)wm_info.info.win.hinstance, (uint64_t)(uintptr_t)wm_info.info.win.window);
+#endif
+        }
+        fprintf(stderr, attached == 0 ? "wasmcart: rendering %ux%u via WebGPU\n"
+                                      : "wasmcart: rendering %ux%u via WebGPU, no window surface (nothing presented)\n",
+                cart_w, cart_h);
+    }
     // 2D carts: destroy EGL (conflicts with SDL renderer), use SDL accelerated renderer
     // GL carts: keep EGL for direct GL rendering
-    if (!is_gl) {
+    else if (!is_gl) {
         egl_destroy();
         uint32_t render_flags = SDL_RENDERER_ACCELERATED;
         if (!uncapped) render_flags |= SDL_RENDERER_PRESENTVSYNC;
@@ -832,8 +865,30 @@ int main(int argc, char* argv[]) {
             free(px);
         }
 
+        if (shot_path && (long)frame_count == shot_frame && is_wgpu) {
+            const wc_cart_info_t* ci = wc_host_get_cart_info(host);
+            uint32_t rw = ci->width, rh = ci->height;
+            uint8_t* px = (uint8_t*)malloc((size_t)rw * rh * 4);
+            FILE* f = px && wc_host_wgpu_read_frame(host, px, rw, rh) == 0 ? fopen(shot_path, "wb") : NULL;
+            if (f) {
+                fprintf(f, "P6\n%u %u\n255\n", rw, rh);
+                for (size_t i = 0; i < (size_t)rw * rh; i++) fwrite(px + i * 4, 1, 3, f);  // top-down already
+                fclose(f);
+                fprintf(stderr, "wasmcart: frame %ld -> %s (webgpu)\n", shot_frame, shot_path);
+            }
+            free(px);
+        }
+
         // Present
-        if (egl_is_initialized()) {
+        if (is_wgpu) {
+            // Letterbox the cart into the window's pixels, as the GL path does.
+            int ww, wh;
+            SDL_GetWindowSizeInPixels(window, &ww, &wh);
+            const wc_cart_info_t* ci = wc_host_get_cart_info(host);
+            double s = fmin((double)ww / ci->width, (double)wh / ci->height);
+            int dw = (int)(ci->width * s), dh = (int)(ci->height * s);
+            wc_host_wgpu_present(host, (ww - dw) / 2, (wh - dh) / 2, dw, dh, ww, wh);
+        } else if (egl_is_initialized()) {
             // GL carts: blit redirect FBO to screen, then swap
             extern void wc_gl_blit_to_screen(uint32_t cart_w, uint32_t cart_h, uint32_t win_w, uint32_t win_h);
             // The letterbox rect and viewport are in surface PIXELS. On Retina

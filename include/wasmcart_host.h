@@ -364,6 +364,24 @@ uint8_t*        wc_host_get_save_data(wc_host_t* host, uint32_t* size);
 
 // GL carts
 bool wc_host_uses_gl(wc_host_t* host);
+
+/* WebGPU (SPEC.md, "WebGPU"). True if the cart runs on WebGPU: it imports
+ * WebGPU functions and this host was built with WASMCART_WGPU (a `wgpu/`
+ * directory beside the executable, or $WASMCART_WGPU_DIR) and found an
+ * adapter. Such a cart has no GL context and no framebuffer to read: present
+ * it with wc_host_wgpu_present and read it with wc_host_wgpu_read_frame. */
+bool wc_host_uses_wgpu(wc_host_t* host);
+/* kind: "xlib", "wayland", "win32" or "metal-layer". display is the X11
+ * Display pointer, wl_display pointer or HINSTANCE (0 for metal-layer);
+ * handle is the X11 Window id, wl_surface pointer, HWND or CAMetalLayer
+ * pointer. 0 on success. */
+int wc_host_wgpu_attach_window(wc_host_t* host, const char* kind, uint64_t display, uint64_t handle);
+/* Draw the frame letterboxed into (x, y, w, h) of a win_w x win_h window
+ * surface and present it. 0 on success. */
+int wc_host_wgpu_present(wc_host_t* host, int x, int y, int w, int h, int win_w, int win_h);
+/* The last frame, top-down RGBA, w*h*4 bytes at the cart's size. Waits for
+ * the GPU. 0 on success. */
+int wc_host_wgpu_read_frame(wc_host_t* host, uint8_t* out, uint32_t w, uint32_t h);
 // Set a function that resolves GL function names to pointers.
 // For standalone: use eglGetProcAddress. For libretro: use retro_hw_get_proc_address.
 typedef void* (*wc_gl_get_proc_fn)(const char* name);

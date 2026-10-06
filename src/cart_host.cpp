@@ -162,6 +162,9 @@ static int v8_init() {
 }
 
 static void threads_shutdown(wc_host_t* host);
+static v8::Local<v8::Value> wgpu_call(wc_host_t* host, const char* method, int argc, v8::Local<v8::Value>* args);
+static v8::Local<v8::Value> wgpu_wait(wc_host_t* host, v8::Local<v8::Value> job, std::string* err, int timeout_ms);
+static void pump_node(wc_host_t* host);
 
 // ─── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -181,9 +184,34 @@ extern "C" wc_host_t* wc_host_create(void) {
 extern "C" void wc_host_destroy(wc_host_t* host) {
     if (!host) return;
     if (host->v8_state) threads_shutdown(host);
+    bool had_wgpu = host->uses_wgpu;
+    if (had_wgpu) {
+        // Players call this after wc_host_exit_v8, so take the isolate again.
+        v8::Locker locker(g_isolate);
+        v8::Isolate::Scope isolate_scope(g_isolate);
+        v8::HandleScope hs(g_isolate);
+        v8::Context::Scope cs(ctx());
+        std::string why;
+        wgpu_wait(host, wgpu_call(host, "destroy", 0, nullptr), &why, 3000);
+        host->uses_wgpu = false;
+    }
     wc_archive_close(host);
     if (host->v8_state) {
+        v8::Locker locker(g_isolate);
         delete (v8_host_state*)host->v8_state;
+        host->v8_state = nullptr;
+    }
+    if (had_wgpu) {
+        // Collect the cart's Dawn objects NOW, with Dawn alive. Left alone they
+        // are finalized by node::FreeEnvironment, which a player reaches from
+        // a static destructor at exit; Dawn's own state can already be gone by
+        // then, and that crashed about one exit in four.
+        v8::Locker locker(g_isolate);
+        v8::Isolate::Scope isolate_scope(g_isolate);
+        v8::HandleScope hs(g_isolate);
+        v8::Context::Scope cs(ctx());
+        g_isolate->LowMemoryNotification();
+        for (int i = 0; i < 20; i++) pump_node(host);
     }
     free(host->text_queue);
     for (uint32_t i = 0; i < host->peer_count; i++) {
@@ -216,6 +244,18 @@ static int check_abi_version(wc_host_t* host) {
         wc_log("wasmcart: ABI version mismatch: cart=%u, host supports %d-%d. "
                "Rebuild the cart against the current wasmcart.h.\n",
                host->info.version, WC_MIN_ABI_VERSION, WC_ABI_VERSION);
+        return -1;
+    }
+    // gpu_api values a cart does not back are refused, not guessed at. Every
+    // value above 0 used to mean GL here, so a WebGPU cart loaded and drew
+    // nothing.
+    if (host->info.gpu_api == WC_GPU_API_WEBGPU && !host->cart_imports_wgpu) {
+        wc_log("wasmcart: cart declares gpu_api 2 (WebGPU) but imports no WebGPU functions\n");
+        return -1;
+    }
+    if (host->info.gpu_api > WC_GPU_API_WEBGPU) {
+        wc_log("wasmcart: cart declares gpu_api %u, which this host does not support "
+               "(0 = 2D, 1 = GL, 2 = WebGPU)\n", host->info.gpu_api);
         return -1;
     }
     return 0;
@@ -251,7 +291,12 @@ static void parse_cart_info(wc_host_t* host, uint32_t info_ptr) {
     // is GL: a hybrid cart (gl imports + fb fallback surface) was being
     // forced onto the 2D path here, which presents its fallback framebuffer
     // and silently never runs its GL renderer.
-    if (info->gpu_api > 0) {
+    if (host->uses_wgpu) {
+        host->uses_gl = false;
+    } else if (info->gpu_api == WC_GPU_API_WEBGPU) {
+        // A dual cart this host runs on GL (no WebGPU here).
+        host->uses_gl = host->cart_imports_gl;
+    } else if (info->gpu_api > 0) {
         host->uses_gl = true;
     } else if (!host->uses_gl) {
         host->uses_gl = (info->fb_ptr == 0);
@@ -276,7 +321,8 @@ static void write_host_info(wc_host_t* host, const wc_host_options_t* opts) {
     wc_write_u32(mem, ptr + WC_HOST_INFO_PREFERRED_HEIGHT, pref_h);
     wc_write_u32(mem, ptr + WC_HOST_INFO_HOST_FPS, opts ? opts->host_fps : 60);
     wc_write_u32(mem, ptr + WC_HOST_INFO_AUDIO_SAMPLE_RATE, opts ? opts->audio_sample_rate : 48000);
-    wc_write_u32(mem, ptr + WC_HOST_INFO_FLAGS, 0);
+    // WC_HOST_FLAG_GPU_WGPU (0x02): this host selected WebGPU for the cart.
+    wc_write_u32(mem, ptr + WC_HOST_INFO_FLAGS, host->uses_wgpu ? 0x02u : 0u);
 }
 
 // ─── Build WASM import object ──────────────────────────────────────────
@@ -1158,6 +1204,132 @@ static void threads_shutdown(wc_host_t* host) {
     state->threads.Reset();
 }
 
+// ─── WebGPU (SPEC.md, "WebGPU") ───────────────────────────────────────
+//
+// WebGPU carts reuse the reference host's JavaScript: wgpu_bridge.cjs loads
+// wasmcart's src/wgpu/host.js and native-dawn's dawn.node from a `wgpu/`
+// directory next to the executable (or $WASMCART_WGPU_DIR). A build without
+// that directory has no WebGPU: a WebGPU-only cart is refused with that
+// reason, and a cart that also imports GL runs on GL.
+
+static void pump_node(wc_host_t* host);
+
+static v8::Global<v8::Object> g_wgpu_bridge;
+static std::string g_wgpu_unavailable;
+static bool g_wgpu_probed = false;
+
+static bool is_wgpu_import_name(const char* n) {
+    auto upper_after = [&](const char* prefix) {
+        size_t k = strlen(prefix);
+        return strncmp(n, prefix, k) == 0 && n[k] >= 'A' && n[k] <= 'Z';
+    };
+    return upper_after("wgpu") || upper_after("emwgpu") || strncmp(n, "emscripten_webgpu_", 18) == 0;
+}
+
+static std::string wgpu_dir() {
+    const char* env = getenv("WASMCART_WGPU_DIR");
+    if (env && *env) return env;
+    char exe[4096] = {0};
+#if defined(__linux__)
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return "";
+    exe[n] = 0;
+#elif defined(__APPLE__)
+    uint32_t sz = sizeof(exe);
+    extern int _NSGetExecutablePath(char*, uint32_t*);
+    if (_NSGetExecutablePath(exe, &sz) != 0) return "";
+#elif defined(_WIN32)
+    if (!GetModuleFileNameA(NULL, exe, sizeof(exe))) return "";
+#endif
+    std::string s(exe);
+    size_t slash = s.find_last_of("/\\");
+    return (slash == std::string::npos ? std::string(".") : s.substr(0, slash)) + "/wgpu";
+}
+
+static v8::Local<v8::Value> run_js_fn(const char* src, int argc, v8::Local<v8::Value>* argv) {
+    v8::Local<v8::Script> script;
+    v8::Local<v8::Value> fn, out;
+    if (!v8::Script::Compile(ctx(), v8str(src)).ToLocal(&script) || !script->Run(ctx()).ToLocal(&fn) || !fn->IsFunction())
+        return v8::Undefined(g_isolate);
+    if (!fn.As<v8::Function>()->Call(ctx(), ctx()->Global(), argc, argv).ToLocal(&out))
+        return v8::Undefined(g_isolate);
+    return out;
+}
+
+// The bridge object, loaded once per process; empty with g_wgpu_unavailable
+// set when this host cannot provide WebGPU.
+static v8::Local<v8::Object> wgpu_bridge() {
+    if (!g_wgpu_probed) {
+        g_wgpu_probed = true;
+        std::string dir = wgpu_dir();
+        v8::Local<v8::Value> argv[] = { v8str(dir.c_str()) };
+        auto r = run_js_fn(
+            "(function (dir) {"
+            "  const fs = __wc_require('node:fs'), p = __wc_require('node:path');"
+            "  if (!fs.existsSync(p.join(dir, 'wgpu_bridge.cjs')))"
+            "    return 'this build of wasmcart-native has no WebGPU support (no ' + dir + '/wgpu_bridge.cjs)';"
+            // __wc_require is the embedder's main-script require, which only
+            // resolves node built-ins; a file needs a real one.
+            "  try { return __wc_require('node:module').createRequire(p.join(dir, 'wgpu_bridge.cjs'))(p.join(dir, 'wgpu_bridge.cjs'))(dir); }"
+            "  catch (e) { return 'loading WebGPU support from ' + dir + ' failed: ' + e.message; }"
+            "})", 1, argv);
+        if (r->IsObject()) g_wgpu_bridge.Reset(g_isolate, r.As<v8::Object>());
+        else if (r->IsString()) { v8::String::Utf8Value s(g_isolate, r); g_wgpu_unavailable = *s; }
+        else g_wgpu_unavailable = "loading WebGPU support failed";
+    }
+    if (g_wgpu_bridge.IsEmpty()) return v8::Local<v8::Object>();
+    return g_wgpu_bridge.Get(g_isolate);
+}
+
+static v8::Local<v8::Value> host_key(wc_host_t* host) {
+    return v8::Number::New(g_isolate, (double)(uintptr_t)host);
+}
+
+// Call bridge[method](host, ...args).
+static v8::Local<v8::Value> wgpu_call(wc_host_t* host, const char* method, int argc = 0, v8::Local<v8::Value>* args = nullptr) {
+    auto bridge = wgpu_bridge();
+    if (bridge.IsEmpty()) return v8::Undefined(g_isolate);
+    v8::Local<v8::Value> fn;
+    if (!bridge->Get(ctx(), v8str(method)).ToLocal(&fn) || !fn->IsFunction()) return v8::Undefined(g_isolate);
+    std::vector<v8::Local<v8::Value>> argv;
+    argv.push_back(host_key(host));
+    for (int i = 0; i < argc; i++) argv.push_back(args[i]);
+    v8::Local<v8::Value> out;
+    if (!fn.As<v8::Function>()->Call(ctx(), bridge, (int)argv.size(), argv.data()).ToLocal(&out))
+        return v8::Undefined(g_isolate);
+    return out;
+}
+
+// Pump Node until a bridge job settles. Returns its value, or empty with
+// *err set. Bounded: a GPU that never answers must not hang the host.
+static v8::Local<v8::Value> wgpu_wait(wc_host_t* host, v8::Local<v8::Value> job, std::string* err, int timeout_ms = 15000) {
+    if (!job->IsObject()) { if (err) *err = "WebGPU bridge call failed"; return v8::Local<v8::Value>(); }
+    auto o = job.As<v8::Object>();
+    for (int waited = 0; ; waited++) {
+        pump_node(host);
+        if (o->Get(ctx(), v8str("done")).ToLocalChecked()->IsTrue()) break;
+        if (waited >= timeout_ms) { if (err) *err = "timed out waiting for the GPU"; return v8::Local<v8::Value>(); }
+        uv_sleep(1);
+    }
+    auto e = o->Get(ctx(), v8str("error")).ToLocalChecked();
+    if (!e->IsNull() && !e->IsUndefined()) {
+        if (err) { v8::String::Utf8Value s(g_isolate, e); *err = *s; }
+        return v8::Local<v8::Value>();
+    }
+    return o->Get(ctx(), v8str("value")).ToLocalChecked();
+}
+
+// A function that throws, naming the call: the binding for a GPU import the
+// host did NOT select for a cart that imports both APIs.
+static v8::Local<v8::Value> gpu_trap(const char* name, const char* selected) {
+    v8::Local<v8::Value> argv[] = { v8str(name), v8str(selected) };
+    return run_js_fn(
+        "(function (name, selected) { return function () { throw new Error("
+        "'wasmcart: the cart called ' + name + ', but this host selected ' + selected + "
+        "' for it. A cart importing both GPU APIs must read WC_HOST_FLAG_GPU_WGPU in host-info "
+        "flags at wc_init and use only that API.'); }; })", 2, argv);
+}
+
 // ─── Load cart ─────────────────────────────────────────────────────────
 
 extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const wc_host_options_t* opts) {
@@ -1196,6 +1368,53 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
     auto wasm_ns = global->Get(ctx(), v8str("WebAssembly")).ToLocalChecked().As<v8::Object>();
     auto wasm_instance_ctor = wasm_ns->Get(ctx(), v8str("Instance")).ToLocalChecked().As<v8::Function>();
 
+    // 2b. Which GPU APIs the cart imports, and which this host gives it
+    //     (SPEC.md, "WebGPU"). WebGPU when the cart imports it and this host
+    //     has it; GL for a cart that also imports GL; otherwise a WebGPU cart
+    //     is refused here with the reason, never stubbed.
+    auto list_imports = [&]() {
+        auto wasm_module_ns = wasm_ns->Get(ctx(), v8str("Module")).ToLocalChecked().As<v8::Object>();
+        auto imports_fn = wasm_module_ns->Get(ctx(), v8str("imports")).ToLocalChecked().As<v8::Function>();
+        v8::Local<v8::Value> a[] = { wasm_module };
+        return imports_fn->Call(ctx(), wasm_module_ns, 1, a).ToLocalChecked().As<v8::Array>();
+    };
+    auto module_imports = list_imports();
+    host->cart_imports_gl = host->cart_imports_wgpu = host->uses_wgpu = false;
+    for (uint32_t i = 0; i < module_imports->Length(); i++) {
+        auto e = module_imports->Get(ctx(), i).ToLocalChecked().As<v8::Object>();
+        v8::String::Utf8Value mod(g_isolate, e->Get(ctx(), v8str("module")).ToLocalChecked());
+        v8::String::Utf8Value name(g_isolate, e->Get(ctx(), v8str("name")).ToLocalChecked());
+        v8::String::Utf8Value kind(g_isolate, e->Get(ctx(), v8str("kind")).ToLocalChecked());
+        bool fn = strcmp(*kind, "function") == 0;
+        if (strcmp(*mod, "gl") == 0 || (strcmp(*mod, "env") == 0 && fn && (*name)[0] == 'g' && (*name)[1] == 'l' && (*name)[2] >= 'A' && (*name)[2] <= 'Z'))
+            host->cart_imports_gl = true;
+        if (fn && (strcmp(*mod, "env") == 0 || strcmp(*mod, "wgpu") == 0) && is_wgpu_import_name(*name))
+            host->cart_imports_wgpu = true;
+    }
+    v8::Local<v8::Object> wgpu_env;
+    if (host->cart_imports_wgpu) {
+        std::string why;
+        auto bridge = wgpu_bridge();
+        if (bridge.IsEmpty()) {
+            why = g_wgpu_unavailable;
+        } else {
+            uint32_t w = (opts && opts->preferred_width) ? opts->preferred_width : (host->manifest.width ? host->manifest.width : 640);
+            uint32_t h = (opts && opts->preferred_height) ? opts->preferred_height : (host->manifest.height ? host->manifest.height : 480);
+            v8::Local<v8::Value> a[] = { wasm_module, v8::Integer::NewFromUnsigned(g_isolate, w), v8::Integer::NewFromUnsigned(g_isolate, h) };
+            auto env = wgpu_wait(host, wgpu_call(host, "prepare", 3, a), &why);
+            if (!env.IsEmpty() && env->IsObject()) { wgpu_env = env.As<v8::Object>(); host->uses_wgpu = true; }
+        }
+        if (!host->uses_wgpu) {
+            if (!host->cart_imports_gl) {
+                wc_log("wasmcart: this cart is a WebGPU cart, but this host cannot provide WebGPU: %s\n", why.c_str());
+                return -1;
+            }
+            wc_log("wasmcart: no WebGPU (%s); the cart also imports GL, so it runs on GL\n", why.c_str());
+        } else {
+            wc_log("wasmcart: WebGPU cart\n");
+        }
+    }
+
     // 3. Build import object
     auto imports = v8::Object::New(g_isolate);
     auto env_imports = build_env_imports();
@@ -1209,6 +1428,37 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
     auto gl_imports_obj = v8::Object::New(g_isolate);
     wc_gl_build_v8_imports(g_isolate, ctx(), gl_imports_obj, env_imports, host);
     imports->Set(ctx(), v8str("gl"), gl_imports_obj).Check();
+
+    // WebGPU imports, or traps for whichever GPU API the host did not select.
+    if (host->uses_wgpu) {
+        auto names = wgpu_env->GetOwnPropertyNames(ctx()).ToLocalChecked();
+        for (uint32_t i = 0; i < names->Length(); i++) {
+            auto k = names->Get(ctx(), i).ToLocalChecked();
+            env_imports->Set(ctx(), k, wgpu_env->Get(ctx(), k).ToLocalChecked()).Check();
+        }
+        imports->Set(ctx(), v8str("wgpu"), wgpu_env).Check();
+    }
+    if (host->cart_imports_wgpu || host->cart_imports_gl) {
+        auto wgpu_mod = v8::Object::New(g_isolate);
+        bool any_wgpu_mod = false;
+        for (uint32_t i = 0; i < module_imports->Length(); i++) {
+            auto e = module_imports->Get(ctx(), i).ToLocalChecked().As<v8::Object>();
+            v8::String::Utf8Value mod(g_isolate, e->Get(ctx(), v8str("module")).ToLocalChecked());
+            v8::String::Utf8Value name(g_isolate, e->Get(ctx(), v8str("name")).ToLocalChecked());
+            v8::String::Utf8Value kind(g_isolate, e->Get(ctx(), v8str("kind")).ToLocalChecked());
+            if (strcmp(*kind, "function") != 0) continue;
+            bool env = strcmp(*mod, "env") == 0;
+            if (!host->uses_wgpu && is_wgpu_import_name(*name)) {
+                if (env) env_imports->Set(ctx(), v8str(*name), gpu_trap(*name, "GL")).Check();
+                else if (strcmp(*mod, "wgpu") == 0) { wgpu_mod->Set(ctx(), v8str(*name), gpu_trap(*name, "GL")).Check(); any_wgpu_mod = true; }
+            } else if (host->uses_wgpu && host->cart_imports_gl) {
+                if (strcmp(*mod, "gl") == 0) gl_imports_obj->Set(ctx(), v8str(*name), gpu_trap(*name, "WebGPU")).Check();
+                else if (env && ((*name)[0] == 'g' && (*name)[1] == 'l' && (*name)[2] >= 'A' && (*name)[2] <= 'Z'))
+                    env_imports->Set(ctx(), v8str(*name), gpu_trap(*name, "WebGPU")).Check();
+            }
+        }
+        if (any_wgpu_mod) imports->Set(ctx(), v8str("wgpu"), wgpu_mod).Check();
+    }
 
     // 3b. Imported memory and WASI threads.
     //
@@ -1417,6 +1667,16 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
         refresh_memory(host);
         wc_log("wasmcart: initial WASM memory: %u bytes (%u MB)\n",
             host->memory_size, host->memory_size / (1024*1024));
+    }
+
+    // Hand the instance to the WebGPU glue before any cart code runs.
+    if (host->uses_wgpu) {
+        std::string why;
+        v8::Local<v8::Value> a[] = { instance, mem_val };
+        if (wgpu_wait(host, wgpu_call(host, "attach", 2, a), &why).IsEmpty() && !why.empty()) {
+            wc_log("wasmcart: WebGPU setup failed: %s\n", why.c_str());
+            return -1;
+        }
     }
 
     // Functions
@@ -2139,6 +2399,7 @@ extern "C" void wc_host_run_frame(wc_host_t* host) {
     deliver_peers(host);        // then into the cart, at a known point
     deliver_text(host);         // before render, like every other input
     deliver_wheel(host);        // frame total in, zeroed again after render
+    if (host->uses_wgpu) wgpu_call(host, "begin");
 
     auto result = state->fn_wc_render.Get(g_isolate)->Call(
         ctx(), ctx()->Global(), 0, nullptr);
@@ -2245,6 +2506,62 @@ extern "C" uint8_t* wc_host_get_save_data(wc_host_t* host, uint32_t* size) {
 // ─── GL / Info (unchanged) ──────────────────────────────────────────────
 
 extern "C" bool wc_host_uses_gl(wc_host_t* host) { return host->uses_gl; }
+extern "C" bool wc_host_uses_wgpu(wc_host_t* host) { return host->uses_wgpu; }
+
+// Present a WebGPU cart into a native window. kind is one of xlib, wayland,
+// win32, metal-layer (native-dawn's NativeSurface kinds); display and handle
+// are that platform's pointers/ids.
+extern "C" int wc_host_wgpu_attach_window(wc_host_t* host, const char* kind, uint64_t display, uint64_t handle) {
+    if (!host->uses_wgpu) return -1;
+    // Callable inside or outside wc_host_enter_v8 (Locker is reentrant).
+    v8::Locker locker(g_isolate);
+    v8::Isolate::Scope isolate_scope(g_isolate);
+    v8::HandleScope hs(g_isolate);
+    v8::Context::Scope cs(ctx());
+    v8::TryCatch tc(g_isolate);
+    v8::Local<v8::Value> a[] = { v8str(kind), v8::BigInt::NewFromUnsigned(g_isolate, display), v8::BigInt::NewFromUnsigned(g_isolate, handle) };
+    auto r = wgpu_call(host, "attachWindow", 3, a);
+    if (tc.HasCaught()) { v8::String::Utf8Value e(g_isolate, tc.Exception()); wc_log("wasmcart: WebGPU window: %s\n", *e); return -1; }
+    return r->IsTrue() ? 0 : -1;
+}
+
+// Draw the cart's frame into the attached window, letterboxed into the rect
+// (x, y, w, h) of a win_w x win_h surface, and present it.
+extern "C" int wc_host_wgpu_present(wc_host_t* host, int x, int y, int w, int h, int win_w, int win_h) {
+    if (!host->uses_wgpu) return -1;
+    // Callable inside or outside wc_host_enter_v8 (Locker is reentrant).
+    v8::Locker locker(g_isolate);
+    v8::Isolate::Scope isolate_scope(g_isolate);
+    v8::HandleScope hs(g_isolate);
+    v8::Context::Scope cs(ctx());
+    v8::TryCatch tc(g_isolate);
+    v8::Local<v8::Value> a[] = { v8::Integer::New(g_isolate, x), v8::Integer::New(g_isolate, y), v8::Integer::New(g_isolate, w),
+                                 v8::Integer::New(g_isolate, h), v8::Integer::New(g_isolate, win_w), v8::Integer::New(g_isolate, win_h) };
+    auto r = wgpu_call(host, "present", 6, a);
+    if (tc.HasCaught()) { v8::String::Utf8Value e(g_isolate, tc.Exception()); wc_log("wasmcart: WebGPU present: %s\n", *e); return -1; }
+    return r->IsTrue() ? 0 : -1;
+}
+
+// The cart's last frame as top-down RGBA into out (w*h*4 bytes, w and h the
+// cart's size). Waits for the GPU. 0 on success.
+extern "C" int wc_host_wgpu_read_frame(wc_host_t* host, uint8_t* out, uint32_t w, uint32_t h) {
+    if (!host->uses_wgpu) return -1;
+    // Callable inside or outside wc_host_enter_v8 (Locker is reentrant).
+    v8::Locker locker(g_isolate);
+    v8::Isolate::Scope isolate_scope(g_isolate);
+    v8::HandleScope hs(g_isolate);
+    v8::Context::Scope cs(ctx());
+    std::string why;
+    auto v = wgpu_wait(host, wgpu_call(host, "read"), &why);
+    if (v.IsEmpty() || !v->IsObject()) { wc_log("wasmcart: WebGPU readback failed: %s\n", why.c_str()); return -1; }
+    auto o = v.As<v8::Object>();
+    uint32_t fw = o->Get(ctx(), v8str("width")).ToLocalChecked()->Uint32Value(ctx()).FromJust();
+    uint32_t fh = o->Get(ctx(), v8str("height")).ToLocalChecked()->Uint32Value(ctx()).FromJust();
+    auto data = o->Get(ctx(), v8str("data")).ToLocalChecked().As<v8::Uint8Array>();
+    if (fw != w || fh != h) { wc_log("wasmcart: WebGPU frame is %ux%u, expected %ux%u\n", fw, fh, w, h); return -1; }
+    data->CopyContents(out, (size_t)w * h * 4);
+    return 0;
+}
 extern "C" bool wc_host_has_trapped(wc_host_t* host) { return host->trapped; }
 extern "C" void wc_host_set_gl_loader(wc_host_t* host, wc_gl_get_proc_fn loader) { host->gl_loader = loader; }
 extern "C" const wc_cart_info_t* wc_host_get_cart_info(wc_host_t* host) { return &host->info; }
