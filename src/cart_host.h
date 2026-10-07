@@ -45,7 +45,8 @@ struct wc_host {
     uint8_t* memory;
     uint32_t memory_size;
 
-    // Raw WASM bytes (kept for module compilation)
+    // Raw WASM bytes, until the module is compiled (wc_host_load_file
+    // frees them then: V8 keeps its own copy)
     uint8_t* wasm_bytes;
     size_t   wasm_bytes_len;
 
@@ -158,6 +159,7 @@ struct wc_host {
 int  wc_archive_open(wc_host_t* host, const char* path);
 int  wc_archive_open_memory(wc_host_t* host, const uint8_t* data, size_t len);
 void wc_archive_close(wc_host_t* host);
+void wc_archive_free_wasm(wc_host_t* host);  // host->wasm_bytes, once compiled
 
 int32_t wc_archive_load_asset(wc_host_t* host, const char* path, uint8_t* dest, uint32_t max_size);
 int32_t wc_archive_asset_size(wc_host_t* host, const char* path);

@@ -131,11 +131,13 @@ void wc_archive_close(wc_host_t* host) {
         free(host->archive);
         host->archive = NULL;
     }
-    if (host->wasm_bytes) {
-        free(host->wasm_bytes);
-        host->wasm_bytes = NULL;
-        host->wasm_bytes_len = 0;
-    }
+    wc_archive_free_wasm(host);
+}
+
+void wc_archive_free_wasm(wc_host_t* host) {
+    free(host->wasm_bytes);
+    host->wasm_bytes = NULL;
+    host->wasm_bytes_len = 0;
 }
 
 // ─── Asset loading ─────────────────────────────────────────────────────────
