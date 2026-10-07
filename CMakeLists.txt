@@ -36,6 +36,12 @@ set(LIBWASMCART_SOURCES
 
 add_library(wasmcart STATIC ${LIBWASMCART_SOURCES})
 target_include_directories(wasmcart PUBLIC include)
+# miniz's file_stat turns every entry's DOS time into a time_t with
+# mktime, and glibc's mktime stats /etc/localtime each time it's called:
+# a cart with 70,000 assets spent over 100 ms of its load on times nothing
+# here reads. The field stays in the struct as padding, so the layout is
+# the same either way.
+target_compile_definitions(wasmcart PRIVATE MINIZ_NO_TIME)
 target_include_directories(wasmcart PRIVATE
     src
     deps
