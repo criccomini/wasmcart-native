@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
-"""thread_clock_test.py — a threaded cart's clocks and pointers, off the main thread.
+"""thread_clock_test.py — a threaded cart's clocks, off the main thread.
 
 Builds a cart byte by byte (no toolchain) that imports a shared memory and
-wasi.thread-spawn, as wasm32-wasip1-threads carts do, and spawns two
-threads from wc_init:
-  thread 1  reads REALTIME and MONOTONIC into the save region, then sleeps
-            100 ms through poll_oneoff with an ABSOLUTE MONOTONIC deadline it
-            computed from clock_time_get, and records how long that took;
-  thread 2  hands wc_log a pointer past the end of the cart's memory.
-The main thread does the same 100 ms absolute sleep in its first wc_render.
+wasi.thread-spawn, as wasm32-wasip1-threads carts do, and spawns a thread
+from wc_init that reads REALTIME and MONOTONIC into the save region, then
+sleeps 100 ms through poll_oneoff with an ABSOLUTE MONOTONIC deadline it
+computed from clock_time_get, and records how long that took. The main thread does the same 100 ms absolute sleep in its first wc_render.
 After a second and a half the runner is stopped with SIGTERM, so it writes
 the save region to the save file. Then checks:
   - the thread's REALTIME is the wall clock, and its MONOTONIC counts from
     the cart's start, as the main thread's do (wasi_clock_test.py), not
     from the machine's boot;
   - an absolute deadline sleeps until it, on a thread and on the main
-    thread: it is measured on the clock the cart read it from;
-  - the bad pointer traps that thread with a RangeError naming wc_log, as it
-    would on the main thread, and the cart keeps running.
+    thread: it is measured on the clock the cart read it from.
+
+Bad pointers and traps on a thread: thread_end_test.py.
 
 Run:  python3 test/thread_clock_test.py build/wasmcart-run
 """
@@ -37,7 +34,6 @@ INFO, SAVE, FB = 1024, 2048, 4096
 W_SCRATCH, M_SCRATCH = 8192, 12288  # each: t0 (8), t1 (8), sub (48), event (32), nevents (4)
 DONE = 2560                          # the main thread's one-shot flag
 SLEEP_NS = 100_000_000
-BAD = 0xFFFFFF00
 
 
 def leb(n):
@@ -137,19 +133,14 @@ def thread_cart():
         return leb(len(b)) + b
 
     get_info = i32(INFO)
-    init = (i32(1) + b"\x10" + leb(SPAWN) + b"\x1a" +
-            i32(2) + b"\x10" + leb(SPAWN) + b"\x1a")
+    init = i32(1) + b"\x10" + leb(SPAWN) + b"\x1a"
     # wc_render: the first time only, the absolute sleep on the main thread
     render = (i32(DONE) + b"\x28" + MEMARG4 + b"\x45" + b"\x04\x40" +   # if (!done)
               i32(DONE) + i32(1) + b"\x36" + MEMARG4 +
               abs_sleep(M_SCRATCH, SAVE + 24) + b"\x0b")
-    # wasi_thread_start(tid, arg): arg 1 the clocks, else the bad pointer
-    start = (b"\x20\x01" + i32(1) + b"\x46" + b"\x04\x40" +             # if (arg == 1)
-             clock_into(0, SAVE) + clock_into(1, SAVE + 8) +
-             abs_sleep(W_SCRATCH, SAVE + 16) +
-             b"\x05" +                                                  # else
-             i32(BAD) + i32(16) + b"\x10" + leb(LOG) +
-             b"\x0b")
+    # wasi_thread_start(tid, arg): the clocks, then the absolute sleep
+    start = (clock_into(0, SAVE) + clock_into(1, SAVE + 8) +
+             abs_sleep(W_SCRATCH, SAVE + 16))
     code = vec([body(get_info), body(init), body(render), body(start)])
     # Active: each thread's instantiation writes the same bytes again, which
     # changes nothing (a toolchain would make it passive and init it once).
@@ -200,10 +191,6 @@ def main():
               "" if "threads run as node workers" in err else err[-400:])
         check("the runner quit cleanly", p.returncode == 0,
               "" if p.returncode == 0 else f"exit {p.returncode}: {err[-400:]}")
-        trapped = [l for l in err.splitlines() if "thread trapped" in l]
-        check("a bad pointer on a thread traps that thread, naming wc_log",
-              any("RangeError" in l and "wc_log" in l for l in trapped),
-              trapped[0][:200] if trapped else "no trap logged")
         try:
             with open(save, "rb") as f:
                 real, mono, t_sleep, m_sleep = struct.unpack("<4Q", f.read())

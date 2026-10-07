@@ -218,6 +218,11 @@ a thread calls them. A cart that imports `thread-spawn` without exporting
 `wasi_thread_start` (or the reverse) is refused. Threads are terminated when the
 host is destroyed.
 
+A thread that traps (a bad pointer to an import included) or calls `proc_exit`
+ends the whole cart, as it would on the main thread: the player stops before the
+next frame, with exit code 1 and no save, since the thread may have died halfway
+through the save region. The JS host ends only that thread.
+
 ## Resolution
 
 The host passes preferred resolution to the cart via `--res`. The cart decides its actual rendering resolution. The host scales the output to fit the window, preserving aspect ratio with letterboxing. Without `--res`, the window matches the cart's native resolution.
@@ -332,7 +337,8 @@ cc -Iinclude -Isrc -o audio_fade_test test/audio_fade_test.c -lm && ./audio_fade
 cc -Isrc -o pad_slots_test test/pad_slots_test.c && ./pad_slots_test   # sticky player slots
 python3 test/no_net_test.py build/wasmcart-run     # --no-net refuses a granted host
 python3 test/heartbeat_test.py build/wasmcart-run ../wasmcart/test/fixtures/savecart.wasc [<v3 cart>]   # Couchmix's heartbeat lines
-python3 test/thread_clock_test.py build/wasmcart-run   # a threaded cart's clocks and a bad pointer, on its worker threads
+python3 test/thread_clock_test.py build/wasmcart-run   # a threaded cart's clocks on its worker threads
+python3 test/thread_end_test.py build/wasmcart-run     # a bad pointer or proc_exit on a thread ends the cart, with no save
 ```
 
 `text_test` and `lifecycle_test` take the cart's debug-field offsets as arguments because they move

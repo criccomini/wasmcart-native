@@ -299,12 +299,20 @@ for (const imp of WebAssembly.Module.imports(wasmModule)) {
   ns[imp.name] = val;
 }
 
+// A thread that traps or calls proc_exit ends the whole cart, as either does
+// on the main thread: WASI threads have no way to end just the one thread,
+// and the cart's other threads may be waiting on it or be halfway through
+// its save. The main thread can't be reached from here, so the shared word
+// says which thread ended the cart and how; the host reads it before each
+// frame and before each save (cart_host.cpp, note_thread_end).
+const ended = new Int32Array(cfg.endedBuffer);
 try {
   const instance = new WebAssembly.Instance(wasmModule, imports);
   instance.exports.wasi_thread_start(tid, startArg);
 } catch (err) {
-  if (err instanceof ProcExit) log(`thread called ${err.message}; thread ended`);
+  if (err instanceof ProcExit) log(`thread called ${err.message}`);
   else log(`thread trapped: ${err && err.stack ? err.stack : err}`);
+  Atomics.compareExchange(ended, 0, 0, (tid << 2) | (err instanceof ProcExit ? 2 : 1));
 }
 if (zipFd !== null) { try { fs.closeSync(zipFd); } catch {} }
 )WCJS";
@@ -317,6 +325,7 @@ static const char WC_THREADS_SPAWNER_JS[] = R"WCJS(
   const fs = __wc_require('fs');
   const tidCounter = new Int32Array(new SharedArrayBuffer(4));
   tidCounter[0] = 1;                   // tids start at 1; 0 is never a spawned thread
+  const ended = new Int32Array(cfg.endedBuffer);   // see the worker's end
   const workers = new Set();
   function spawn(startArg) {
     const tid = Atomics.add(tidCounter, 0, 1);
@@ -329,6 +338,7 @@ static const char WC_THREADS_SPAWNER_JS[] = R"WCJS(
       workers.add(w);
       w.on('error', (err) => {
         try { fs.writeSync(2, `wasmcart: cart thread ${tid} failed: ${err && err.message}\n`); } catch {}
+        Atomics.compareExchange(ended, 0, 0, (tid << 2) | 1);   // as a trap would
       });
       w.on('exit', () => workers.delete(w));
       return tid;

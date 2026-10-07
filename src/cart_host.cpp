@@ -29,6 +29,8 @@ extern "C" {
 #include <stdio.h>
 #include <limits.h>
 #include <time.h>
+#include <atomic>
+#include <memory>
 #include <random>
 #include <thread>
 #include <chrono>
@@ -69,6 +71,9 @@ struct v8_host_state {
     // WASI threads (wasi.thread-spawn). Empty for a cart that does not spawn.
     v8::Global<v8::Object> threads;      // { spawn, shutdown, count } from WC_THREADS_SPAWNER_JS
     v8::Global<v8::Function> thread_spawn_fn;
+    // One int32 shared with every cart thread: (tid << 2) | 1 once a thread
+    // has trapped, | 2 once one has called proc_exit (thread_worker_js.h).
+    std::shared_ptr<v8::BackingStore> thread_end;
 };
 
 // ─── V8 helpers ──────────────────────────────────────────────────────────
@@ -1328,7 +1333,27 @@ static v8::Local<v8::Object> build_thread_cfg(wc_host_t* host, const char* wasc_
     // The origin of the cart's clocks (wasi_now_ns), so a thread reads the
     // same MONOTONIC as the main thread.
     cfg->Set(ctx(), v8str("clockOriginNs"), v8::BigInt::NewFromUnsigned(g_isolate, g_clock_origin_ns)).Check();
+    // Where a thread says it ended the cart (note_thread_end).
+    auto ended = v8::SharedArrayBuffer::New(g_isolate, 4);
+    ((v8_host_state*)host->v8_state)->thread_end = ended->GetBackingStore();
+    cfg->Set(ctx(), v8str("endedBuffer"), ended).Check();
     return cfg;
+}
+
+// A cart thread that traps or calls proc_exit ends the cart, as either does
+// on the main thread (thread_worker_js.h says why). A worker is another
+// isolate on another native thread and can't set host->trapped, so it sets
+// the shared word, and this folds it in: before each frame, and wherever the
+// player asks whether the cart trapped, which includes before every save, so
+// a save region a thread may have left half-written isn't saved.
+static void note_thread_end(wc_host_t* host) {
+    auto state = (v8_host_state*)host->v8_state;
+    if (host->trapped || !state || !state->thread_end) return;
+    int32_t v = std::atomic_ref<int32_t>(*(int32_t*)state->thread_end->Data()).load();
+    if (!v) return;
+    host->trapped = true;
+    wc_log("wasmcart: cart thread %d %s, which ends the cart\n",
+           v >> 2, (v & 3) == 2 ? "called proc_exit" : "trapped");
 }
 
 // Stop every cart thread. Called from wc_host_destroy, outside the frame loop's
@@ -2666,6 +2691,7 @@ static void deliver_wheel(wc_host_t* host) {
 }
 
 extern "C" void wc_host_run_frame(wc_host_t* host) {
+    note_thread_end(host);
     // The spec's one MUST for suspension: no wc_render while suspended.
     if (!host->fn_wc_render || host->trapped || host->suspended) return;
 
@@ -2867,7 +2893,10 @@ extern "C" int wc_host_wgpu_read_frame(wc_host_t* host, uint8_t* out, uint32_t w
     data->CopyContents(out, (size_t)w * h * 4);
     return 0;
 }
-extern "C" bool wc_host_has_trapped(wc_host_t* host) { return host->trapped; }
+extern "C" bool wc_host_has_trapped(wc_host_t* host) {
+    note_thread_end(host);
+    return host->trapped;
+}
 extern "C" void wc_host_set_gl_loader(wc_host_t* host, wc_gl_get_proc_fn loader) { host->gl_loader = loader; }
 extern "C" const wc_cart_info_t* wc_host_get_cart_info(wc_host_t* host) { return &host->info; }
 extern "C" const wc_manifest_t* wc_host_get_manifest(wc_host_t* host) { return &host->manifest; }
