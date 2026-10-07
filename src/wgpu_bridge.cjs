@@ -68,11 +68,14 @@ module.exports = function createBridge(dir) {
     },
 
     // A window to present into. kind: xlib | wayland | win32 | metal-layer.
-    attachWindow(id, kind, display, handle) {
+    // vsync false (--uncapped) presents without waiting for the display:
+    // FIFO under Xwayland measured ~0.65 s per frame.
+    attachWindow(id, kind, display, handle, vsync = true) {
       const s = sessions.get(id);
       s.surface?.destroy();
       s.surface = new dawn.NativeSurface(s.session.device, { kind, display, handle, xid: handle });
       s.size = [0, 0];
+      s.presentModes = vsync ? ['fifo'] : ['mailbox', 'immediate', 'fifo'];
       return true;
     },
 
@@ -82,7 +85,16 @@ module.exports = function createBridge(dir) {
       const s = sessions.get(id);
       if (!s?.surface) return false;
       if (s.size[0] !== winW || s.size[1] !== winH) {
-        s.surface.configure({ width: winW, height: winH, format: gpu.getPreferredCanvasFormat(), usage: 0x10 });
+        // The first present mode the surface supports (configure checks).
+        let err;
+        for (const presentMode of s.presentModes) {
+          try {
+            s.surface.configure({ width: winW, height: winH, format: gpu.getPreferredCanvasFormat(), usage: 0x10, presentMode });
+            err = null;
+            break;
+          } catch (e) { err = e; }
+        }
+        if (err) throw err;
         s.size = [winW, winH];
       }
       const texture = s.surface.getCurrentTexture();

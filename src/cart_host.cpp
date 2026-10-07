@@ -1426,9 +1426,11 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
     imports->Set(ctx(), v8str("wasi_snapshot_preview1"), wasi_imports).Check();
     imports->Set(ctx(), v8str("wasi_unstable"), wasi_imports).Check();
 
-    // GL imports
+    // GL imports. Not for a cart that runs on WebGPU: its GL imports are the
+    // traps below, and building the real ones would resolve GL through the
+    // embedder's loader, which may make a GL context just for that.
     auto gl_imports_obj = v8::Object::New(g_isolate);
-    wc_gl_build_v8_imports(g_isolate, ctx(), gl_imports_obj, env_imports, host);
+    if (!host->uses_wgpu) wc_gl_build_v8_imports(g_isolate, ctx(), gl_imports_obj, env_imports, host);
     imports->Set(ctx(), v8str("gl"), gl_imports_obj).Check();
 
     // WebGPU imports, or traps for whichever GPU API the host did not select.
@@ -2513,7 +2515,7 @@ extern "C" bool wc_host_uses_wgpu(wc_host_t* host) { return host->uses_wgpu; }
 // Present a WebGPU cart into a native window. kind is one of xlib, wayland,
 // win32, metal-layer (native-dawn's NativeSurface kinds); display and handle
 // are that platform's pointers/ids.
-extern "C" int wc_host_wgpu_attach_window(wc_host_t* host, const char* kind, uint64_t display, uint64_t handle) {
+extern "C" int wc_host_wgpu_attach_window(wc_host_t* host, const char* kind, uint64_t display, uint64_t handle, int vsync) {
     if (!host->uses_wgpu) return -1;
     // Callable inside or outside wc_host_enter_v8 (Locker is reentrant).
     v8::Locker locker(g_isolate);
@@ -2521,8 +2523,8 @@ extern "C" int wc_host_wgpu_attach_window(wc_host_t* host, const char* kind, uin
     v8::HandleScope hs(g_isolate);
     v8::Context::Scope cs(ctx());
     v8::TryCatch tc(g_isolate);
-    v8::Local<v8::Value> a[] = { v8str(kind), v8::BigInt::NewFromUnsigned(g_isolate, display), v8::BigInt::NewFromUnsigned(g_isolate, handle) };
-    auto r = wgpu_call(host, "attachWindow", 3, a);
+    v8::Local<v8::Value> a[] = { v8str(kind), v8::BigInt::NewFromUnsigned(g_isolate, display), v8::BigInt::NewFromUnsigned(g_isolate, handle), v8::Boolean::New(g_isolate, vsync != 0) };
+    auto r = wgpu_call(host, "attachWindow", 4, a);
     if (tc.HasCaught()) { v8::String::Utf8Value e(g_isolate, tc.Exception()); wc_log("wasmcart: WebGPU window: %s\n", *e); return -1; }
     return r->IsTrue() ? 0 : -1;
 }

@@ -375,7 +375,7 @@ bool wc_host_uses_wgpu(wc_host_t* host);
  * Display pointer, wl_display pointer or HINSTANCE (0 for metal-layer);
  * handle is the X11 Window id, wl_surface pointer, HWND or CAMetalLayer
  * pointer. 0 on success. */
-int wc_host_wgpu_attach_window(wc_host_t* host, const char* kind, uint64_t display, uint64_t handle);
+int wc_host_wgpu_attach_window(wc_host_t* host, const char* kind, uint64_t display, uint64_t handle, int vsync);
 /* Draw the frame letterboxed into (x, y, w, h) of a win_w x win_h window
  * surface and present it. 0 on success. */
 int wc_host_wgpu_present(wc_host_t* host, int x, int y, int w, int h, int win_w, int win_h);

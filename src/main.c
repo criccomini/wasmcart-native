@@ -27,6 +27,22 @@ static SDL_GameController* controllers[MAX_CONTROLLERS] = {0};
 // (gl_imports.cpp), which computes a centred destination rect from the cart's
 // real blit size; 2D carts are scaled by SDL via SDL_RenderSetLogicalSize.
 
+// The GL loader the host resolves GL entry points through. It makes the EGL
+// context on first use, so a cart that runs on WebGPU (whose GL imports are
+// traps) never creates a GL context: on a two-GPU machine that context would
+// sit on the default GPU whatever WASMCART_WGPU_POWER picked for WebGPU.
+static bool egl_tried = false;
+static void ensure_egl(void) {
+    if (egl_tried) return;
+    egl_tried = true;
+    egl_create_context(16, 16);
+}
+
+static void* lazy_gl_proc(const char* name) {
+    ensure_egl();
+    return egl_is_initialized() ? egl_get_proc_address(name) : NULL;
+}
+
 static void print_usage(const char* argv0) {
     fprintf(stderr, "Usage: %s <cart.wasc|cart.wasm> [options]\n", argv0);
     fprintf(stderr, "Options:\n");
@@ -38,7 +54,7 @@ static void print_usage(const char* argv0) {
     fprintf(stderr, "  --fps           Show FPS counter\n");
     fprintf(stderr, "  --uncapped      Disable vsync and frame cap\n");
     fprintf(stderr, "  --fixed-step MS Host clock advances exactly MS per frame (deterministic tests)\n");
-    fprintf(stderr, "  --shot N FILE   Save frame N of a GL cart as a PPM (tests)\n");
+    fprintf(stderr, "  --shot N FILE   Save frame N of a GL or WebGPU cart as a PPM (tests)\n");
     fprintf(stderr, "  --debug-dump N FILE  After frame N, write the cart's debug state as JSON (tests)\n");
     fprintf(stderr, "  --debug-cmd N TEXT   Before frame N, post TEXT to a cartwheel-style dbg.cmd mailbox;\n");
     fprintf(stderr, "                       replies (dbg.reply) print to stderr (repeatable)\n");
@@ -403,12 +419,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 2. Create EGL context (BEFORE SDL window)
-    //    Always available — the cart decides whether to use GL or framebuffer
-    egl_create_context(16, 16);
-    if (egl_is_initialized()) {
-        wc_host_set_gl_loader(host, (wc_gl_get_proc_fn)egl_get_proc_address);
-    }
+    // 2. GL (BEFORE the SDL window): the EGL context is made when the host
+    //    first resolves GL, during the load of a cart that runs on GL; after
+    //    the load for a 2D cart, whose frame is presented with GL too; and
+    //    never for a cart that runs on WebGPU.
+    wc_host_set_gl_loader(host, (wc_gl_get_proc_fn)lazy_gl_proc);
 
     // 3. Load cart
     char sav_path[4096];
@@ -439,6 +454,7 @@ int main(int argc, char* argv[]) {
     // A WebGPU cart (SPEC.md, "WebGPU") has no GL context: the host draws its
     // frame into a WebGPU surface on the window.
     bool is_wgpu = wc_host_uses_wgpu(host);
+    if (!is_wgpu) ensure_egl();
 
     // A GL cart cannot run without a GL context, and its first GL call through
     // an unresolved proc is a NULL jump. Say why instead of segfaulting.
@@ -516,17 +532,17 @@ int main(int argc, char* argv[]) {
 #ifdef SDL_VIDEO_DRIVER_WAYLAND
             if (wm_info.subsystem == SDL_SYSWM_WAYLAND)
                 attached = wc_host_wgpu_attach_window(host, "wayland",
-                    (uint64_t)(uintptr_t)wm_info.info.wl.display, (uint64_t)(uintptr_t)wm_info.info.wl.surface);
+                    (uint64_t)(uintptr_t)wm_info.info.wl.display, (uint64_t)(uintptr_t)wm_info.info.wl.surface, !uncapped);
 #endif
 #ifdef SDL_VIDEO_DRIVER_X11
             if (wm_info.subsystem == SDL_SYSWM_X11)
                 attached = wc_host_wgpu_attach_window(host, "xlib",
-                    (uint64_t)(uintptr_t)wm_info.info.x11.display, (uint64_t)wm_info.info.x11.window);
+                    (uint64_t)(uintptr_t)wm_info.info.x11.display, (uint64_t)wm_info.info.x11.window, !uncapped);
 #endif
 #ifdef SDL_VIDEO_DRIVER_WINDOWS
             if (wm_info.subsystem == SDL_SYSWM_WINDOWS)
                 attached = wc_host_wgpu_attach_window(host, "win32",
-                    (uint64_t)(uintptr_t)wm_info.info.win.hinstance, (uint64_t)(uintptr_t)wm_info.info.win.window);
+                    (uint64_t)(uintptr_t)wm_info.info.win.hinstance, (uint64_t)(uintptr_t)wm_info.info.win.window, !uncapped);
 #endif
         }
         fprintf(stderr, attached == 0 ? "wasmcart: rendering %ux%u via WebGPU\n"
