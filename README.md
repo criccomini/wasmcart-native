@@ -340,6 +340,7 @@ python3 test/heartbeat_test.py build/wasmcart-run ../wasmcart/test/fixtures/save
 python3 test/thread_clock_test.py build/wasmcart-run   # a threaded cart's clocks on its worker threads, the wall clock stepped too (Linux, cc)
 python3 test/thread_end_test.py build/wasmcart-run     # a bad pointer or proc_exit on a thread ends the cart, with no save
 python3 test/frame_time_test.py build/wasmcart-run     # delta_ms: a stall clamped to 250 ms; --fixed-step exact
+python3 test/asset_index_test.py build/wasmcart-run    # a threaded cart's asset index: one shared by its workers, names found as on the main thread
 ```
 
 `text_test` and `lifecycle_test` take the cart's debug-field offsets as arguments because they move

@@ -67,15 +67,61 @@ const readStr = (name, ptr, len) => {
 };
 
 // ---- assets: read the .wasc ourselves, same lookup rules as asset_loader.c ----
-let zipFd = null;
-function zipEntry(name) {
-  const idx = cfg.zipIndex;
-  return idx && Object.hasOwn(idx, name) ? idx[name] : null;
+//
+// The archive's index is one SharedArrayBuffer that every thread shares
+// (build_asset_index in cart_host.cpp lays it out), not a copy per worker.
+// A name is looked up in it as the main thread looks it up: the path's
+// bytes up to a NUL and at most 511 of them (v8_wc_load_asset), under the
+// manifest's asset root, then bare, then under "assets/" (locate_asset),
+// each ASCII case-folded and binary-searched as miniz searches.
+const ai = cfg.assetIndex;
+const aiNums = ai ? new Float64Array(ai.buffer, 0, ai.count * 3) : null;
+const aiRecs = ai ? new Uint32Array(ai.buffer, ai.recs, ai.count * 5) : null;
+const aiNames = ai ? new Uint8Array(ai.buffer, ai.names, ai.namesLen) : null;
+const fileList = ai && ai.listLen >= 0 ? new Uint8Array(ai.buffer, ai.list, ai.listLen) : null;
+const AI_DIR = 1 << 16;
+const PATH_MAX = 511;
+const NONE = Buffer.alloc(0), ASSETS = Buffer.from('assets/'), FILELIST = Buffer.from('_filelist.txt');
+const root = Buffer.from(cfg.assetsRoot || '');
+
+function find(key) {
+  let l = 0, h = ai.count - 1;
+  while (l <= h) {
+    const m = (l + h) >>> 1, at = aiRecs[m * 5], len = aiRecs[m * 5 + 1];
+    let d = 0;
+    for (let j = 0, k = Math.min(len, key.length); j < k && !d; j++) d = aiNames[at + j] - key[j];
+    if (!d) d = len - key.length;
+    if (!d) return m;
+    if (d < 0) l = m + 1; else h = m - 1;
+  }
+  return -1;
+}
+function lookup(prefix, path) {
+  let key = Buffer.concat([prefix, path]);
+  if (key.length > PATH_MAX) key = key.subarray(0, PATH_MAX);
+  for (let i = 0; i < key.length; i++) if (key[i] >= 65 && key[i] <= 90) key[i] += 32;
+  const m = find(key);
+  if (m < 0) return null;
+  const flags = aiRecs[m * 5 + 4];
+  return { ofs: aiNums[m * 3], csize: aiNums[m * 3 + 1], usize: aiNums[m * 3 + 2],
+           crc: aiRecs[m * 5 + 2], method: aiRecs[m * 5 + 3], flags: flags & 0xffff,
+           dir: (flags & AI_DIR) !== 0 };
 }
 function locate(path) {
-  if (cfg.assetsRoot) { const e = zipEntry(cfg.assetsRoot + path); if (e) return e; }
-  return zipEntry(path) || zipEntry('assets/' + path);
+  if (root.length) { const e = lookup(root, path); if (e) return e; }
+  return lookup(NONE, path) || lookup(ASSETS, path);
 }
+// A cart's path as the main thread takes it: a copy, since the cart may
+// change its memory meanwhile.
+function cartPath(name, ptr, len) {
+  ptr = need(name, ptr, len);
+  let b = u8().subarray(ptr, ptr + Math.min(len >>> 0, PATH_MAX));
+  const nul = b.indexOf(0);
+  if (nul >= 0) b = b.subarray(0, nul);
+  return Buffer.from(b);
+}
+
+let zipFd = null;
 function readEntry(e) {
   if (zipFd === null) zipFd = fs.openSync(cfg.wascPath, 'r');
   const hdr = Buffer.alloc(30);
@@ -89,22 +135,23 @@ function readEntry(e) {
   return null;
 }
 function assetSize(pathPtr, pathLen) {
-  const path = readStr('wc_asset_size', pathPtr, pathLen);
-  if (path === '_filelist.txt') return cfg.fileList === null ? -1 : Buffer.byteLength(cfg.fileList);
+  const path = cartPath('wc_asset_size', pathPtr, pathLen);
+  if (!ai) return -1;
+  if (path.equals(FILELIST)) return fileList === null ? -1 : fileList.length;
   const e = locate(path);
   return e ? e.usize : -1;
 }
 function loadAsset(pathPtr, pathLen, destPtr, maxSize) {
-  const path = readStr('wc_load_asset', pathPtr, pathLen);
+  const path = cartPath('wc_load_asset', pathPtr, pathLen);
   // The whole of dest, as on the main thread: maxSize is the cart's word for
   // how big its buffer is.
   destPtr = need('wc_load_asset', destPtr, maxSize);
   maxSize >>>= 0;
+  if (!ai) return -1;
   let data;
-  if (path === '_filelist.txt') {
-    if (cfg.fileList === null) return -1;
-    data = Buffer.from(cfg.fileList);
-    if (data.length > maxSize) return -1;
+  if (path.equals(FILELIST)) {
+    if (fileList === null || fileList.length > maxSize) return -1;
+    data = fileList;
   } else {
     const e = locate(path);
     if (!e) return -1;

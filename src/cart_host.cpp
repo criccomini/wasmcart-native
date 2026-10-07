@@ -29,6 +29,7 @@ extern "C" {
 #include <stdio.h>
 #include <limits.h>
 #include <time.h>
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <random>
@@ -1292,23 +1293,106 @@ static void v8_thread_spawn(const v8::FunctionCallbackInfo<v8::Value>& args) {
 // entry sits in it. Workers cannot call into this C code (they are separate
 // isolates), and the main thread may be parked in a futex wait, so they read
 // the archive themselves with the same lookup rules as asset_loader.c.
+//
+// The index is one SharedArrayBuffer, which every worker shares rather than
+// gets a copy of. It was a V8 object per entry, structured-cloned into each
+// worker: 70,000 entries took about 290 ms to build before wc_init, 40 MiB
+// on the main thread and tens more in every worker. Laid out as
+// thread_worker_js.h reads it (assetIndex):
+//
+//   Float64 [count][3]  the local header's offset, compressed size, size
+//   Uint32  [count][5]  name offset, name length, CRC-32, method, flags
+//   Uint8   names       each name as miniz compares it: ASCII lowercased
+//   Uint8   list        _filelist.txt's body, as the main thread serves it
+//
+// One record per name as miniz finds it: sorted the way miniz sorts its
+// central directory (bytes, case folded, a prefix first), and where names
+// differ only in case, only the entry mz_zip_reader_locate_file picks. A
+// worker's binary search then finds what the main thread's lookup finds.
+// Names a lookup can never match (over 511 bytes, as the main thread cuts
+// a path there, or with a NUL in them) are left out.
+enum { AI_DIR = 1u << 16 };   // flags: the low 16 bits are the entry's own
+
+static v8::Local<v8::Value> build_asset_index(wc_host_t* host) {
+    mz_zip_archive* zip = (mz_zip_archive*)host->archive;
+    if (!zip) return v8::Null(g_isolate);
+    struct ent { std::string key; mz_uint index; };
+    std::vector<ent> ents;
+    mz_uint n = mz_zip_reader_get_num_files(zip);
+    ents.reserve(n);
+    char name[512];
+    for (mz_uint i = 0; i < n; i++) {
+        mz_uint len = mz_zip_reader_get_filename(zip, i, name, 0);   // its length + 1
+        if (len == 0 || len - 1 > 511) continue;
+        mz_zip_reader_get_filename(zip, i, name, sizeof name);
+        if (memchr(name, 0, len - 1)) continue;
+        std::string key(name, len - 1);
+        for (char& c : key) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        ents.push_back({std::move(key), i});
+    }
+    // std::string orders as unsigned bytes, a prefix first: miniz's order.
+    std::sort(ents.begin(), ents.end(), [](const ent& a, const ent& b) { return a.key < b.key; });
+    std::vector<ent> keep;
+    keep.reserve(ents.size());
+    for (size_t i = 0; i < ents.size();) {
+        size_t j = i + 1;
+        while (j < ents.size() && ents[j].key == ents[i].key) j++;
+        mz_uint pick = ents[i].index;
+        if (j - i > 1) {
+            mz_zip_reader_get_filename(zip, ents[i].index, name, sizeof name);
+            int found = mz_zip_reader_locate_file(zip, name, NULL, 0);
+            if (found >= 0) pick = (mz_uint)found;
+        }
+        keep.push_back({std::move(ents[i].key), pick});
+        i = j;
+    }
+
+    // _filelist.txt: asking its size builds the body the main thread serves,
+    // and leaves it in host->file_list.
+    bool has_list = wc_archive_asset_size(host, "_filelist.txt") >= 0 && host->file_list;
+    const char* list = has_list ? host->file_list : nullptr;
+    uint32_t list_len = has_list ? host->file_list_len : 0;
+
+    size_t count = keep.size(), names_len = 0;
+    for (auto& e : keep) names_len += e.key.size();
+    size_t recs_at = count * 3 * sizeof(double);
+    size_t names_at = recs_at + count * 5 * sizeof(uint32_t);
+    size_t list_at = names_at + names_len;
+    auto sab = v8::SharedArrayBuffer::New(g_isolate, list_at + list_len);
+    uint8_t* base = (uint8_t*)sab->GetBackingStore()->Data();
+    double* nums = (double*)base;
+    uint32_t* recs = (uint32_t*)(base + recs_at);
+    size_t at = 0;
+    for (size_t i = 0; i < count; i++) {
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(zip, keep[i].index, &st)) memset(&st, 0, sizeof st);
+        nums[i * 3 + 0] = (double)st.m_local_header_ofs;
+        nums[i * 3 + 1] = (double)st.m_comp_size;
+        nums[i * 3 + 2] = (double)st.m_uncomp_size;
+        recs[i * 5 + 0] = (uint32_t)at;
+        recs[i * 5 + 1] = (uint32_t)keep[i].key.size();
+        recs[i * 5 + 2] = st.m_crc32;
+        recs[i * 5 + 3] = st.m_method;
+        recs[i * 5 + 4] = st.m_bit_flag | (st.m_is_directory ? AI_DIR : 0);
+        memcpy(base + names_at + at, keep[i].key.data(), keep[i].key.size());
+        at += keep[i].key.size();
+    }
+    if (list_len) memcpy(base + list_at, list, list_len);
+
+    auto idx = v8::Object::New(g_isolate);
+    auto num = [&](const char* k, double v) { idx->Set(ctx(), v8str(k), v8::Number::New(g_isolate, v)).Check(); };
+    idx->Set(ctx(), v8str("buffer"), sab).Check();
+    num("count", (double)count);
+    num("recs", (double)recs_at);
+    num("names", (double)names_at);
+    num("namesLen", (double)names_len);
+    num("list", (double)list_at);
+    num("listLen", has_list ? (double)list_len : -1);
+    return idx;
+}
+
 static v8::Local<v8::Object> build_thread_cfg(wc_host_t* host, const char* wasc_path) {
     auto cfg = v8::Object::New(g_isolate);
-    auto index = v8::Object::New(g_isolate);
-    mz_zip_archive* zip = (mz_zip_archive*)host->archive;
-    if (zip) {
-        mz_uint n = mz_zip_reader_get_num_files(zip);
-        for (mz_uint i = 0; i < n; i++) {
-            mz_zip_archive_file_stat st;
-            if (!mz_zip_reader_file_stat(zip, i, &st) || st.m_is_directory) continue;
-            auto e = v8::Object::New(g_isolate);
-            e->Set(ctx(), v8str("ofs"), v8::Number::New(g_isolate, (double)st.m_local_header_ofs)).Check();
-            e->Set(ctx(), v8str("csize"), v8::Number::New(g_isolate, (double)st.m_comp_size)).Check();
-            e->Set(ctx(), v8str("usize"), v8::Number::New(g_isolate, (double)st.m_uncomp_size)).Check();
-            e->Set(ctx(), v8str("method"), v8::Integer::New(g_isolate, st.m_method)).Check();
-            index->Set(ctx(), v8str(st.m_filename), e).Check();
-        }
-    }
     char path_buf[4096];
     const char* abs_path = wasc_path;
 #ifndef _WIN32
@@ -1317,19 +1401,8 @@ static v8::Local<v8::Object> build_thread_cfg(wc_host_t* host, const char* wasc_
     if (_fullpath(path_buf, wasc_path, sizeof path_buf)) abs_path = path_buf;
 #endif
     cfg->Set(ctx(), v8str("wascPath"), v8str(abs_path)).Check();
-    cfg->Set(ctx(), v8str("zipIndex"), zip ? index.As<v8::Value>() : v8::Null(g_isolate).As<v8::Value>()).Check();
+    cfg->Set(ctx(), v8str("assetIndex"), build_asset_index(host)).Check();
     cfg->Set(ctx(), v8str("assetsRoot"), v8str(host->manifest.assets)).Check();
-    // _filelist.txt: same body the main thread serves.
-    int32_t flen = wc_archive_asset_size(host, "_filelist.txt");
-    if (flen >= 0) {
-        std::vector<uint8_t> buf((size_t)flen + 1);
-        int32_t got = wc_archive_load_asset(host, "_filelist.txt", buf.data(), (uint32_t)flen);
-        cfg->Set(ctx(), v8str("fileList"),
-            v8::String::NewFromUtf8(g_isolate, (const char*)buf.data(), v8::NewStringType::kNormal,
-                got > 0 ? got : 0).ToLocalChecked()).Check();
-    } else {
-        cfg->Set(ctx(), v8str("fileList"), v8::Null(g_isolate)).Check();
-    }
     // The origin of the cart's clocks (wasi_now_ns), so a thread reads the
     // same MONOTONIC as the main thread.
     cfg->Set(ctx(), v8str("clockOriginNs"), v8::BigInt::NewFromUnsigned(g_isolate, g_clock_origin_ns)).Check();
