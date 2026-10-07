@@ -1543,6 +1543,16 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
     // Compile WASM module — V8 Liftoff baseline compiles instantly
     v8::MemorySpan<const uint8_t> wire_bytes(host->wasm_bytes, host->wasm_bytes_len);
     auto maybe_module = v8::WasmModuleObject::Compile(g_isolate, wire_bytes);
+    // The one thing still read from the bytes themselves (3b): the memory
+    // the module imports, if it does.
+    wasm_memory_import mi;
+    bool imports_memory = parse_memory_import(host->wasm_bytes, host->wasm_bytes_len, &mi);
+    // Then they go. V8 copied them into the compiled module, which keeps
+    // them for as long as it lives, and nothing else here reads them:
+    // threads get the compiled module, and so does WebGPU. Kept, they were
+    // the module a second time for the whole game: 100 MiB of cart.wasm
+    // cost 200 MiB before the cart allocated anything.
+    wc_archive_free_wasm(host);
     if (maybe_module.IsEmpty()) {
         if (try_catch.HasCaught()) {
             v8::String::Utf8Value err(g_isolate, try_catch.Exception());
@@ -1695,8 +1705,7 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
         }
         host->threaded = spawn_import;
 
-        wasm_memory_import mi;
-        if (parse_memory_import(host->wasm_bytes, host->wasm_bytes_len, &mi)) {
+        if (imports_memory) {
             if (mi.is64) {
                 wc_log("wasmcart: cart imports a memory64 memory, which is not supported\n");
                 return -1;
