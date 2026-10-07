@@ -67,7 +67,18 @@ const readStr = (name, ptr, len) => {
 };
 
 // ---- assets: read the .wasc ourselves, same lookup rules as asset_loader.c ----
+//
+// An asset goes straight into the cart's memory, as on the main thread
+// (asset_loader.c): a stored entry is read into it a chunk at a time, a
+// deflated one inflated into it a chunk of input at a time, and its CRC is
+// checked on the way. A worker never holds the entry, compressed or not, in
+// a buffer of its own; a 600 MiB asset costs the cart's 600 MiB and a few
+// more, where a whole-entry read and inflate cost two or three times that
+// and could end the game on its memory limit. The return values are the
+// main thread's too: the asset's size, or -1 when it's missing, bigger than
+// dest, too big for an int32, damaged, or not stored or deflated.
 let zipFd = null;
+let zipSize = 0;
 function zipEntry(name) {
   const idx = cfg.zipIndex;
   return idx && Object.hasOwn(idx, name) ? idx[name] : null;
@@ -76,23 +87,159 @@ function locate(path) {
   if (cfg.assetsRoot) { const e = zipEntry(cfg.assetsRoot + path); if (e) return e; }
   return zipEntry(path) || zipEntry('assets/' + path);
 }
-function readEntry(e) {
-  if (zipFd === null) zipFd = fs.openSync(cfg.wascPath, 'r');
+const INT32_MAX = 0x7fffffff;
+const READ_CHUNK = 4 << 20;     // a stored entry's reads, straight into dest
+const INFLATE_IN = 1 << 20;     // a deflated entry's compressed input, per read
+// Encrypted, strongly encrypted, a patch: miniz refuses all three.
+const UNSUPPORTED_FLAGS = 0x1 | 0x40 | 0x20;
+
+let crc32 = zlib.crc32;
+if (typeof crc32 !== 'function') {
+  const table = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c;
+  }
+  crc32 = (buf, crc = 0) => {
+    let c = ~crc;
+    for (let i = 0; i < buf.length; i++) c = table[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return ~c >>> 0;
+  };
+}
+
+// fs.readSync until len bytes are in buf at off, or the file ends.
+function readFully(buf, off, len, pos) {
+  while (len > 0) {
+    const n = fs.readSync(zipFd, buf, off, len, pos);
+    if (n <= 0) return false;
+    off += n; len -= n; pos += n;
+  }
+  return true;
+}
+
+// Where an entry's data starts, from its local header (whose name and extra
+// field lengths can differ from the central directory's).
+function dataOffset(e) {
+  if (zipFd === null) {
+    zipFd = fs.openSync(cfg.wascPath, 'r');
+    zipSize = fs.fstatSync(zipFd).size;
+  }
   const hdr = Buffer.alloc(30);
-  fs.readSync(zipFd, hdr, 0, 30, e.ofs);
-  if (hdr.readUInt32LE(0) !== 0x04034b50) return null;
-  const dataOfs = e.ofs + 30 + hdr.readUInt16LE(26) + hdr.readUInt16LE(28);
-  const comp = Buffer.alloc(e.csize);
-  fs.readSync(zipFd, comp, 0, e.csize, dataOfs);
-  if (e.method === 0) return comp;
-  if (e.method === 8) return zlib.inflateRawSync(comp);
+  if (!readFully(hdr, 0, 30, e.ofs) || hdr.readUInt32LE(0) !== 0x04034b50) return -1;
+  const ofs = e.ofs + 30 + hdr.readUInt16LE(26) + hdr.readUInt16LE(28);
+  return ofs + e.csize > zipSize ? -1 : ofs;
+}
+
+// A stored entry: read into out in chunks, the CRC taken as each one lands.
+function readStored(pos, out) {
+  let crc = 0;
+  for (let off = 0; off < out.length;) {
+    const n = Math.min(READ_CHUNK, out.length - off);
+    if (!readFully(out, off, n, pos + off)) return { why: 'the archive ends inside it' };
+    crc = crc32(out.subarray(off, off + n), crc);
+    off += n;
+  }
+  return { crc };
+}
+
+// A deflated entry: inflated into out with zlib's own handle, which takes
+// the output buffer and its window per call, so the output lands in the
+// cart's memory and nowhere else. The stream has to end exactly at the
+// entry's size: once out is full, anything more it gives goes into a
+// one-byte probe, and that is an error, as one that ends short is.
+//
+// One handle per thread, reset for each entry. A stream made per load
+// and closed would leave its close for a tick, and a cart thread never
+// lets its event loop run: each would stay, with its 16 KiB output
+// buffer, until the thread ended. One that failed is closed and dropped.
+let inflater = null;
+function takeInflater() {
+  if (inflater) { inflater.h.reset(); inflater.failed = null; return inflater; }
+  const z = zlib.createInflateRaw();
+  const h = z._handle, state = z._writeState;
+  if (!h || typeof h.writeSync !== 'function' || typeof h.reset !== 'function' || !state) return null;
+  const inf = { z, h, state, failed: null };
+  h.onerror = (message) => { inf.failed = String(message || 'inflate failed'); };
+  return (inflater = inf);
+}
+function inflateTo(pos, csize, out) {
+  const inf = takeInflater();
+  if (!inf) return null;
+  const { h, state } = inf;
+  const input = Buffer.allocUnsafe(Math.max(1, Math.min(csize, INFLATE_IN)));
+  const probe = Buffer.alloc(1);
+  let crc = 0, done = 0, ok = false;
+  // One call: input (or none) against what's left of out, else the probe.
+  const step = (flush, inBuf, inOfs, inLen) => {
+    const full = done === out.length;
+    const dst = full ? probe : out, dstOfs = full ? 0 : done, room = full ? 1 : out.length - done;
+    h.writeSync(flush, inBuf, inOfs, inLen, dst, dstOfs, room);
+    if (inf.failed) return -1;
+    const made = room - state[0];
+    if (made && full) { inf.failed = 'more data than its size'; return -1; }
+    if (made) { crc = crc32(out.subarray(done, done + made), crc); done += made; }
+    return inBuf ? inLen - state[1] : made;   // consumed (or, with no input, made)
+  };
+  try {
+    for (let left = csize; left > 0;) {
+      const n = Math.min(left, input.length);
+      if (!readFully(input, 0, n, pos)) return { why: 'the archive ends inside it' };
+      pos += n; left -= n;
+      for (let at = 0; at < n;) {
+        const before = done;
+        const used = step(zlib.constants.Z_NO_FLUSH, input, at, n - at);
+        if (used < 0) return { why: inf.failed };
+        at += used;
+        if (!used && done === before) break;   // the stream has ended
+      }
+    }
+    // All of the input is in. Z_FINISH says so: zlib reports a stream that
+    // hasn't ended as "unexpected end of file".
+    if (step(zlib.constants.Z_FINISH, null, 0, 0) < 0) return { why: inf.failed };
+    ok = true;
+    if (done !== out.length) return { why: `inflated to ${done} bytes, not ${out.length}` };
+    return { crc };
+  } finally {
+    if (!ok) {
+      try { h.close(); } catch {}
+      inflater = null;
+    }
+  }
+}
+
+// Fallback for a node without zlib's handle: the whole entry at once.
+function inflateWhole(pos, csize, out) {
+  const comp = Buffer.allocUnsafe(csize);
+  if (!readFully(comp, 0, csize, pos)) return { why: 'the archive ends inside it' };
+  const data = zlib.inflateRawSync(comp);
+  if (data.length !== out.length) return { why: `inflated to ${data.length} bytes, not ${out.length}` };
+  out.set(data);
+  return { crc: crc32(out) };
+}
+
+let saidWhole = false;
+function extract(e, out) {
+  if (!e.csize) return null;   // as miniz: nothing to read, nothing written
+  if (e.flags & UNSUPPORTED_FLAGS) return 'encrypted';
+  if (e.method !== 0 && e.method !== 8) return `compression method ${e.method}`;
+  const pos = dataOffset(e);
+  if (pos < 0) return 'bad local header';
+  let r = e.method === 0 ? readStored(pos, out) : inflateTo(pos, e.csize, out);
+  if (r === null) {
+    if (!saidWhole) { log("this node's zlib has no handle to inflate into; inflating whole entries"); saidWhole = true; }
+    r = inflateWhole(pos, e.csize, out);
+  }
+  if (r.why) return r.why;
+  if (r.crc !== e.crc) return 'CRC mismatch';
   return null;
 }
+
 function assetSize(pathPtr, pathLen) {
   const path = readStr('wc_asset_size', pathPtr, pathLen);
   if (path === '_filelist.txt') return cfg.fileList === null ? -1 : Buffer.byteLength(cfg.fileList);
   const e = locate(path);
-  return e ? e.usize : -1;
+  return e && e.usize <= INT32_MAX ? e.usize : -1;
 }
 function loadAsset(pathPtr, pathLen, destPtr, maxSize) {
   const path = readStr('wc_load_asset', pathPtr, pathLen);
@@ -100,23 +247,32 @@ function loadAsset(pathPtr, pathLen, destPtr, maxSize) {
   // how big its buffer is.
   destPtr = need('wc_load_asset', destPtr, maxSize);
   maxSize >>>= 0;
-  let data;
   if (path === '_filelist.txt') {
     if (cfg.fileList === null) return -1;
-    data = Buffer.from(cfg.fileList);
+    const data = Buffer.from(cfg.fileList);
     if (data.length > maxSize) return -1;
-  } else {
-    const e = locate(path);
-    if (!e) return -1;
-    try { data = readEntry(e); } catch (err) { log(`asset ${path}: ${err.message}`); return -1; }
-    if (!data) return -1;
-    if (data.length > maxSize) data = data.subarray(0, maxSize);
+    u8().set(data, destPtr);
+    return data.length;
   }
-  if (destPtr + data.length > memory.buffer.byteLength) return -1;
-  u8().set(data, destPtr);
-  return data.length;
+  const e = locate(path);
+  if (!e || e.usize > INT32_MAX) return -1;
+  if (e.usize > maxSize) {
+    log(`asset ${path}: ${e.usize} bytes, more than dest's ${maxSize}`);
+    return -1;
+  }
+  let why;
+  try {
+    why = extract(e, Buffer.from(memory.buffer, destPtr, e.usize));
+  } catch (err) {
+    why = err && err.message ? err.message : String(err);
+  }
+  if (why) { log(`asset ${path}: ${why}`); return -1; }
+  return e.usize;
 }
 
+)WCJS"
+// Two pieces: MSVC takes no single string literal over 16 KB.
+R"WCJS(
 // ---- WASI (preview1) as threaded wasi-libc uses it ----
 const EBADF = 8, EINVAL = 28, ENOTSUP = 58;
 const sleepCell = new Int32Array(new SharedArrayBuffer(4));

@@ -1306,6 +1306,8 @@ static v8::Local<v8::Object> build_thread_cfg(wc_host_t* host, const char* wasc_
             e->Set(ctx(), v8str("csize"), v8::Number::New(g_isolate, (double)st.m_comp_size)).Check();
             e->Set(ctx(), v8str("usize"), v8::Number::New(g_isolate, (double)st.m_uncomp_size)).Check();
             e->Set(ctx(), v8str("method"), v8::Integer::New(g_isolate, st.m_method)).Check();
+            e->Set(ctx(), v8str("crc"), v8::Integer::NewFromUnsigned(g_isolate, st.m_crc32)).Check();
+            e->Set(ctx(), v8str("flags"), v8::Integer::New(g_isolate, st.m_bit_flag)).Check();
             index->Set(ctx(), v8str(st.m_filename), e).Check();
         }
     }
