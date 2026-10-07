@@ -310,7 +310,7 @@ cc -Isrc -o switch_rumble_test test/switch_rumble_test.c -lm && ./switch_rumble_
 python3 test/import_bounds_test.py build/wasmcart-run   # a bad pointer to an import traps the cart (GL cases need a compositor)
 sh test/input_guard_test.sh   # keyboard is not also a gamepad while typing
 python3 test/gl_no_context_test.py build/wasmcart-run   # with no display, a GL cart is refused at load, not crashed
-sh test/wayland_egl_guard_test.sh   # Wayland EGL stays on SDL's surface, torn down first
+sh test/wayland_egl_guard_test.sh   # Wayland EGL stays on SDL's surface, resized before a frame, torn down first
 sh test/kmsdrm_gl_guard_test.sh     # KMSDRM GL follows SDL's ordering rules
 cc -Iinclude -o pad_layout_test test/pad_layout_test.c && ./pad_layout_test   # wc_pad_t is the ABI's 20 bytes
 sh test/controller_db_platform_test.sh build/wasmcart-run test/snake.wasc   # this platform's mappings only
@@ -339,6 +339,7 @@ python3 test/no_net_test.py build/wasmcart-run     # --no-net refuses a granted 
 python3 test/heartbeat_test.py build/wasmcart-run ../wasmcart/test/fixtures/savecart.wasc [<v3 cart>]   # Couchmix's heartbeat lines
 python3 test/thread_clock_test.py build/wasmcart-run   # a threaded cart's clocks on its worker threads, the wall clock stepped too (Linux, cc)
 python3 test/thread_end_test.py build/wasmcart-run     # a bad pointer or proc_exit on a thread ends the cart, with no save
+python3 test/frame_time_test.py build/wasmcart-run     # delta_ms: a stall clamped to 250 ms; --fixed-step exact
 ```
 
 `text_test` and `lifecycle_test` take the cart's debug-field offsets as arguments because they move
