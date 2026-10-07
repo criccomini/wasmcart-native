@@ -343,6 +343,7 @@ python3 test/thread_end_test.py build/wasmcart-run     # a bad pointer or proc_e
 python3 test/frame_time_test.py build/wasmcart-run     # delta_ms: a stall clamped to 250 ms; --fixed-step exact
 python3 test/worker_asset_test.py build/wasmcart-run   # a thread's assets: the main thread's answers, straight into memory at the asset's size
 python3 test/wasm_bytes_test.py build/wasmcart-run     # cart.wasm costs its size once: our copy is freed once V8 has compiled it
+python3 test/asset_index_test.py build/wasmcart-run    # a threaded cart's asset index: one shared by its workers, names found as on the main thread
 ```
 
 `text_test` and `lifecycle_test` take the cart's debug-field offsets as arguments because they move
