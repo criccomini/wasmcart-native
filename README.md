@@ -332,6 +332,7 @@ cc -Iinclude -Isrc -o audio_fade_test test/audio_fade_test.c -lm && ./audio_fade
 cc -Isrc -o pad_slots_test test/pad_slots_test.c && ./pad_slots_test   # sticky player slots
 python3 test/no_net_test.py build/wasmcart-run     # --no-net refuses a granted host
 python3 test/heartbeat_test.py build/wasmcart-run ../wasmcart/test/fixtures/savecart.wasc [<v3 cart>]   # Couchmix's heartbeat lines
+python3 test/thread_clock_test.py build/wasmcart-run   # a threaded cart's clocks and a bad pointer, on its worker threads
 ```
 
 `text_test` and `lifecycle_test` take the cart's debug-field offsets as arguments because they move
