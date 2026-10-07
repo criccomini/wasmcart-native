@@ -1054,7 +1054,8 @@ static void v8_proc_exit(const v8::FunctionCallbackInfo<v8::Value>& args) {
 //
 // REALTIME (id 0) is the wall clock. The rest (MONOTONIC and the CPU-time
 // clocks, which a cart can't tell from it) count from when the cart's
-// imports were built, as the reference host's performance.now() does. They
+// imports were built (wc_host_load_file sets the origin once its GL context
+// exists), as the reference host's performance.now() does. They
 // used to count from the machine's boot. An Emscripten cart's clock() is a
 // 32-bit count of microseconds, and musl returns -1 for good once that
 // passes 2^31, 35.8 minutes in: on a machine up longer than that, Lua's
@@ -1156,7 +1157,6 @@ static void v8_random_get(const v8::FunctionCallbackInfo<v8::Value>& args) {
 }
 
 static v8::Local<v8::Object> build_wasi_imports() {
-    g_clock_origin_ns = uv_hrtime();
     auto wasi = v8::Object::New(g_isolate);
     wasi->Set(ctx(), v8str("fd_write"), make_fn(v8_fd_write)).Check();
     wasi->Set(ctx(), v8str("fd_close"), make_fn(v8_fd_close)).Check();
@@ -1594,6 +1594,13 @@ extern "C" int wc_host_load_file(wc_host_t* host, const char* wasc_path, const w
     auto gl_imports_obj = v8::Object::New(g_isolate);
     if (!host->uses_wgpu) wc_gl_build_v8_imports(g_isolate, ctx(), gl_imports_obj, env_imports, host);
     imports->Set(ctx(), v8str("gl"), gl_imports_obj).Check();
+
+    // The cart's clocks start here (wasi_now_ns), after its GL context
+    // exists: the embedder's GL loader may make the context on its first
+    // lookup, which building the GL imports just did, and the boot window,
+    // EGL or a KMSDRM modeset shouldn't count as time the cart has run. The
+    // threads' config (build_thread_cfg, below) carries the same origin.
+    g_clock_origin_ns = uv_hrtime();
 
     // WebGPU imports, or traps for whichever GPU API the host did not select.
     if (host->uses_wgpu) {
