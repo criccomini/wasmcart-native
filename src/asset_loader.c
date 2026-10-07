@@ -5,6 +5,7 @@
 #include "../deps/miniz.h"
 #include "../deps/cJSON.h"
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -214,6 +215,15 @@ static const char* build_file_list(wc_host_t* host, uint32_t* out_len) {
     return host->file_list;
 }
 
+static void too_big(const char* path, mz_uint64 size) {
+    static int said = 0;
+    if (said < 3) {
+        wc_log("wasmcart: asset %s is %llu bytes, more than an asset can be (%d)\n", path,
+               (unsigned long long)size, INT32_MAX);
+        said++;
+    }
+}
+
 int32_t wc_archive_asset_size(wc_host_t* host, const char* path) {
     if (!host->archive) return -1;
     mz_zip_archive* zip = (mz_zip_archive*)host->archive;
@@ -228,6 +238,13 @@ int32_t wc_archive_asset_size(wc_host_t* host, const char* path) {
 
     mz_zip_archive_file_stat stat;
     if (!mz_zip_reader_file_stat(zip, idx, &stat)) return -1;
+    // The ABI gives sizes as int32: past INT32_MAX the cast came out
+    // negative (2.5 GiB) or wrapped to a small, wrong size (4 GiB + 300 MiB
+    // read as 300 MiB). An asset that big can't be loaded, so it has none.
+    if (stat.m_uncomp_size > INT32_MAX) {
+        too_big(path, stat.m_uncomp_size);
+        return -1;
+    }
     return (int32_t)stat.m_uncomp_size;
 }
 
@@ -253,6 +270,10 @@ int32_t wc_archive_load_asset(wc_host_t* host, const char* path, uint8_t* dest, 
 
     mz_zip_archive_file_stat stat;
     if (!mz_zip_reader_file_stat(zip, idx, &stat)) return -1;
+    if (stat.m_uncomp_size > INT32_MAX) {
+        too_big(path, stat.m_uncomp_size);
+        return -1;
+    }
 
     uint32_t read_size = (uint32_t)stat.m_uncomp_size;
     if (read_size > max_size) {
