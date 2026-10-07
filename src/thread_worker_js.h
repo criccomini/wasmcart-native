@@ -46,12 +46,16 @@ const dv = () => new DataView(memory.buffer);
 
 // A pointer outside the cart's memory traps the thread, as one handed to an
 // import traps the main thread (cart_host.cpp, wc_cart_range_ok): a
-// RangeError thrown back into the cart. DataView accessors and
-// TypedArray.set throw one by themselves; slice and copyWithin would quietly
-// clamp instead, so those ranges are checked here. wasm hands i32s over
-// signed, hence the >>> 0.
+// RangeError naming the import, thrown back into the cart before the import
+// has read or written anything. DataView accessors and TypedArray.set would
+// throw by themselves, but only when they got there, partway through, and
+// without the import's name; slice and copyWithin would quietly clamp. So
+// every range an import touches is checked here first. wasm hands i32s over
+// signed, hence the >>> 0; a length the shim computed (a count times a size)
+// is already a non-negative Number and is taken as it is.
 function need(name, ptr, len) {
-  ptr >>>= 0; len >>>= 0;
+  ptr >>>= 0;
+  if (len < 0) len >>>= 0;
   const size = memory.buffer.byteLength;
   if (ptr + len > size)
     throw new RangeError(`${name}: ${len} bytes at ${ptr} are outside the cart's memory (${size} bytes)`);
@@ -127,7 +131,8 @@ const clockNs = (id) => id === 0
 class ProcExit extends Error {}
 
 function fdStat(fd, ptr) {
-  if (fd > 2) return EBADF;
+  if ((fd >>> 0) > 2) return EBADF;
+  ptr = need('fd_fdstat_get', ptr, 24);
   const v = dv();
   for (let i = 0; i < 24; i++) v.setUint8(ptr + i, 0);
   v.setUint8(ptr, 2);                                   // filetype: character device
@@ -136,9 +141,24 @@ function fdStat(fd, ptr) {
   v.setBigUint64(ptr + 16, 0xffffffffffffffffn, true);  // rights inheriting
   return 0;
 }
+// environ_sizes_get, args_sizes_get: both counts are zero, and are written.
+const sizesZero = (name) => (countPtr, sizePtr) => {
+  countPtr = need(name, countPtr, 4);
+  sizePtr = need(name, sizePtr, 4);
+  const v = dv();
+  v.setUint32(countPtr, 0, true);
+  v.setUint32(sizePtr, 0, true);
+  return 0;
+};
 
 const wasi = {
   fd_write(fd, iovs, iovsLen, nwrittenPtr) {
+    // Everything checked before anything is written, as on the main thread:
+    // the iovec list, nwritten, then each buffer as its iovec is read (once:
+    // what's checked is what's copied).
+    iovsLen >>>= 0;
+    iovs = need('fd_write', iovs, iovsLen * 8);
+    nwrittenPtr = need('fd_write', nwrittenPtr, 4);
     const v = dv();
     let total = 0;
     const chunks = [];
@@ -155,13 +175,18 @@ const wasi = {
     v.setUint32(nwrittenPtr, total, true);
     return 0;
   },
-  fd_read(fd, iovs, iovsLen, nreadPtr) { dv().setUint32(nreadPtr, 0, true); return 0; },
+  fd_read(fd, iovs, iovsLen, nreadPtr) {
+    nreadPtr = need('fd_read', nreadPtr, 4);
+    dv().setUint32(nreadPtr, 0, true);
+    return 0;
+  },
   fd_close() { return 0; },
   fd_seek() { return 0; },
   fd_fdstat_get(fd, ptr) { return fdStat(fd, ptr); },
-  fd_fdstat_set_flags(fd) { return fd > 2 ? EBADF : 0; },
+  fd_fdstat_set_flags(fd) { return (fd >>> 0) > 2 ? EBADF : 0; },
   fd_filestat_get(fd, ptr) {
-    if (fd > 2) return EBADF;
+    if ((fd >>> 0) > 2) return EBADF;
+    ptr = need('fd_filestat_get', ptr, 64);
     const v = dv();
     for (let i = 0; i < 64; i++) v.setUint8(ptr + i, 0);
     v.setUint8(ptr + 16, 2);                            // filetype: character device
@@ -171,13 +196,23 @@ const wasi = {
   fd_prestat_dir_name() { return EBADF; },
   path_open() { return EBADF; },
   path_filestat_get() { return EBADF; },
-  environ_sizes_get(countPtr, sizePtr) { const v = dv(); v.setUint32(countPtr, 0, true); v.setUint32(sizePtr, 0, true); return 0; },
+  environ_sizes_get: sizesZero('environ_sizes_get'),
   environ_get() { return 0; },
-  args_sizes_get(countPtr, sizePtr) { const v = dv(); v.setUint32(countPtr, 0, true); v.setUint32(sizePtr, 0, true); return 0; },
+  args_sizes_get: sizesZero('args_sizes_get'),
   args_get() { return 0; },
-  clock_time_get(id, precision, resultPtr) { dv().setBigUint64(resultPtr, clockNs(id), true); return 0; },
-  clock_res_get(id, resultPtr) { dv().setBigUint64(resultPtr, 1000n, true); return 0; },
+  clock_time_get(id, precision, resultPtr) {
+    resultPtr = need('clock_time_get', resultPtr, 8);
+    dv().setBigUint64(resultPtr, clockNs(id), true);
+    return 0;
+  },
+  clock_res_get(id, resultPtr) {
+    resultPtr = need('clock_res_get', resultPtr, 8);
+    dv().setBigUint64(resultPtr, 1000n, true);
+    return 0;
+  },
   random_get(ptr, len) {
+    len >>>= 0;
+    ptr = need('random_get', ptr, len);
     const tmp = Buffer.alloc(len);
     crypto.randomFillSync(tmp);
     u8().set(tmp, ptr);
@@ -187,7 +222,11 @@ const wasi = {
   proc_exit(code) { throw new ProcExit(`proc_exit(${code})`); },
   // Clock subscriptions sleep (that is nanosleep); fd subscriptions report ready.
   poll_oneoff(inPtr, outPtr, nsubs, neventsPtr) {
+    nsubs >>>= 0;
     if (nsubs === 0) return EINVAL;
+    inPtr = need('poll_oneoff', inPtr, nsubs * 48);
+    outPtr = need('poll_oneoff', outPtr, nsubs * 32);
+    neventsPtr = need('poll_oneoff', neventsPtr, 4);
     const v = dv();
     let wake = null;
     for (let i = 0; i < nsubs; i++) {
