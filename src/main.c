@@ -779,6 +779,37 @@ static void save_done(bool ok) {
     hb_note(ok ? 'W' : 'E', ok ? NULL : "write_failed");
 }
 
+// The save region, read once. A threaded cart's other threads keep running
+// between frames, so the region can change while the host reads it; working
+// from one copy means the bytes compared, checked, written and remembered
+// below are the same bytes. A copy that a second read disagrees with (a
+// thread was writing the save just then) is taken again, a few times, so a
+// save caught half-written is less likely, though it can't be ruled out
+// without the cart's help; after that the latest copy is used, as one read
+// was before. For a cart without threads the first copy always holds.
+static uint8_t* g_save_snap = NULL;
+static uint32_t g_save_snap_cap = 0;
+
+static const uint8_t* save_snapshot(const uint8_t* live, uint32_t size) {
+    if (size > g_save_snap_cap) {
+        uint8_t* p = (uint8_t*)realloc(g_save_snap, size);
+        if (!p) return live;  // no room for a copy: read it in place, as before
+        g_save_snap = p;
+        g_save_snap_cap = size;
+    }
+    for (int tries = 0; tries < 4; tries++) {
+        memcpy(g_save_snap, live, size);
+        if (memcmp(g_save_snap, live, size) == 0) return g_save_snap;
+    }
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        fprintf(stderr, "wasmcart: the save region kept changing while it was read; "
+                        "saving the latest copy\n");
+    }
+    return g_save_snap;
+}
+
 // now: write it here and now, after anything the writer has in flight (the
 // final save on exit). Otherwise hand a snapshot to the writer thread.
 static void persist_sav(wc_host_t* host, const char* sav_path, bool now) {
@@ -786,8 +817,9 @@ static void persist_sav(wc_host_t* host, const char* sav_path, bool now) {
     // save; the last save written while it was healthy is the better one.
     if (wc_host_has_trapped(host)) return;
     uint32_t size = 0;
-    const uint8_t* data = wc_host_get_save_data(host, &size);
-    if (!data || size == 0) return;  // cart declares no save block
+    const uint8_t* live = wc_host_get_save_data(host, &size);
+    if (!live || size == 0) return;  // cart declares no save block
+    const uint8_t* data = save_snapshot(live, size);
     if (save_writer_take_failure(&g_writer)) g_save_retry = true;
     if (!g_save_retry && g_last_saved && g_last_saved_size == size &&
         memcmp(g_last_saved, data, size) == 0)
