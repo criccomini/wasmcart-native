@@ -3871,9 +3871,12 @@ static mz_bool mz_zip_reader_read_central_dir(mz_zip_archive *pZip, mz_uint flag
             if ((disk_index == MZ_UINT16_MAX) || ((disk_index != num_this_disk) && (disk_index != 1)))
                 return mz_zip_set_error(pZip, MZ_ZIP_UNSUPPORTED_MULTIDISK);
 
-            if (comp_size != MZ_UINT32_MAX)
+            /* An offset of MZ_UINT32_MAX is in the zip64 extra field, which a writer may use for any offset (Python's
+               zipfile does from 2 GiB): the 32-bit value isn't one to check. The real offset is checked when the entry
+               is read. */
+            if ((comp_size != MZ_UINT32_MAX) && (local_header_ofs != MZ_UINT32_MAX))
             {
-                if (((mz_uint64)MZ_READ_LE32(p + MZ_ZIP_CDH_LOCAL_HEADER_OFS) + MZ_ZIP_LOCAL_DIR_HEADER_SIZE + comp_size) > pZip->m_archive_size)
+                if ((local_header_ofs + MZ_ZIP_LOCAL_DIR_HEADER_SIZE + comp_size) > pZip->m_archive_size)
                     return mz_zip_set_error(pZip, MZ_ZIP_INVALID_HEADER_OR_CORRUPTED);
             }
 
