@@ -2,8 +2,8 @@
 """import_bounds_test.py — a cart can't point a host import outside its memory.
 
 Builds tiny carts byte by byte (no toolchain) that call host imports (wc_log,
-the asset and peer calls, WASI fd_write/clock_time_get/random_get, and a set
-of GL calls) with pointers into their own one page of memory that run past
+the asset and peer calls, the WASI calls that take pointers, and a set of GL
+calls) with pointers into their own one page of memory that run past
 its end, or wrap around 32 bits. Each must trap the cart the way a bad load
 or store would: a RangeError naming the import, a non-zero exit, no crash,
 and nothing after the bad call runs. Control carts make the same calls with
@@ -93,6 +93,13 @@ SIGS = {
     "fd_write": ("wasi_snapshot_preview1", [I32] * 4, [I32]),
     "clock_time_get": ("wasi_snapshot_preview1", [I32, I64, I32], [I32]),
     "random_get": ("wasi_snapshot_preview1", [I32] * 2, [I32]),
+    "fd_read": ("wasi_snapshot_preview1", [I32] * 4, [I32]),
+    "fd_fdstat_get": ("wasi_snapshot_preview1", [I32] * 2, [I32]),
+    "fd_filestat_get": ("wasi_snapshot_preview1", [I32] * 2, [I32]),
+    "environ_sizes_get": ("wasi_snapshot_preview1", [I32] * 2, [I32]),
+    "args_sizes_get": ("wasi_snapshot_preview1", [I32] * 2, [I32]),
+    "clock_res_get": ("wasi_snapshot_preview1", [I32] * 2, [I32]),
+    "poll_oneoff": ("wasi_snapshot_preview1", [I32] * 4, [I32]),
     "glGenBuffers": ("gl", [I32] * 2, []),
     "glBindBuffer": ("gl", [I32] * 2, []),
     "glBufferData": ("gl", [I32] * 4, []),
@@ -267,6 +274,16 @@ TRAPS = [
     ("fd_write nwritten", "fd_write", lambda c: c.call("fd_write", 2, iov(c, STRS, 0), 1, END - 2)),
     ("clock_time_get", "clock_time_get", lambda c: c.call("clock_time_get", 0, 0, END - 4)),
     ("random_get", "random_get", lambda c: c.call("random_get", END - 3, 4)),
+    ("fd_read nread", "fd_read", lambda c: c.call("fd_read", 0, 0, 0, END - 3)),
+    ("fd_fdstat_get", "fd_fdstat_get", lambda c: c.call("fd_fdstat_get", 1, END - 23)),
+    ("fd_filestat_get", "fd_filestat_get", lambda c: c.call("fd_filestat_get", 1, END - 63)),
+    ("environ_sizes_get", "environ/args_sizes_get", lambda c: c.call("environ_sizes_get", 0, END - 3)),
+    ("args_sizes_get", "environ/args_sizes_get", lambda c: c.call("args_sizes_get", END - 3, 0)),
+    ("clock_res_get", "clock_res_get", lambda c: c.call("clock_res_get", 0, END - 7)),
+    ("poll_oneoff subscriptions", "poll_oneoff",
+     lambda c: c.call("poll_oneoff", END - 47, SCRATCH, 1, SCRATCH + 64)),
+    ("poll_oneoff events", "poll_oneoff", lambda c: c.call("poll_oneoff", SCRATCH, END - 31, 1, SCRATCH + 64)),
+    ("poll_oneoff nevents", "poll_oneoff", lambda c: c.call("poll_oneoff", SCRATCH, SCRATCH + 64, 1, END - 3)),
     ("wc_peer_open", "wc_peer_open", lambda c: c.call("wc_peer_open", END - 3, 4)),
     ("wc_peer_send", "wc_peer_send", lambda c: c.call("wc_peer_send", 0, END - 3, 4)),
     ("wc_peer_broadcast", "wc_peer_broadcast", lambda c: c.call("wc_peer_broadcast", END - 3, 4)),
@@ -328,6 +345,14 @@ def control_wasi():
     c.init = (c.call("fd_write", 2, iov(c, STRS + 512, 12), 1, END - 4) +
               c.call("clock_time_get", 0, 0, END - 8) +
               c.call("random_get", END - 16, 16) +
+              c.call("fd_read", 0, 0, 0, END - 4) +
+              c.call("fd_fdstat_get", 1, END - 24) +
+              c.call("fd_filestat_get", 1, END - 64) +
+              c.call("environ_sizes_get", END - 8, END - 4) +
+              c.call("args_sizes_get", END - 8, END - 4) +
+              c.call("clock_res_get", 0, END - 8) +
+              # one clock subscription, all zeros: a relative timeout of 0
+              c.call("poll_oneoff", SCRATCH + 128, END - 32, 1, END - 36) +
               c.log("ok wasi"))
     c.render = UNREACHABLE
     return c, ["fd_write ok", "ok wasi"]
