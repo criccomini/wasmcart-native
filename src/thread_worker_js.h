@@ -121,13 +121,23 @@ function loadAsset(pathPtr, pathLen, destPtr, maxSize) {
 const EBADF = 8, EINVAL = 28, ENOTSUP = 58;
 const sleepCell = new Int32Array(new SharedArrayBuffer(4));
 // The cart's clocks, read as the main thread reads them (cart_host.cpp,
-// wasi_now_ns): REALTIME (id 0) is the wall clock, the rest count from the
-// origin the main thread took when it built the cart's imports, on uv_hrtime,
-// which is what process.hrtime.bigint() reads. A deadline computed on one
-// thread then means the same instant on another.
-const clockNs = (id) => id === 0
-  ? BigInt(Math.round((performance.timeOrigin + performance.now()) * 1e6))
-  : process.hrtime.bigint() - cfg.clockOriginNs;
+// wasi_now_ns). MONOTONIC and the CPU-time clocks count from the origin the
+// main thread took when it built the cart's imports, on uv_hrtime, which is
+// what process.hrtime.bigint() reads, so a deadline on one of them means the
+// same instant on every thread. REALTIME (id 0) is the wall clock, read live
+// as the main thread's timespec_get is: performance.timeOrigin is the wall
+// clock when this worker started, and timeOrigin + now() alone would never
+// see the wall clock stepped (a Pi with no RTC that syncs over the network
+// after a cart started). Date.now() sees steps but only to the millisecond,
+// so it moves the offset only when the two disagree by more than that.
+let wallOffsetMs = 0;
+function realtimeNs() {
+  const t = performance.timeOrigin + performance.now();
+  const drift = Date.now() - (t + wallOffsetMs);
+  if (drift > 1 || drift < -1) wallOffsetMs = Date.now() - t;
+  return BigInt(Math.round((t + wallOffsetMs) * 1e6));
+}
+const clockNs = (id) => id === 0 ? realtimeNs() : process.hrtime.bigint() - cfg.clockOriginNs;
 class ProcExit extends Error {}
 
 function fdStat(fd, ptr) {
