@@ -100,6 +100,10 @@ struct wc_host {
     // .wasc archive (kept open for wc_load_asset)
     void* archive;  // mz_zip_archive*
 
+    // Called between the chunks of an asset load (wc_host_set_load_progress).
+    wc_load_progress_fn load_progress;
+    void* load_progress_user;
+
     // Rumble backend supplied by the embedder (libretro, SDL, ...).
     // has_rumble == NULL means "no backend": the imports become silent no-ops
     // and wc_pad_has_rumble reports 0.

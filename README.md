@@ -337,6 +337,7 @@ cc -Iinclude -Isrc -o audio_fade_test test/audio_fade_test.c -lm && ./audio_fade
 cc -Isrc -o pad_slots_test test/pad_slots_test.c && ./pad_slots_test   # sticky player slots
 python3 test/no_net_test.py build/wasmcart-run     # --no-net refuses a granted host
 python3 test/heartbeat_test.py build/wasmcart-run ../wasmcart/test/fixtures/savecart.wasc [<v3 cart>]   # Couchmix's heartbeat lines
+python3 test/load_progress_test.py build/wasmcart-run   # a long asset load is chunked, CRC-checked, and sends A lines; Home and quit mid-load (Linux, cc)
 python3 test/thread_clock_test.py build/wasmcart-run   # a threaded cart's clocks on its worker threads, the wall clock stepped too (Linux, cc)
 python3 test/thread_end_test.py build/wasmcart-run     # a bad pointer or proc_exit on a thread ends the cart, with no save
 python3 test/frame_time_test.py build/wasmcart-run     # delta_ms: a stall clamped to 250 ms; --fixed-step exact

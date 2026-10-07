@@ -232,6 +232,27 @@ int  wc_host_load_file(wc_host_t* host, const char* wasc_path, const wc_host_opt
 int  wc_host_load_memory(wc_host_t* host, const uint8_t* data, size_t len, const wc_host_options_t* opts);
 int  wc_host_finish_init(wc_host_t* host);  // call after GL context ready if defer_init was set
 
+// ─── Asset load progress ───────────────────────────────────────────────────
+//
+// wc_load_asset blocks the cart's thread until the whole asset is in its
+// memory, and a big one takes seconds (a stored 256 MiB asset is about 4 s
+// from a Pi's SD card when it isn't cached). It is extracted in chunks of a
+// few MiB, and between them the host calls this, so an embedder that watches
+// for hangs can tell a long load from a stuck cart:
+//
+//   fn(user, 0, total)      when a load starts (total: the bytes it will write)
+//   fn(user, done, total)   after each chunk, done growing to total
+//
+// done == total once every byte is in, before the CRC is checked: a load
+// that then fails the check still returns -1 to the cart. A load that fails
+// part way stops calling. A zero-byte asset makes no calls.
+//
+// It runs on the thread that called wc_load_asset, inside the import, so it
+// must not call back into the host or the cart; it may block, and the load
+// waits for it. Pass NULL to detach.
+typedef void (*wc_load_progress_fn)(void* user, uint64_t done, uint64_t total);
+void wc_host_set_load_progress(wc_host_t* host, wc_load_progress_fn fn, void* user);
+
 // ─── Rumble (ABI v3) ───────────────────────────────────────────────────────
 //
 // Rumble runs the OPPOSITE way to the rest of input: the cart drives it, so it

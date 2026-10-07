@@ -248,6 +248,75 @@ int32_t wc_archive_asset_size(wc_host_t* host, const char* path) {
     return (int32_t)stat.m_uncomp_size;
 }
 
+void wc_host_set_load_progress(wc_host_t* host, wc_load_progress_fn fn, void* user) {
+    if (!host) return;
+    host->load_progress = fn;
+    host->load_progress_user = fn ? user : NULL;
+}
+
+/*
+ * An asset goes into the cart's memory WC_LOAD_CHUNK bytes at a time,
+ * through miniz's iterator: a stored entry is read straight into dest, and a
+ * deflated one is inflated through miniz's 32 KiB window and copied out of
+ * it, so nothing the size of the asset is allocated on the way. The CRC is
+ * taken as the bytes go by and checked once they're all in, as
+ * mz_zip_reader_extract_to_mem did.
+ *
+ * Between chunks the embedder's progress callback runs
+ * (wc_host_set_load_progress). It used to be one call that returned when the
+ * whole asset was in, and the cart's thread showed no sign of life until
+ * then: about 4 s for a stored 256 MiB asset from a Pi's SD card, cold.
+ * A chunk there is about 60 ms.
+ *
+ * Returns NULL, or why the load failed. dest may hold part of the asset after
+ * a failure, as it could before.
+ */
+#define WC_LOAD_CHUNK (4u << 20)
+
+static const char* extract_chunked(wc_host_t* host, mz_zip_archive* zip, int idx,
+                                   uint8_t* dest, uint32_t size) {
+    if (size == 0) return NULL;  // a directory or an empty file: nothing to read
+    mz_zip_clear_last_error(zip);
+    mz_zip_reader_extract_iter_state* it = mz_zip_reader_extract_iter_new(zip, (mz_uint)idx, 0);
+    if (!it) return mz_zip_get_error_string(mz_zip_get_last_error(zip));
+    wc_load_progress_fn progress = host->load_progress;
+    void* user = host->load_progress_user;
+    if (progress) progress(user, 0, size);
+
+    uint32_t done = 0;
+    while (done < size) {
+        uint32_t want = size - done < WC_LOAD_CHUNK ? size - done : WC_LOAD_CHUNK;
+        size_t got = mz_zip_reader_extract_iter_read(it, dest + done, want);
+        if (got == 0 || got > want) break;  // a read error, or the data ended early
+        done += (uint32_t)got;
+        if (progress) progress(user, done, size);
+    }
+
+    const char* why = NULL;
+    if (done < size) {
+        why = mz_zip_peek_last_error(zip) == MZ_ZIP_FILE_READ_FAILED ? "read failed"
+            : it->status < TINFL_STATUS_DONE ? "the compressed data is damaged"
+            : "the entry's data ended early";
+    } else {
+        // All of it is out, but a deflated entry's inflater may not be past
+        // the end of the stream yet, and iter_free checks the size and CRC
+        // only once it is. Take it there, into scratch rather than the
+        // cart's memory: an entry with more in it than its size would spill.
+        uint8_t tail[256];
+        for (int i = 0; i < 8 && (it->status == TINFL_STATUS_NEEDS_MORE_INPUT ||
+                                  it->status == TINFL_STATUS_HAS_MORE_OUTPUT); i++) {
+            if (mz_zip_reader_extract_iter_read(it, tail, sizeof(tail)) != 0) {
+                why = "the entry holds more than its size";
+                break;
+            }
+        }
+        if (!why && it->status != TINFL_STATUS_DONE) why = "the compressed data is damaged";
+    }
+    // Every byte in and the stream ended: a failure now is the CRC.
+    if (!mz_zip_reader_extract_iter_free(it) && !why) why = "CRC mismatch";
+    return why;
+}
+
 int32_t wc_archive_load_asset(wc_host_t* host, const char* path, uint8_t* dest, uint32_t max_size) {
     if (!host->archive) return -1;
     mz_zip_archive* zip = (mz_zip_archive*)host->archive;
@@ -277,12 +346,17 @@ int32_t wc_archive_load_asset(wc_host_t* host, const char* path, uint8_t* dest, 
 
     uint32_t read_size = (uint32_t)stat.m_uncomp_size;
     if (read_size > max_size) {
-        wc_log( "wasmcart: asset %s: size %u > max %u, truncating\n", path, read_size, max_size);
-        read_size = max_size;
+        // Refused, with dest left alone. (This used to log "truncating",
+        // but miniz refused a buffer smaller than the entry, so the load
+        // failed then too.)
+        wc_log( "wasmcart: asset %s: %u bytes, more than the %u the cart has room for\n",
+                path, read_size, max_size);
+        return -1;
     }
 
-    if (!mz_zip_reader_extract_to_mem(zip, idx, dest, read_size, 0)) {
-        wc_log( "wasmcart: asset %s: extract failed\n", path);
+    const char* why = extract_chunked(host, zip, idx, dest, read_size);
+    if (why) {
+        wc_log( "wasmcart: asset %s: extract failed (%s)\n", path, why);
         return -1;
     }
     static int _load = 0;

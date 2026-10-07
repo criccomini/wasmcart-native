@@ -607,6 +607,32 @@ static void dbg_poll_reply(wc_host_t* host, uint32_t* last_seq) {
 //   dropped.
 // - COUCHMIX_KEYBOARD_PAD=0 stops the keyboard driving pad 0. A TV's
 //   HDMI-CEC remote shows up as a keyboard.
+// - A long asset load sends progress in place of frames:
+//   "A <load> <monotonic_us> <done> <total>". wc_load_asset holds the
+//   cart's thread until the asset is in (about 4 s for a stored 256 MiB
+//   asset from a Pi's SD card, cold), and no F goes out meanwhile. load
+//   numbers the loads since start (1, 2, ...); done is the bytes of it in
+//   the cart's memory so far, total all of them. A line goes out between
+//   chunks once 250 ms have passed since the last F, S, R, P or A line, so a
+//   load that fits in a frame sends none, and a long stretch of loading (one
+//   big asset, or a frame of many small ones) sends about four a second. A
+//   load that sent one sends one more when all its bytes are in (done ==
+//   total), so a reader knows it ended. A load that stalls sends nothing,
+//   like a cart stuck in its own code. Five fields, so a supervisor that
+//   predates the line, and takes any three-field line as a beat, ignores
+//   it. Only with COUCHMIX_HEARTBEAT_FD.
+// - Home mid-load (SIGUSR1, or a minimize) doesn't stop the load. It runs
+//   to its end, still sending A lines, and the suspend (wc_on_focus_lost,
+//   wc_on_suspend, the save, the fade) happens when that frame ends, as for
+//   a Home at any other time. Not between chunks: the cart is mid-call, so
+//   it can't be told it's suspended, and its save region may be half way
+//   through the frame's changes. A load paused under the menu would also
+//   have to finish at Close game, inside the supervisor's 3 s quit grace;
+//   one left to run is usually done by then. The wait is the rest of the
+//   frame's loading: an asset is under 2 GiB, and a load whose bytes stop
+//   is a hang to the supervisor after 2 s. SIGTERM mid-load is the same: the
+//   load finishes, the frame ends, then the save and the exit. SIGSTOP stops
+//   a load anywhere, which is as safe as it is for any frame.
 static volatile sig_atomic_t g_ext_suspend = 0;
 #ifndef _WIN32
 #include <errno.h>
@@ -632,13 +658,18 @@ static void hb_open(void) {
     g_hb_fd = fd;
 }
 
+// When the last F, S, R, P or A line went out (all from the cart's thread).
+static unsigned long long g_hb_last_us = 0;
+
 static void hb_write(char kind, uint32_t frame) {
     if (g_hb_fd < 0) return;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+    unsigned long long us =
+        (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull;
+    g_hb_last_us = us;
     char line[64];
-    int n = snprintf(line, sizeof(line), "%c %u %llu\n", kind, frame,
-        (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull);
+    int n = snprintf(line, sizeof(line), "%c %u %llu\n", kind, frame, us);
     if (write(g_hb_fd, line, (size_t)n) < 0 && errno != EAGAIN && errno != EINTR) {
         close(g_hb_fd);
         g_hb_fd = -1;  // the supervisor went away; keep playing
@@ -649,6 +680,32 @@ static unsigned long long hb_now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull;
+}
+
+// The A lines (above). The library calls this between the chunks of a load
+// (wc_host_set_load_progress), on the cart's thread.
+#define HB_LOAD_EVERY_US 250000ull
+static uint32_t g_load_seq = 0;      // loads started since the cart did
+static bool g_load_reported = false; // an A line went out for this load
+static void hb_line(const char* line, int n);
+
+static void hb_load_progress(void* user, uint64_t done, uint64_t total) {
+    (void)user;
+    if (done == 0) {  // a load starting
+        g_load_seq++;
+        g_load_reported = false;
+        return;
+    }
+    if (g_hb_fd < 0) return;
+    unsigned long long now = hb_now_us();
+    bool last = done >= total && g_load_reported;
+    if (!last && now - g_hb_last_us < HB_LOAD_EVERY_US) return;
+    char line[96];
+    int n = snprintf(line, sizeof(line), "A %u %llu %llu %llu\n", g_load_seq, now,
+                     (unsigned long long)done, (unsigned long long)total);
+    g_hb_last_us = now;
+    g_load_reported = done < total;  // the one at the end is this load's last
+    hb_line(line, n);
 }
 
 static void hb_line(const char* line, int n) {
@@ -690,6 +747,14 @@ static void supervisor_hooks_init(void) {
     signal(SIGUSR2, on_resume_signal);
     hb_open();
 }
+
+// After the cart is loaded: wc_init's loads go before the heartbeat fd is
+// open, under the supervisor's launch deadline.
+static void hb_watch_loads(wc_host_t* host) {
+    if (g_hb_fd < 0) return;
+    g_hb_last_us = hb_now_us();
+    wc_host_set_load_progress(host, hb_load_progress, NULL);
+}
 #else
 static void hb_write(char kind, uint32_t frame) { (void)kind; (void)frame; }
 static void hb_write_slot(int slot, bool connected, const char* key) {
@@ -698,6 +763,7 @@ static void hb_write_slot(int slot, bool connected, const char* key) {
 static void hb_note(char kind, const char* what) { (void)kind; (void)what; }
 static void hb_info(uint32_t abi, uint32_t save_size) { (void)abi; (void)save_size; }
 static void supervisor_hooks_init(void) {}
+static void hb_watch_loads(wc_host_t* host) { (void)host; }
 #endif
 
 // Couchmix's pad policy: sticky slots, and one-player carts hear every pad.
@@ -1599,6 +1665,7 @@ static int run_player(int argc, char* argv[]) {
     // report the slots of the pads opened just below.
     pad_policy_init();
     supervisor_hooks_init();
+    hb_watch_loads(host);
     {
         uint32_t save_size = 0;
         wc_host_get_save_data(host, &save_size);
