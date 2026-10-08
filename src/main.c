@@ -620,7 +620,10 @@ static void dbg_poll_reply(wc_host_t* host, uint32_t* last_seq) {
 //   total), so a reader knows it ended. A load that stalls sends nothing,
 //   like a cart stuck in its own code. Five fields, so a supervisor that
 //   predates the line, and takes any three-field line as a beat, ignores
-//   it. Only with COUCHMIX_HEARTBEAT_FD.
+//   it. Only with COUCHMIX_HEARTBEAT_FD. The fd is opened before the cart
+//   loads, so wc_init's loads send A lines too, before the "I" line and the
+//   first F: a game that loads its art at start can be told from one stuck
+//   in its own code.
 // - Home mid-load (SIGUSR1, or a minimize) doesn't stop the load. It runs
 //   to its end, still sending A lines, and the suspend (wc_on_focus_lost,
 //   wc_on_suspend, the save, the fade) happens when that frame ends, as for
@@ -645,6 +648,9 @@ static void on_suspend_signal(int sig) { (void)sig; g_ext_suspend = 1; }
 static void on_resume_signal(int sig) { (void)sig; g_ext_suspend = 0; }
 
 static void hb_open(void) {
+    static bool opened = false;  // before the cart loads (hb_watch_loads), and again after
+    if (opened) return;
+    opened = true;
     const char* s = getenv("COUCHMIX_HEARTBEAT_FD");
     if (!s || !*s) return;
     int fd = atoi(s);
@@ -748,9 +754,10 @@ static void supervisor_hooks_init(void) {
     hb_open();
 }
 
-// After the cart is loaded: wc_init's loads go before the heartbeat fd is
-// open, under the supervisor's launch deadline.
+// Before the cart is loaded, so wc_init's loads are reported too: the
+// heartbeat fd opens here, ahead of the rest of the hooks.
 static void hb_watch_loads(wc_host_t* host) {
+    hb_open();
     if (g_hb_fd < 0) return;
     g_hb_last_us = hb_now_us();
     wc_host_set_load_progress(host, hb_load_progress, NULL);
@@ -1286,6 +1293,7 @@ static int run_player(int argc, char* argv[]) {
     };
     if (no_net) fprintf(stderr, "wasmcart: networking off (--no-net)\n");
 
+    hb_watch_loads(host);  // wc_init's loads send A lines (see the supervisor hooks)
     int rc = wc_host_load_file(host, cart_path, &opts);
     if (rc != 0) {
         fprintf(stderr, "wasmcart: failed to load %s\n", cart_path);
@@ -1665,7 +1673,6 @@ static int run_player(int argc, char* argv[]) {
     // report the slots of the pads opened just below.
     pad_policy_init();
     supervisor_hooks_init();
-    hb_watch_loads(host);
     {
         uint32_t save_size = 0;
         wc_host_get_save_data(host, &save_size);
