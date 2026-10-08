@@ -29,6 +29,8 @@ Checks:
   stall      reads that stop part way: the A lines stop too, and nothing
              else goes out (the supervisor's hang)
   no fd      without COUCHMIX_HEARTBEAT_FD the load is the same, unreported
+  init       the stored load in wc_init instead: A lines before the "I" line
+             and the first F, done rising to total
 
 Run:  python3 test/load_progress_test.py build/wasmcart-run    (Linux, cc)
 """
@@ -140,12 +142,13 @@ GET, SET, TEE = b"\x20", b"\x21", b"\x22"
 I, OKL = 0, 1  # wc_render's locals: the loop count, and all-ok so far
 
 
-def cart_wasm(asset, size, count, w0, w1):
+def cart_wasm(asset, size, count, w0, w1, at_init=False):
     """An ABI 4, 64x64 2D cart with a 16-byte save. Imports wc_load_asset (0)
     and wc_log (1); defines wc_get_info (2), wc_init (3), wc_render (4).
     At frame LOAD_FRAME, wc_render loads asset into DEST with room for one
     byte less, then count times with room for all of it, and checks the
-    returns (-1, then size) and the words at DEST and DEST + size - 4."""
+    returns (-1, then size) and the words at DEST and DEST + size - 4.
+    at_init: wc_init does that instead, and wc_render nothing."""
     i32 = 0x7F
     types = vec([b"\x60\x00\x01" + bytes([i32]), b"\x60\x00\x00",
                  b"\x60\x04" + bytes([i32] * 4) + b"\x01" + bytes([i32]),
@@ -158,8 +161,7 @@ def cart_wasm(asset, size, count, w0, w1):
     exports = vec([name("memory") + b"\x02" + uleb(0), name("wc_get_info") + b"\x00" + uleb(2),
                    name("wc_init") + b"\x00" + uleb(3), name("wc_render") + b"\x00" + uleb(4)])
     load = lambda room: const(NAME) + const(len(asset)) + const(DEST) + const(room) + call(0)
-    render = (load32(TIME + 16) + const(LOAD_FRAME) + EQ + IF +
-              load(size - 1) + const(-1) + EQ + SET + uleb(OKL) +
+    loads = (load(size - 1) + const(-1) + EQ + SET + uleb(OKL) +
               const(0) + SET + uleb(I) +
               LOOP +
               GET + uleb(OKL) + load(size) + const(size) + EQ + AND + SET + uleb(OKL) +
@@ -167,14 +169,17 @@ def cart_wasm(asset, size, count, w0, w1):
               END +
               GET + uleb(OKL) + load32(DEST) + const(w0) + EQ + AND +
               load32(DEST + size - 4) + const(w1) + EQ + AND +
-              IF + const(OK) + const(7) + call(1) + ELSE + const(BAD) + const(8) + call(1) + END +
-              END)
+              IF + const(OK) + const(7) + call(1) + ELSE + const(BAD) + const(8) + call(1) + END)
+    render = load32(TIME + 16) + const(LOAD_FRAME) + EQ + IF + loads + END
 
     def body(code, locals_=b"\x00"):
         b = locals_ + code + END
         return uleb(len(b)) + b
 
-    code = vec([body(const(INFO)), body(b""), body(render, b"\x01\x02\x7f")])
+    if at_init:
+        code = vec([body(const(INFO)), body(loads, b"\x01\x02\x7f"), body(b"")])
+    else:
+        code = vec([body(const(INFO)), body(b""), body(render, b"\x01\x02\x7f")])
     img = bytearray(0xB00 - INFO)
     struct.pack_into("<18I", img, 0, 4, 64, 64, FB, AUDIO, 1024, AWRITE, PADS, SAVE, 16, TIME, HOST, 0,
                      48000, PTRS, KEYS, 0, 0)
@@ -192,11 +197,11 @@ def low_entropy(n, seed):
     return random.Random(seed).randbytes(n).translate(table)
 
 
-def write_cart(path, asset, data, method, count=1):
+def write_cart(path, asset, data, method, count=1, at_init=False):
     w0, w1 = struct.unpack_from("<I", data, 0)[0], struct.unpack_from("<I", data, len(data) - 4)[0]
     with zipfile.ZipFile(path, "w") as z:
         z.writestr("manifest.json", '{"name": "load progress", "abi": 4}')
-        z.writestr("cart.wasm", cart_wasm(asset, len(data), count, w0, w1))
+        z.writestr("cart.wasm", cart_wasm(asset, len(data), count, w0, w1, at_init))
         z.writestr(zipfile.ZipInfo(asset), data, compress_type=method, compresslevel=1)
     with zipfile.ZipFile(path) as z:
         return z.getinfo(asset).compress_size
@@ -474,6 +479,25 @@ def main():
         try:
             log = loaded(r)
             check("no fd: the load is the same", "load ok" in log, log[-300:])
+        finally:
+            r.stop()
+
+        # init: the stored load in wc_init, before the cart's first frame
+        at_init = os.path.join(d, "init.wasc")
+        write_cart(at_init, "big.bin", random.Random(1).randbytes(big), zipfile.ZIP_STORED, at_init=True)
+        r = Run(binary, at_init, d, shim, SLOWREAD_BPS=RATE)
+        try:
+            r.read(20, lambda p: p and p[0] == "F")
+            log = loaded(r)
+            check("init: the load in wc_init returned the asset", "load ok" in log, log[-400:])
+            k = kinds(r.lines)
+            seq = [v for _, v in a_lines(r.lines)]
+            check("init: A lines while it loads", len(seq) >= 4, k[:8])
+            check("init: all before the I line and the first F",
+                  "A" in k and "I" in k and "F" in k and
+                  len(k) - 1 - k[::-1].index("A") < k.index("I") < k.index("F"), k[:20])
+            check("init: done rises to total", seq and all(x[2] < y[2] for x, y in zip(seq, seq[1:]))
+                  and seq[-1][2] == seq[-1][3] == big, [v[2] for v in seq])
         finally:
             r.stop()
 
