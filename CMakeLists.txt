@@ -27,6 +27,7 @@ set(LIBWASMCART_SOURCES
     src/cart_host.cpp
     src/gl_imports.cpp
     src/gl_procs.c
+    src/gl_timer.c
     src/asset_loader.c
     deps/miniz.c
     deps/cJSON.c

@@ -21,6 +21,7 @@ extern "C" {
 // self-contained core. (Placed outside the extern "C" header block so the
 // #defines don't rewrite the header declarations.)
 #include "gl_procs.h"
+#include "gl_timer.h"
 #include "wc_log.h"
 
 // V8 context accessor — defined in cart_host.cpp
@@ -438,7 +439,7 @@ static bool _unpackCompressed(const char* import, uint32_t p, GLsizei imageSize,
 
 GL_REG(glEnable,  1, 0, glEnable(A_U32(0)))
 GL_REG(glDisable, 1, 0, glDisable(A_U32(0)))
-GL_REG(glGetError, 0, 1, R_I32(glGetError()))
+GL_REG(glGetError, 0, 1, R_I32(wc_gl_timer_get_error()))
 GL_REG(glFinish, 0, 0, glFinish())
 GL_REG(glFlush, 0, 0, glFlush())
 GL_REG(glHint, 2, 0, glHint(A_U32(0), A_U32(1)))
@@ -448,7 +449,17 @@ GL_REG(glIsEnabled, 1, 1, R_I32(glIsEnabled(A_U32(0))))
 GL_REG(glGetIntegerv, 2, 0, {
     GLenum pname = A_U32(0);
     _getInto<GLint>(_import, A_U32(1), _getCount(pname), [&](GLint* out) {
-        glGetIntegerv(pname, out);
+        if (pname == GL_GPU_DISJOINT_EXT) wc_gl_timer_get_disjoint(out);
+        else {
+            glGetIntegerv(pname, out);
+            if (pname == GL_NUM_EXTENSIONS && p_glGetStringi) {
+                GLint actual = *out;
+                for (GLint i = 0; i < actual; ++i) {
+                    const char* ext = (const char*)glGetStringi(GL_EXTENSIONS, (GLuint)i);
+                    if (ext && !wc_gl_timer_extension_visible(ext)) --*out;
+                }
+            }
+        }
         // Ensure correct values for draw buffer caps — Core 3.3 returns correct values
         // but gl4es may query these before the context is fully configured
         if ((pname == 0x8CDF || pname == 0x8824) && *out < 4) {
@@ -458,11 +469,17 @@ GL_REG(glGetIntegerv, 2, 0, {
 })
 GL_REG(glGetFloatv, 2, 0, {
     GLenum pname = A_U32(0);
-    _getInto<GLfloat>(_import, A_U32(1), _getCount(pname), [&](GLfloat* out) { glGetFloatv(pname, out); });
+    _getInto<GLfloat>(_import, A_U32(1), _getCount(pname), [&](GLfloat* out) {
+        if (pname == GL_GPU_DISJOINT_EXT) { GLint value; if (wc_gl_timer_get_disjoint(&value)) *out = (GLfloat)value; }
+        else glGetFloatv(pname, out);
+    });
 })
 GL_REG(glGetBooleanv, 2, 0, {
     GLenum pname = A_U32(0);
-    _getInto<GLboolean>(_import, A_U32(1), _getCount(pname), [&](GLboolean* out) { glGetBooleanv(pname, out); });
+    _getInto<GLboolean>(_import, A_U32(1), _getCount(pname), [&](GLboolean* out) {
+        if (pname == GL_GPU_DISJOINT_EXT) { GLint value; if (wc_gl_timer_get_disjoint(&value)) *out = value ? GL_TRUE : GL_FALSE; }
+        else glGetBooleanv(pname, out);
+    });
 })
 // GL writes at most bufSize values.
 GL_REG(glGetInternalformativ, 5, 0, {
@@ -506,21 +523,34 @@ static uint32_t _gl_alloc_string(wc_host_t* host, const char* s) {
 static char _ext_string_buf[16384] = {0};
 static const char* _build_extension_string(void) {
     if (_ext_string_buf[0]) return _ext_string_buf;
-    // Start with driver's glGetString result if non-empty
-    const char* base = (const char*)glGetString(GL_EXTENSIONS);
+    // Indexed enumeration avoids INVALID_ENUM from glGetString(GL_EXTENSIONS)
+    // on desktop core contexts. The supported native host contexts are GL/ES3.
+    const char* base = p_glGetStringi ? NULL : (const char*)glGetString(GL_EXTENSIONS);
     int offset = 0;
     if (base && base[0]) {
         int len = strlen(base);
         if (len > 14000) len = 14000;
-        memcpy(_ext_string_buf, base, len);
-        offset = len;
+        // Keep the driver's other extensions, but never advertise a timer
+        // extension whose required procedures the host loader did not supply.
+        std::string words(base, len);
+        for (size_t p = 0; p < words.size();) {
+            size_t end = words.find(' ', p);
+            if (end == std::string::npos) end = words.size();
+            std::string ext = words.substr(p, end - p);
+            if (!ext.empty() && wc_gl_timer_extension_visible(ext.c_str())) {
+                if (offset) _ext_string_buf[offset++] = ' ';
+                memcpy(_ext_string_buf + offset, ext.data(), ext.size());
+                offset += ext.size();
+            }
+            p = end + 1;
+        }
     } else {
         // Core profile: build from glGetStringi
         GLint num_ext = 0;
         glGetIntegerv(GL_NUM_EXTENSIONS, &num_ext);
         for (int i = 0; i < num_ext && offset < 14000; i++) {
             const char* ext = (const char*)glGetStringi(GL_EXTENSIONS, i);
-            if (ext) {
+            if (ext && wc_gl_timer_extension_visible(ext)) {
                 int len = strlen(ext);
                 if (offset + len + 1 < 16384) {
                     if (offset > 0) _ext_string_buf[offset++] = ' ';
@@ -571,7 +601,7 @@ static const char* _build_extension_string(void) {
 
 GL_REG(glGetString, 1, 1, {
     uint32_t name = A_U32(0);
-    const char* s = (const char*)glGetString(name);
+    const char* s = (name == GL_EXTENSIONS || name == GL_VERSION) ? NULL : (const char*)glGetString(name);
     // wasmcart ABI = WebGL2 = ES 3.0. Always report ES 3.0 regardless of actual context.
     if (name == 0x1F02) s = "OpenGL ES 3.0 wasmcart";
     // Always build comprehensive extension string — Core profile may return
@@ -1055,7 +1085,18 @@ GL_REG(glReadBuffer, 1, 0, glReadBuffer(A_U32(0)))
 GL_REG(glGetStringi, 2, 1, {
     uint32_t name = A_U32(0);
     uint32_t index = A_U32(1);
-    const char* s = (const char*)glGetStringi(name, index);
+    const char* s = NULL;
+    if (name == GL_EXTENSIONS) {
+        GLint n = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+        uint32_t visible = 0;
+        for (GLint i = 0; i < n; ++i) {
+            const char* ext = (const char*)glGetStringi(name, (GLuint)i);
+            if (ext && wc_gl_timer_extension_visible(ext) && visible++ == index) { s = ext; break; }
+        }
+        // Let the driver produce INVALID_VALUE for an out-of-range index.
+        if (!s) glGetStringi(name, (GLuint)n);
+    } else s = (const char*)glGetStringi(name, index);
     {
         static int _si_dbg = 0;
         if (_si_dbg < 3 && name == 0x1F03 && s) {
@@ -1070,7 +1111,11 @@ GL_REG(glGetStringi, 2, 1, {
 })
 GL_REG(glGetInteger64v, 2, 0, {
     GLenum pname = A_U32(0);
-    _getInto<GLint64>(_import, A_U32(1), _getCount(pname), [&](GLint64* out) { glGetInteger64v(pname, out); });
+    _getInto<GLint64>(_import, A_U32(1), _getCount(pname), [&](GLint64* out) { wc_gl_timer_get_integer64v(pname, out); });
+})
+GL_REG(glGetInteger64vEXT, 2, 0, {
+    GLenum pname = A_U32(0);
+    _getInto<GLint64>(_import, A_U32(1), _getCount(pname), [&](GLint64* out) { wc_gl_timer_get_integer64v(pname, out); });
 })
 GL_REG(glBindBufferBase, 3, 0, glBindBufferBase(A_U32(0), A_U32(1), A_U32(2)))
 GL_REG(glBindBufferRange, 5, 0, glBindBufferRange(A_U32(0), A_U32(1), A_U32(2), A_I32(3), A_I32(4)))
@@ -1168,8 +1213,10 @@ GL_REG(glGetSynciv, 5, 0, {
     if (!sync) return;  // GL's INVALID_VALUE
     glGetSynciv(sync, A_U32(1), bufSize, (GLsizei*)wptr(A_U32(3)), (GLint*)wmem(A_U32(4)));
 })
-GL_REG(glGenQueries, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glGenQueries(A_I32(0), (GLuint*)wmem(A_U32(1))); })
-GL_REG(glDeleteQueries, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); glDeleteQueries(A_I32(0), (const GLuint*)wmem(A_U32(1))); })
+GL_REG(glGenQueries, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); wc_gl_timer_gen_queries(A_I32(0), (GLuint*)wmem(A_U32(1))); })
+GL_REG(glGenQueriesEXT, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); wc_gl_timer_gen_queries(A_I32(0), (GLuint*)wmem(A_U32(1))); })
+GL_REG(glDeleteQueries, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); wc_gl_timer_delete_queries(A_I32(0), (const GLuint*)wmem(A_U32(1))); })
+GL_REG(glDeleteQueriesEXT, 2, 0, { NEED(A_U32(1), _nbytes(A_I32(0), 4)); wc_gl_timer_delete_queries(A_I32(0), (const GLuint*)wmem(A_U32(1))); })
 
 // Four values for GL_COLOR, one for GL_DEPTH. GL reads them from a copy, so
 // a buffer value it doesn't expect can't make it read further.
@@ -1398,11 +1445,44 @@ GL_REG(glPushDebugGroupKHR, 4, 0, { /* no-op */ })
 GL_REG(glWindowRectanglesEXT, 3, 0, { /* no-op — extension not available */ })
 
 // Timer queries
-GL_REG(glQueryCounterEXT, 2, 0, { /* no-op */ })
-GL_REG(glGetQueryObjecti64v, 3, 0, { int64_t zero = 0; NEED(A_U32(2), 8); memcpy(wmem(A_U32(2)), &zero, 8); })
-GL_REG(glGetQueryObjecti64vEXT, 3, 0, { int64_t zero = 0; NEED(A_U32(2), 8); memcpy(wmem(A_U32(2)), &zero, 8); })
-GL_REG(glGetQueryObjectui64v, 3, 0, { uint64_t zero = 0; NEED(A_U32(2), 8); memcpy(wmem(A_U32(2)), &zero, 8); })
-GL_REG(glGetQueryObjectui64vEXT, 3, 0, { uint64_t zero = 0; NEED(A_U32(2), 8); memcpy(wmem(A_U32(2)), &zero, 8); })
+GL_REG(glIsQuery, 1, 1, R_I32(wc_gl_timer_is_query(A_U32(0))))
+GL_REG(glIsQueryEXT, 1, 1, R_I32(wc_gl_timer_is_query(A_U32(0))))
+GL_REG(glBeginQuery, 2, 0, wc_gl_timer_begin_query(A_U32(0), A_U32(1)))
+GL_REG(glBeginQueryEXT, 2, 0, wc_gl_timer_begin_query(A_U32(0), A_U32(1)))
+GL_REG(glEndQuery, 1, 0, wc_gl_timer_end_query(A_U32(0)))
+GL_REG(glEndQueryEXT, 1, 0, wc_gl_timer_end_query(A_U32(0)))
+GL_REG(glQueryCounter, 2, 0, wc_gl_timer_query_counter(A_U32(0), A_U32(1)))
+GL_REG(glQueryCounterEXT, 2, 0, wc_gl_timer_query_counter(A_U32(0), A_U32(1)))
+GL_REG(glGetQueryiv, 3, 0, {
+    _getInto<GLint>(_import, A_U32(2), 1, [&](GLint* out) { wc_gl_timer_get_query_iv(A_U32(0), A_U32(1), out); });
+})
+GL_REG(glGetQueryivEXT, 3, 0, {
+    _getInto<GLint>(_import, A_U32(2), 1, [&](GLint* out) { wc_gl_timer_get_query_iv(A_U32(0), A_U32(1), out); });
+})
+GL_REG(glGetQueryObjectiv, 3, 0, {
+    _getInto<GLint>(_import, A_U32(2), 1, [&](GLint* out) { wc_gl_timer_get_query_object_iv(A_U32(0), A_U32(1), out); });
+})
+GL_REG(glGetQueryObjectivEXT, 3, 0, {
+    _getInto<GLint>(_import, A_U32(2), 1, [&](GLint* out) { wc_gl_timer_get_query_object_iv(A_U32(0), A_U32(1), out); });
+})
+GL_REG(glGetQueryObjectuiv, 3, 0, {
+    _getInto<GLuint>(_import, A_U32(2), 1, [&](GLuint* out) { wc_gl_timer_get_query_object_uiv(A_U32(0), A_U32(1), out); });
+})
+GL_REG(glGetQueryObjectuivEXT, 3, 0, {
+    _getInto<GLuint>(_import, A_U32(2), 1, [&](GLuint* out) { wc_gl_timer_get_query_object_uiv(A_U32(0), A_U32(1), out); });
+})
+GL_REG(glGetQueryObjecti64v, 3, 0, {
+    _getInto<GLint64>(_import, A_U32(2), 1, [&](GLint64* out) { wc_gl_timer_get_query_object_i64v(A_U32(0), A_U32(1), out); });
+})
+GL_REG(glGetQueryObjecti64vEXT, 3, 0, {
+    _getInto<GLint64>(_import, A_U32(2), 1, [&](GLint64* out) { wc_gl_timer_get_query_object_i64v(A_U32(0), A_U32(1), out); });
+})
+GL_REG(glGetQueryObjectui64v, 3, 0, {
+    _getInto<GLuint64>(_import, A_U32(2), 1, [&](GLuint64* out) { wc_gl_timer_get_query_object_ui64v(A_U32(0), A_U32(1), out); });
+})
+GL_REG(glGetQueryObjectui64vEXT, 3, 0, {
+    _getInto<GLuint64>(_import, A_U32(2), 1, [&](GLuint64* out) { wc_gl_timer_get_query_object_ui64v(A_U32(0), A_U32(1), out); });
+})
 
 // Multi-draw indirect
 GL_REG(glMultiDrawArraysIndirect, 4, 0, { /* no-op — fallback to individual draws */ })
@@ -1518,7 +1598,7 @@ static const gl_import_entry_t gl_table[] = {
     GL_E(glDrawBuffers, "ii>"), GL_E(glReadBuffer, "i>"),
     GL_E(glClearBufferfv, "iii>"),
     // GLES3 functions needed by Godot
-    GL_E(glGetStringi, "ii>i"), GL_E(glGetInteger64v, "ii>"),
+    GL_E(glGetStringi, "ii>i"), GL_E(glGetInteger64v, "ii>"), GL_E(glGetInteger64vEXT, "ii>"),
     GL_E(glBindBufferBase, "iii>"), GL_E(glBindBufferRange, "iiiii>"),
     GL_E(glGetUniformBlockIndex, "ii>i"), GL_E(glUniformBlockBinding, "iii>"),
     GL_E(glGetActiveUniformBlockiv, "iiii>"), GL_E(glGetActiveUniformsiv, "iiiii>"),
@@ -1532,7 +1612,8 @@ static const gl_import_entry_t gl_table[] = {
     GL_E(glBeginTransformFeedback, "i>"), GL_E(glEndTransformFeedback, ">"),
     GL_E(glTransformFeedbackVaryings, "iiii>"),
     GL_E(glGetSynciv, "iiiii>"),
-    GL_E(glGenQueries, "ii>"), GL_E(glDeleteQueries, "ii>"),
+    GL_E(glGenQueries, "ii>"), GL_E(glGenQueriesEXT, "ii>"),
+    GL_E(glDeleteQueries, "ii>"), GL_E(glDeleteQueriesEXT, "ii>"),
     // Framebuffers
     GL_E(glGenFramebuffers, "ii>"), GL_E(glDeleteFramebuffers, "ii>"),
     GL_E(glBindFramebuffer, "ii>"), GL_E(glCheckFramebufferStatus, "i>i"),
@@ -1571,7 +1652,13 @@ static const gl_import_entry_t gl_table[] = {
     GL_E(glPushDebugGroup, "iiii>"), GL_E(glPushDebugGroupKHR, "iiii>"),
     GL_E(glWindowRectanglesEXT, "iii>"),
     // Timer queries
-    GL_E(glQueryCounterEXT, "ii>"),
+    GL_E(glIsQuery, "i>i"), GL_E(glIsQueryEXT, "i>i"),
+    GL_E(glBeginQuery, "ii>"), GL_E(glBeginQueryEXT, "ii>"),
+    GL_E(glEndQuery, "i>"), GL_E(glEndQueryEXT, "i>"),
+    GL_E(glGetQueryiv, "iii>"), GL_E(glGetQueryivEXT, "iii>"),
+    GL_E(glGetQueryObjectiv, "iii>"), GL_E(glGetQueryObjectivEXT, "iii>"),
+    GL_E(glGetQueryObjectuiv, "iii>"), GL_E(glGetQueryObjectuivEXT, "iii>"),
+    GL_E(glQueryCounter, "ii>"), GL_E(glQueryCounterEXT, "ii>"),
     GL_E(glGetQueryObjecti64v, "iii>"), GL_E(glGetQueryObjecti64vEXT, "iii>"),
     GL_E(glGetQueryObjectui64v, "iii>"), GL_E(glGetQueryObjectui64vEXT, "iii>"),
     // Multi-draw indirect
@@ -1720,6 +1807,7 @@ static int s_gl_procs_loaded = 0;
 static void _load_gl_procs_once(void) {
     if (s_gl_procs_loaded || !_host || !_host->gl_loader) return;
     wc_gl_procs_load((void*)_host->gl_loader);
+    wc_gl_timer_load((void*)_host->gl_loader);
     s_gl_procs_loaded = 1;
     if (!p_glGenFramebuffers)
         wc_log("wasmcart: WARNING host gl_loader returned no glGenFramebuffers\n");
@@ -1876,6 +1964,12 @@ extern "C" void wc_gl_imports_init(wc_host_t* host) {
 extern "C" void wc_gl_build_v8_imports(v8::Isolate* isolate, v8::Local<v8::Context> context,
     v8::Local<v8::Object> gl_obj, v8::Local<v8::Object> env_obj, wc_host_t* host) {
     _host = host;
+    // These cached strings contain offsets in this cart's memory and the
+    // previous context's extension capabilities. A newly loaded cart starts
+    // with its own current context and cannot reuse either cache.
+    memset(_glstring_cache, 0, sizeof _glstring_cache);
+    _ext_string_buf[0] = 0;
+    s_gl_procs_loaded = 0;
 
     int idx = 0;
     for (const gl_import_entry_t* e = gl_table; e->name; e++, idx++) {
