@@ -459,6 +459,55 @@ to 2D carts on KMSDRM.
 - **Windows**: MSVC needs `/std:c++20 /Zc:__cplusplus` (CXX only) + static CRT (`/MT`).
 - **Windows**: `clock_gettime` → `QueryPerformanceCounter` (`#ifdef _WIN32`).
 
+## GPU timing
+
+The native GL bridge supports EXT disjoint timer queries, desktop ARB/core
+timer queries, and elapsed-only EXT timer queries when the current context
+advertises them and supplies their required procedures. Counter-bit queries
+report the driver's actual capability. Unsupported timer calls record GL
+errors instead of returning fabricated successful results. Read 64-bit
+results only after `GL_QUERY_RESULT_AVAILABLE` is true.
+
+The standalone player can capture cart-frame timing without rebuilding the
+cart's engine:
+
+```sh
+wasmcart-run game.wasc --gpu-profile profile.jsonl --frames 1200
+```
+
+The JSONL contains capabilities, original-frame samples and a final summary.
+The GPU interval uses two completion timestamps around `wc_host_run_frame`:
+host async pump/input delivery, `wc_render`, and memory refresh. It excludes
+the frontend's final blit, present and vsync wait. Command starvation and
+driver scheduling can contribute to the interval; this is not dedicated GPU
+busy time. CPU wall duration is recorded separately with SDL's performance
+counter. Neither clock changes the cart's simulation time or `--fixed-step`.
+
+The host sampler requires 64-bit timestamp counters. An elapsed-only or
+narrow-counter context still runs the cart and emits CPU measurements with
+GPU values set to null. Timestamp pairs do not occupy a guest's elapsed-query
+target. The eight-slot ring never waits for unavailable results; saturation,
+disjoint events, invalid values, failed calls and pending shutdown results
+are reported separately. Profiler calls preserve guest GL errors and guest
+disjoint observations. Pending queries are discarded on pause and deleted
+before GL context teardown. Profiling is opt-in and writes one final record
+per sampled frame.
+
+For driver-independent tests:
+
+```sh
+sh test/gpu_profile_test.sh
+cc -std=c11 -Wall -Wextra -Werror -Isrc -Ivendor/gl \
+  src/gl_timer.c test/gl_timer_test.c -o /tmp/wasmcart-gl-timer-test
+/tmp/wasmcart-gl-timer-test
+```
+
+See the [EXT timer specification](https://registry.khronos.org/OpenGL/extensions/EXT/EXT_disjoint_timer_query.txt)
+for completion ordering and disjoint semantics. Measure overhead with paired
+profile-off/on runs of the same cart, runner, workload and backend. On Mesa
+V3D, completion-ordered kernel CPU timestamp jobs also contribute scheduling
+cost; the result is not a hardware busy-cycle counter.
+
 ## License
 
 MIT

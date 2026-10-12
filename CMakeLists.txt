@@ -92,12 +92,22 @@ endif()
 if(APPLE)
     # mac_layer.m: NSWindow->CALayer resolution + CAMetalLayer vsync/scale
     # for ANGLE's Metal backend (see src/mac_layer.h).
-    add_executable(wasmcart-run src/main.c src/egl_context.c src/mac_layer.m)
+    add_executable(wasmcart-run src/main.c src/egl_context.c src/gpu_profile.c src/mac_layer.m)
     target_link_libraries(wasmcart-run PUBLIC "-framework Cocoa" "-framework QuartzCore")
 else()
-    add_executable(wasmcart-run src/main.c src/egl_context.c)
+    add_executable(wasmcart-run src/main.c src/egl_context.c src/gpu_profile.c)
 endif()
 target_link_libraries(wasmcart-run PRIVATE wasmcart)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(wasmcart-gpu-profile-test src/gpu_profile.c test/gpu_profile_test.c)
+    target_include_directories(wasmcart-gpu-profile-test PRIVATE src vendor/gl)
+    if(NOT WIN32)
+        target_link_libraries(wasmcart-gpu-profile-test PRIVATE m)
+    endif()
+    add_test(NAME gpu-profile COMMAND wasmcart-gpu-profile-test)
+endif()
 
 # SDL2 — prefer static linking for single-binary distribution
 set(SDL2_DIR "" CACHE PATH "Path to SDL2 (Windows)")

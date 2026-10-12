@@ -8,6 +8,7 @@
 #include "../include/wasmcart_host.h"
 #include "egl_context.h"
 #include "frame_clock.h"
+#include "gpu_profile.h"
 #include "audio_mix.h"
 #define PAD_SLOTS_MAX 4
 #include "pad_slots.h"
@@ -25,6 +26,7 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <math.h>
+#include <errno.h>
 #ifdef __linux__
 #include <fcntl.h>
 #include <unistd.h>
@@ -79,6 +81,8 @@ static void print_usage(const char* argv0) {
     fprintf(stderr, "  --fps           Show FPS counter\n");
     fprintf(stderr, "  --uncapped      Disable vsync and frame cap\n");
     fprintf(stderr, "  --fixed-step MS Host clock advances exactly MS per frame (deterministic tests)\n");
+    fprintf(stderr, "  --frames N      Exit after N rendered frames (bounded tests)\n");
+    fprintf(stderr, "  --gpu-profile FILE  Write asynchronous cart-frame GPU timestamps and CPU wall times as JSONL\n");
     fprintf(stderr, "  --shot N FILE   Save frame N of a GL or WebGPU cart as a PPM (tests)\n");
     fprintf(stderr, "  --debug-dump N FILE  After frame N, write the cart's debug state as JSON (tests)\n");
     fprintf(stderr, "  --debug-cmd N TEXT   Before frame N, post TEXT to a cartwheel-style dbg.cmd mailbox;\n");
@@ -1182,6 +1186,8 @@ static int run_player(int argc, char* argv[]) {
     long shot_frame = -1;   /* --shot N file.ppm: save frame N as the cart drew it (tests) */
     const char* shot_path = NULL;
     double fixed_step = 0.0; /* --fixed-step MS: time_ms = frame * MS (tests) */
+    uint32_t frame_limit = 0;
+    const char* gpu_profile_path = NULL;
     const char* save_override = NULL;
     uint32_t save_every_s = 0;
     bool no_net = false;
@@ -1222,6 +1228,23 @@ static int run_player(int argc, char* argv[]) {
                 fprintf(stderr, "wasmcart: --fixed-step needs a positive number of milliseconds\n");
                 return 1;
             }
+        }
+        else if (strcmp(argv[i], "--frames") == 0) {
+            char* end = NULL;
+            errno = 0;
+            unsigned long long n = i + 1 < argc ? strtoull(argv[++i], &end, 10) : 0;
+            if (!end || *end || errno || !n || n > UINT32_MAX) {
+                fprintf(stderr, "wasmcart: --frames needs an integer from 1 to %u\n", UINT32_MAX);
+                return 1;
+            }
+            frame_limit = (uint32_t)n;
+        }
+        else if (strcmp(argv[i], "--gpu-profile") == 0) {
+            if (i + 1 == argc || !argv[i + 1][0]) {
+                fprintf(stderr, "wasmcart: --gpu-profile needs an output path\n");
+                return 1;
+            }
+            gpu_profile_path = argv[++i];
         }
         else if (strcmp(argv[i], "--debug-dump") == 0 && i + 2 < argc) {
             dump_frame = atol(argv[++i]);
@@ -1705,8 +1728,31 @@ static int run_player(int argc, char* argv[]) {
     wc_frame_clock_start(&frame_clock, (double)start_ticks);
     bool window_focused = true;  // as the cart assumes at start (SPEC: Lifecycle)
     uint64_t last_save_ticks = start_ticks;
+    FILE* gpu_profile_file = gpu_profile_path ? fopen(gpu_profile_path, "wb") : NULL;
+    wc_gpu_profile_t gpu_profile;
+    uint64_t profiling_clock_frequency = 0;
+    if (gpu_profile_path) {
+        if (!gpu_profile_file) {
+            fprintf(stderr, "wasmcart: cannot open GPU profiling output %s: %s\n",
+                    gpu_profile_path, strerror(errno));
+            exit_code = 1;
+            running = false;
+        } else {
+            wc_gpu_profile_ops_t ops = {
+                wc_gl_timer_checked_gen_queries, wc_gl_timer_checked_delete_queries,
+                wc_gl_timer_checked_query_counter, wc_gl_timer_checked_get_query_object_uiv,
+                wc_gl_timer_checked_get_query_object_ui64v, wc_gl_timer_checked_get_disjoint
+            };
+            wc_gl_timer_caps_t caps = {0};
+            if (is_gl && (egl_is_initialized() || kms_ctx)) caps = wc_gl_timer_caps();
+            wc_gpu_profile_init(&gpu_profile, gpu_profile_file, &ops, caps);
+            profiling_clock_frequency = SDL_GetPerformanceFrequency();
+            fprintf(stderr, "wasmcart: GPU profiling -> %s (%s)\n", gpu_profile_path,
+                    gpu_profile.supported ? "asynchronous timestamps" : "GPU unsupported; CPU wall times only");
+        }
+    }
 
-    while (running) {
+    while (running && (!frame_limit || frame_count < frame_limit)) {
         uint64_t now = SDL_GetTicks64();
 
         // SDL only emits SDL_TEXTINPUT between StartTextInput and
@@ -1775,6 +1821,7 @@ static int run_player(int argc, char* argv[]) {
                           g_ext_suspend;
             if (hidden) {
                 if (wc_host_suspend(host)) {
+                    if (gpu_profile_file) wc_gpu_profile_suspend(&gpu_profile, frame_count);
                     hb_write('S', frame_count);
                     // The cart can't stop a rumble it started while it's
                     // suspended, and a paused game shouldn't buzz.
@@ -1796,6 +1843,7 @@ static int run_player(int argc, char* argv[]) {
                 // cart sees none of it, not even one clamped frame.
                 wc_frame_clock_rebase(&frame_clock, (double)now);
                 wc_host_resume(host);
+                if (gpu_profile_file) wc_gpu_profile_resume(&gpu_profile);
                 hb_write('R', frame_count);
                 // Mask what is held right now until it is released.
                 wc_pad_t held[WC_MAX_PADS];
@@ -1915,7 +1963,18 @@ static int run_player(int argc, char* argv[]) {
             if (dbg_cmd_frame[k] == (long)frame_count) dbg_post(host, dbg_cmd_text[k]);
 
         // Run frame
+        uint64_t profiling_cpu_start = 0;
+        if (gpu_profile_file) {
+            wc_gpu_profile_begin(&gpu_profile, frame_count);
+            profiling_cpu_start = SDL_GetPerformanceCounter();
+        }
         wc_host_run_frame(host);
+        if (gpu_profile_file) {
+            uint64_t profiling_cpu_end = SDL_GetPerformanceCounter();
+            double cpu_ns = profiling_clock_frequency && profiling_cpu_end >= profiling_cpu_start ?
+                (double)(profiling_cpu_end - profiling_cpu_start) * 1e9 / (double)profiling_clock_frequency : NAN;
+            wc_gpu_profile_end(&gpu_profile, cpu_ns, !wc_host_has_trapped(host));
+        }
         rumble_tick();
         if (dbg_cmd_count) {
             static uint32_t reply_seq = 0;
@@ -2071,6 +2130,17 @@ static int run_player(int argc, char* argv[]) {
     }
 
     // 8. Cleanup
+    // Query deletion requires the original current context. No blocking drain:
+    // unavailable tail results are counted, reported and discarded.
+    if (gpu_profile_file) {
+        wc_gpu_profile_destroy(&gpu_profile, frame_count);
+        int output_failed = ferror(gpu_profile_file);
+        if (fclose(gpu_profile_file) != 0) output_failed = 1;
+        if (output_failed) {
+            fprintf(stderr, "wasmcart: GPU profiling output write failed\n");
+            exit_code = 1;
+        }
+    }
     // Start the sound fading out now, so the fade plays while the save below
     // is written: the save doesn't wait for it, and the cart's last audio is
     // still there to fade rather than run dry.
