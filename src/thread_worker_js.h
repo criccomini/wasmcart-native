@@ -166,13 +166,14 @@ function readFully(buf, off, len, pos) {
 
 // Where an entry's data starts, from its local header (whose name and extra
 // field lengths can differ from the central directory's).
-function dataOffset(e) {
+function dataOffset(e, storedRange = false) {
   if (zipFd === null) {
     zipFd = fs.openSync(cfg.wascPath, 'r');
     zipSize = fs.fstatSync(zipFd).size;
   }
   const hdr = Buffer.alloc(30);
   if (!readFully(hdr, 0, 30, e.ofs) || hdr.readUInt32LE(0) !== 0x04034b50) return -1;
+  if (storedRange && (hdr.readUInt16LE(6) !== e.flags || hdr.readUInt16LE(8) !== 0)) return -1;
   const ofs = e.ofs + 30 + hdr.readUInt16LE(26) + hdr.readUInt16LE(28);
   return ofs + e.csize > zipSize ? -1 : ofs;
 }
@@ -314,6 +315,24 @@ function loadAsset(pathPtr, pathLen, destPtr, maxSize) {
   }
   if (why) { log(`asset ${path}: ${why}`); return -1; }
   return e.usize;
+}
+
+// Same raw STORED range contract as asset_loader.c; no outer CRC check.
+function readAssetRange(pathPtr, pathLen, offset, destPtr, length) {
+  const path = cartPath('wc_read_asset_range', pathPtr, pathLen);
+  destPtr = need('wc_read_asset_range', destPtr, length);
+  offset >>>= 0; length >>>= 0;
+  if (!ai || path.equals(FILELIST)) return -1;
+  const e = locate(path);
+  if (!e || e.dir || e.method !== 0 || (e.flags & UNSUPPORTED_FLAGS) ||
+      e.usize > INT32_MAX || e.csize !== e.usize || offset > e.usize) return -1;
+  try {
+    const pos = dataOffset(e, true);
+    if (pos < 0) return -1;
+    const count = Math.min(length, e.usize - offset);
+    return count === 0 ? 0 :
+      readFully(Buffer.from(memory.buffer, destPtr, count), 0, count, pos + offset) ? count : -1;
+  } catch { return -1; }
 }
 
 )WCJS"
@@ -500,6 +519,7 @@ for (const imp of WebAssembly.Module.imports(wasmModule)) {
     if (n === 'wc_log') val = (p, l) => log(readStr('wc_log', p, l));
     else if (n === 'wc_asset_size') val = assetSize;
     else if (n === 'wc_load_asset') val = loadAsset;
+    else if (n === 'wc_read_asset_range') val = readAssetRange;
     else if (n === 'wc_debug_mark' || n === 'wc_frame_yield') val = () => {};
     else if (n === 'emscripten_memcpy_js') val = (d, s, c) => {
       s = need('emscripten_memcpy_js', s, c); d = need('emscripten_memcpy_js', d, c);

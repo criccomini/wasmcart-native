@@ -366,6 +366,48 @@ int32_t wc_archive_load_asset(wc_host_t* host, const char* path, uint8_t* dest, 
     return (int32_t)read_size;
 }
 
+/* Random access to a STORED outer entry, without allocating/extracting it.
+ * The caller validates both complete Wasm spans before entering here.
+ * Resolve the same name as wc_load_asset; _filelist.txt is virtual, not a ZIP.
+ * Offset at EOF returns zero, past EOF fails, and reads crossing EOF are short.
+ * This is raw I/O: even a whole-range read does NOT verify the outer entry CRC.
+ * Use wc_load_asset for that contract; an inner ZIP's extraction CRC/hash checks
+ * remain the consumer's responsibility. A read error may leave partial bytes.
+ */
+static uint16_t range_le16(const uint8_t* p) {
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+int32_t wc_archive_read_asset_range(wc_host_t* host, const char* path, uint32_t offset,
+                                    uint8_t* dest, uint32_t length) {
+    if (!host->archive || strcmp(path, "_filelist.txt") == 0) return -1;
+    mz_zip_archive* zip = (mz_zip_archive*)host->archive;
+    int idx = locate_asset(zip, &host->manifest, path);
+    mz_zip_archive_file_stat stat;
+    if (idx < 0 || !mz_zip_reader_file_stat(zip, idx, &stat) ||
+        stat.m_is_directory || !stat.m_is_supported || stat.m_is_encrypted ||
+        stat.m_method != 0 || stat.m_comp_size != stat.m_uncomp_size ||
+        stat.m_uncomp_size > INT32_MAX || offset > stat.m_uncomp_size) return -1;
+
+    uint8_t hdr[30];
+    mz_uint64 size = mz_zip_get_archive_size(zip), at = stat.m_local_header_ofs;
+    if (at > size || sizeof(hdr) > size - at ||
+        mz_zip_read_archive_data(zip, at, hdr, sizeof(hdr)) != sizeof(hdr) ||
+        memcmp(hdr, "PK\003\004", 4) != 0 ||
+        range_le16(hdr + 6) != stat.m_bit_flag || range_le16(hdr + 8) != 0) return -1;
+    at += sizeof(hdr);
+    uint32_t extra = (uint32_t)range_le16(hdr + 26) + range_le16(hdr + 28);
+    if (extra > size - at) return -1;
+    at += extra;
+    if (stat.m_comp_size > size - at) return -1;
+
+    uint32_t count = (uint32_t)stat.m_uncomp_size - offset;
+    if (count > length) count = length;
+    if (count == 0) return 0;
+    if (!dest || mz_zip_read_archive_data(zip, at + offset, dest, count) != count) return -1;
+    return (int32_t)count;
+}
+
 // ─── Manifest parsing ──────────────────────────────────────────────────────
 
 int wc_parse_manifest(wc_host_t* host, const char* json, size_t len) {

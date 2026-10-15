@@ -85,6 +85,7 @@ SIGS = {
     "wc_log": ("env", [I32] * 2, []),
     "wc_asset_size": ("env", [I32] * 2, [I32]),
     "wc_load_asset": ("env", [I32] * 4, [I32]),
+    "wc_read_asset_range": ("env", [I32] * 5, [I32]),
     "emscripten_memcpy_js": ("env", [I32] * 3, []),
     "wc_peer_open": ("env", [I32] * 2, [I32]),
     "wc_peer_send": ("env", [I32] * 3, [I32]),
@@ -266,6 +267,11 @@ TRAPS = [
      lambda c: c.call("emscripten_memcpy_js", END - 3, 0, 4)),
     ("wc_asset_size path", "wc_asset_size", lambda c: c.call("wc_asset_size", END - 3, 5)),
     ("wc_load_asset path", "wc_load_asset", lambda c: c.call("wc_load_asset", END - 3, 5, 0, 64)),
+    ("wc_read_asset_range path", "wc_read_asset_range",
+     lambda c: c.call("wc_read_asset_range", END - 3, 5, 0, 0, 1)),
+    ("wc_read_asset_range dest wrapping 32 bits", "wc_read_asset_range",
+     lambda c: (c.put(STRS - 8, b"a.bin"),
+                c.call("wc_read_asset_range", STRS - 8, 5, 0, 0xFFFFFF00, 0x200))[1]),
     # dest + max_size wraps to 0x100, which the old 32-bit check let through.
     ("wc_load_asset dest wrapping 32 bits", "wc_load_asset",
      lambda c: (c.put(STRS - 8, b"a.bin"), c.call("wc_load_asset", STRS - 8, 5, 0xFFFFFF00, 0x200))[1]),
@@ -330,13 +336,19 @@ def control_env():
               c.call("emscripten_memcpy_js", END - 16, END - 5, 5) +
               c.call("wc_asset_size", END - 5, 5, keep=True) + c.log_if(64, "ok wc_asset_size") +
               c.call("wc_load_asset", END - 5, 5, END - 128, 64, keep=True) + c.log_if(64, "ok wc_load_asset") +
+              c.call("wc_read_asset_range", END - 5, 5, 64, END, 0, keep=True) +
+              c.log_if(0, "ok wc_read_asset_range EOF") +
+              c.call("wc_read_asset_range", END - 5, 5, 63, END - 1, 1, keep=True) +
+              c.log_if(1, "ok wc_read_asset_range") +
+              c.call("emscripten_memcpy_js", END - 5, END - 16, 5) +
               c.call("wc_peer_open", END - 5, 5) +
               c.call("wc_peer_send", 0, END - 5, 5) +
               c.call("wc_peer_broadcast", END - 5, 5) +
               c.call("wc_peer_name", 0, END - 32, 32) +
               c.log("ok env"))
     c.render = UNREACHABLE
-    return c, ["wasmcart [cart]: a.bin", "ok wc_asset_size", "ok wc_load_asset", "ok env"]
+    return c, ["wasmcart [cart]: a.bin", "ok wc_asset_size", "ok wc_load_asset",
+               "ok wc_read_asset_range", "ok wc_read_asset_range EOF", "ok env"]
 
 
 def control_wasi():

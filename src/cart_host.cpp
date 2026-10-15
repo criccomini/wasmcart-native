@@ -508,6 +508,24 @@ static void v8_wc_asset_size(const v8::FunctionCallbackInfo<v8::Value>& args) {
     args.GetReturnValue().Set(v8::Integer::New(g_isolate, size));
 }
 
+static void v8_wc_read_asset_range(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    wc_host_t* host = _current_host;
+    refresh_memory(host);
+    uint32_t path_ptr = args[0]->Uint32Value(ctx()).FromJust();
+    uint32_t path_len = args[1]->Uint32Value(ctx()).FromJust();
+    uint32_t offset   = args[2]->Uint32Value(ctx()).FromJust();
+    uint32_t dest_ptr = args[3]->Uint32Value(ctx()).FromJust();
+    uint32_t length   = args[4]->Uint32Value(ctx()).FromJust();
+    if (!wc_cart_range_ok(host, "wc_read_asset_range", path_ptr, path_len) ||
+        !wc_cart_range_ok(host, "wc_read_asset_range", dest_ptr, length)) return;
+    char path[512];
+    uint32_t len = path_len < 511 ? path_len : 511;
+    memcpy(path, host->memory + path_ptr, len);
+    path[len] = 0;
+    int32_t bytes = wc_archive_read_asset_range(host, path, offset, host->memory + dest_ptr, length);
+    args.GetReturnValue().Set(v8::Integer::New(g_isolate, bytes));
+}
+
 static void v8_wc_load_asset(const v8::FunctionCallbackInfo<v8::Value>& args) {
     wc_host_t* host = _current_host;
     refresh_memory(host);
@@ -890,6 +908,7 @@ static v8::Local<v8::Object> build_env_imports() {
     env->Set(ctx(), v8str("wc_log"), make_fn(v8_wc_log)).Check();
     env->Set(ctx(), v8str("wc_asset_size"), make_fn(v8_wc_asset_size)).Check();
     env->Set(ctx(), v8str("wc_load_asset"), make_fn(v8_wc_load_asset)).Check();
+    env->Set(ctx(), v8str("wc_read_asset_range"), make_fn(v8_wc_read_asset_range)).Check();
     env->Set(ctx(), v8str("emscripten_notify_memory_growth"), make_fn(v8_emscripten_notify_memory_growth)).Check();
     env->Set(ctx(), v8str("emscripten_memcpy_js"), make_fn(v8_emscripten_memcpy_js)).Check();
     env->Set(ctx(), v8str("emscripten_stack_init"), make_fn(v8_noop)).Check();

@@ -163,6 +163,9 @@ void wc_archive_free_wasm(wc_host_t* host);  // host->wasm_bytes, once compiled
 
 int32_t wc_archive_load_asset(wc_host_t* host, const char* path, uint8_t* dest, uint32_t max_size);
 int32_t wc_archive_asset_size(wc_host_t* host, const char* path);
+// STORED entries only. Short at EOF; -1 on error. No outer-entry CRC check.
+int32_t wc_archive_read_asset_range(wc_host_t* host, const char* path, uint32_t offset,
+                                    uint8_t* dest, uint32_t length);
 
 int wc_parse_manifest(wc_host_t* host, const char* json, size_t len);
 
